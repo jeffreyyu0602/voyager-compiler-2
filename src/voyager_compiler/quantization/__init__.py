@@ -20,12 +20,14 @@ from voyager_compiler.quantization.gptq import (
     gptq,
 )
 from voyager_compiler.quantization.codebook_optimizer import (
+    CodebookRefitter,
     Weighting,
     Histogram,
-    codebook_qmap,
+    codebook_qmaps,
     fit_codebooks,
     load_codebooks,
-    optimal_codebook,
+    optimal_codebooks,
+    refit_window,
 )
 from voyager_compiler.quantization.qspec import QScheme, parse_codebook_dtype
 from voyager_compiler.quantization.quantize_pt2e import (
@@ -46,6 +48,7 @@ from voyager_compiler.quantization.training import (
     TrainingQuantizers,
     capture_training,
     disable_observers,
+    gemm_partners,
     gradient_program,
     prepare_from_args,
     prepare_training,
@@ -61,6 +64,7 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 
 __all__ = [
     "CACHE_RESERVE",
+    "CodebookRefitter",
     "Weighting",
     "Histogram",
     "DerivedQuantizationSpec",
@@ -73,7 +77,7 @@ __all__ = [
     "QuantizationSpec",
     "TrainingQuantizers",
     "capture_training",
-    "codebook_qmap",
+    "codebook_qmaps",
     "compensate_weight",
     "convert_pt2e",
     "derive_bias_qparams_fn",
@@ -83,17 +87,19 @@ __all__ = [
     "fold_conv_bn_qat",
     "freeze_cache_reads",
     "freeze_weights",
+    "gemm_partners",
     "get_default_quantizer",
     "get_quantization_map",
     "gptq",
     "gradient_program",
     "load_codebooks",
-    "optimal_codebook",
+    "optimal_codebooks",
     "parse_codebook_dtype",
     "prepare_from_args",
     "prepare_pt2e",
     "prepare_qat_pt2e",
     "prepare_training",
+    "refit_window",
     "set_batch_norm_training",
     "set_training",
     "sink_obs_or_fq",

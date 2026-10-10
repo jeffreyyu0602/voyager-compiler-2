@@ -402,33 +402,44 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
 
 
 class _FreezableFlags(FakeQuantizeBase):
-    """``FakeQuantizeBase`` whose enable flags freezing can fix.
+    """``FakeQuantizeBase`` whose enable flags are Python bools.
 
-    The flags are device tensors, so reading one on every call waits for
-    the device, and a CUDA graph cannot capture the read.  Once
-    ``freeze_flags`` has read them, the module goes by those values.
+    The base class keeps ``fake_quant_enabled`` and ``observer_enabled`` in
+    device tensors, so reading one on every call waits for the device.
+    Here they are plain attributes that only the enable methods change,
+    and they travel in the state dict as extra state.
     """
 
-    _frozen_flags: Optional[Tuple[bool, bool]] = None
+    def __init__(self) -> None:
+        super().__init__()
+        del self.fake_quant_enabled, self.observer_enabled
+        self.fake_quant_enabled = True
+        self.observer_enabled = True
 
-    def freeze_flags(self) -> None:
-        """Fix the enable flags at their current values."""
-        self._frozen_flags = (
-            bool(self.fake_quant_enabled[0]),
-            bool(self.observer_enabled[0]),
-        )
+    def enable_fake_quant(self, enabled: bool = True) -> None:
+        self.fake_quant_enabled = enabled
 
-    def fake_quant_on(self) -> bool:
-        """Whether ``forward`` fake-quantizes."""
-        if self._frozen_flags is not None:
-            return self._frozen_flags[0]
-        return bool(self.fake_quant_enabled[0])
+    def enable_observer(self, enabled: bool = True) -> None:
+        self.observer_enabled = enabled
 
-    def observer_on(self) -> bool:
-        """Whether ``forward`` updates the statistics."""
-        if self._frozen_flags is not None:
-            return self._frozen_flags[1]
-        return bool(self.observer_enabled[0])
+    def get_extra_state(self):
+        return {
+            "fake_quant_enabled": self.fake_quant_enabled,
+            "observer_enabled": self.observer_enabled,
+        }
+
+    def set_extra_state(self, state):
+        self.fake_quant_enabled = state["fake_quant_enabled"]
+        self.observer_enabled = state["observer_enabled"]
+
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        # A checkpoint saved while the flags were buffers holds them so.
+        if prefix + "fake_quant_enabled" in state_dict:
+            state_dict[prefix + "_extra_state"] = {
+                name: bool(state_dict.pop(prefix + name)[0])
+                for name in ("fake_quant_enabled", "observer_enabled")
+            }
+        super()._load_from_state_dict(state_dict, prefix, *args)
 
 
 class _FakeQuantize(_FreezableFlags):
@@ -513,8 +524,14 @@ class _QuantizeTransform:
     quantizes and through ``post`` after.  Each transform mixin acts when
     its spec field is set and hands on to ``super()``: ``pre`` transforms
     first, ``post`` last, so mixins listed before a scheme's base nest, the
-    first one outermost.
+    first one outermost.  ``prepare`` applies the same transforms as
+    ``pre``, whether or not fake-quantization is on, without changing state
+    (an outlier comes back as a zero), so a codebook fit sees the values the
+    codebook will quantize.
     """
+
+    def prepare(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
     def pre(self, x: torch.Tensor) -> torch.Tensor:
         return x
@@ -551,20 +568,26 @@ class RandomHadamardTransform(_QuantizeTransform):
     def extra_repr(self):
         return f"{super().extra_repr()}, rht_axis={self.rht_axis}"
 
+    def prepare(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rht_axis is not None:
+            x = _rotate(x, self.rht_axis, self.rht_matrix)
+        return super().prepare(x)
+
     def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rht_axis is not None and self.fake_quant_on():
+        if self.rht_axis is not None and self.fake_quant_enabled:
             x = _rotate(x, self.rht_axis, self.rht_matrix)
         return super().pre(x)
 
     def post(self, x: torch.Tensor) -> torch.Tensor:
         x = super().post(x)
-        if self.rht_axis is not None and self.fake_quant_on():
+        if self.rht_axis is not None and self.fake_quant_enabled:
             x = _rotate(x, self.rht_axis, self.rht_matrix.T)
         return x
 
 
 class OutlierFilter(_QuantizeTransform):
-    """Keep outliers out of quantization: zeroed before it, restored after.
+    """Keep outliers out of quantization: zeroed before it, restored after,
+    while fake-quantization is on.
 
     An outlier is an element whose magnitude reaches the threshold.  The
     threshold is given, or calibrated while the observer is on as the
@@ -590,7 +613,13 @@ class OutlierFilter(_QuantizeTransform):
             outlier_pct is None or outlier_threshold is None
         ), "Only one of outlier_pct and outlier_threshold can be set."
         self.outlier_pct = outlier_pct
-        self.max_outlier_pct = 0.0
+        # The largest fraction of outliers any call has held, kept on the
+        # device so that recording it never waits for it.
+        self.register_buffer(
+            "max_outlier_pct",
+            torch.zeros((), device=self.scale.device),
+            persistent=False,
+        )
         if outlier_pct is not None:
             self.register_buffer(
                 "outlier_threshold",
@@ -602,30 +631,49 @@ class OutlierFilter(_QuantizeTransform):
         # ``post`` restores.
         self._outliers = None
 
+    def _outlier_mask(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return which elements reach the threshold, or None without one."""
+        threshold = self.outlier_threshold
+        if threshold is None or (
+            isinstance(threshold, torch.Tensor) and threshold.numel() == 0
+        ):
+            return None
+        return x.abs() >= threshold
+
+    def _calibrate_threshold(self, x: torch.Tensor) -> None:
+        """Raise the threshold to the smallest of ``x``'s largest
+        ``outlier_pct`` magnitudes, if that is larger."""
+        flat = x.abs().flatten()
+        k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+
+        vals = torch.topk(flat, k, largest=True, sorted=False).values
+        threshold = vals.min()
+
+        # The largest threshold any calibration batch asked for, so the
+        # bound holds on every batch seen.
+        if self.outlier_threshold.numel() == 0:
+            self.outlier_threshold.resize_as_(threshold)
+            self.outlier_threshold.copy_(threshold)
+        else:
+            self.outlier_threshold.copy_(
+                torch.maximum(self.outlier_threshold, threshold)
+            )
+
+    def prepare(self, x: torch.Tensor) -> torch.Tensor:
+        skip = self._outlier_mask(x)
+        if skip is not None:
+            x = x.masked_fill(skip, 0.0)
+        return super().prepare(x)
+
     def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.outlier_pct is not None and self.observer_on():
-            flat = x.abs().flatten()
-            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+        if self.outlier_pct is not None and self.observer_enabled:
+            self._calibrate_threshold(x)
 
-            vals = torch.topk(flat, k, largest=True, sorted=False).values
-            threshold = vals.min()
-
-            # The largest threshold any calibration batch asked for, so
-            # the bound holds on every batch seen.
-            if self.outlier_threshold.numel() == 0:
-                self.outlier_threshold.resize_as_(threshold)
-                self.outlier_threshold.copy_(threshold)
-            else:
-                self.outlier_threshold.copy_(
-                    torch.maximum(self.outlier_threshold, threshold)
-                )
-
-        if self.outlier_threshold is not None:
-            skip = x.abs() >= self.outlier_threshold
+        skip = self._outlier_mask(x) if self.fake_quant_enabled else None
+        if skip is not None:
             self._outliers = (skip, x)
             x = x.masked_fill(skip, 0.0)
-            outlier_pct = skip.sum().item() / x.numel()
-            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
+            self.max_outlier_pct.clamp_min_(skip.float().mean())
         return super().pre(x)
 
     def post(self, x: torch.Tensor) -> torch.Tensor:
@@ -658,7 +706,7 @@ class DirectCastFakeQuantize(_FakeQuantize):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.scale
+            x, self.fake_quant_enabled, self.qmap, self.scale
         )
 
 
@@ -779,10 +827,10 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.observer_on():
+        if self.observer_enabled:
             self._update_amax_scale(x)
         return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.scale
+            x, self.fake_quant_enabled, self.qmap, self.scale
         )
 
 
@@ -892,7 +940,7 @@ class MXFakeQuantize(
         )
         x = MXFakeQuantizeFunction.apply(
             x,
-            self.fake_quant_on(),
+            self.fake_quant_enabled,
             self.scale,
             self.qmap,
             self.ch_axis,
@@ -939,7 +987,7 @@ class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return GroupWiseAffineFakeQuantFunction.apply(
             x,
-            self.fake_quant_on(),
+            self.fake_quant_enabled,
             self.scale,
             self.zero_point,
             self.ch_axis,
@@ -987,7 +1035,7 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
         self.register_buffer(
             "qmap", get_quantization_map(dtype), persistent=False
         )
-        self.observer_enabled[0] = 0
+        self.disable_observer()
         self.dtype = dtype
 
     def forward(self, x: Tensor) -> Tensor:
@@ -996,7 +1044,7 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
             self.to(x.device)
 
         return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.calculate_qparams()
+            x, self.fake_quant_enabled, self.qmap, self.calculate_qparams()
         )
 
     def calculate_qparams(self):

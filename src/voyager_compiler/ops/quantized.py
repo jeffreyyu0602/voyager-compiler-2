@@ -1175,7 +1175,7 @@ def filter_outlier(
     Returns:
         torch.Tensor: Filtered tensor.
     """
-    is_outlier = torch.abs(input) > threshold
+    is_outlier = torch.abs(input) >= threshold
     inlier = torch.where(is_outlier, 0, input)
     outliers = torch.where(is_outlier, input, 0)
 

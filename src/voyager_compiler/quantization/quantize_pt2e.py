@@ -34,7 +34,6 @@ from voyager_compiler.quantization.fake_quantize import (
     MXFakeQuantize,
     RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
-    _FreezableFlags,
     calculate_global_scale,
     get_quantization_map,
 )
@@ -644,7 +643,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         # The stream takes the observed maximum plus one percentage point,
         # rounded to the nearest whole percent: headroom for the blocks
         # above the mean.
-        observed = activation_post_process.max_outlier_pct
+        observed = activation_post_process.max_outlier_pct.item()
         stream_pct = round((observed + 0.01) * 100) / 100
         # ``CSR_STREAM_PCT`` declares the stream at that rate instead (never
         # below what was observed).
@@ -1245,11 +1244,7 @@ def _is_mutating(node: Node) -> bool:
 
 
 def _finish_freezing(model: GraphModule) -> None:
-    """Mark ``model`` frozen, fix its fake-quants' enable flags, and drop
-    what the freezing left unused."""
-    for module in model.modules():
-        if isinstance(module, _FreezableFlags):
-            module.freeze_flags()
+    """Mark ``model`` frozen and drop what the freezing left unused."""
     model.meta["frozen_weights"] = True
     model.graph.lint()
     model.recompile()

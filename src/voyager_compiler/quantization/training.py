@@ -85,6 +85,7 @@ __all__ = [
     "TrainingQuantizers",
     "capture_training",
     "disable_observers",
+    "gemm_partners",
     "gradient_program",
     "prepare_from_args",
     "prepare_training",
@@ -852,7 +853,7 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
         fake_quant_attr, operand = node.args
         target = fake_quant_attr.target
         fake_quant = program.get_submodule(target)
-        if not fake_quant.fake_quant_on():
+        if not fake_quant.fake_quant_enabled:
             node.replace_all_uses_with(operand)
             graph.erase_node(node)
             continue
@@ -886,7 +887,7 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
                     "Per-channel scales have no lowering for training"
                 )
             with graph.inserting_before(node):
-                if fake_quant.observer_on():
+                if fake_quant.observer_enabled:
                     current[target] = _delayed_scale(
                         graph, operand, *states[target], fake_quant
                     )
@@ -1150,6 +1151,46 @@ def update_program(
             node.update_kwarg("device", device)
     program.recompile()
     return program
+
+
+def gemm_partners(model: nn.Module) -> Dict[str, Set[str]]:
+    """Each fake-quant of a prepared model -> the ones it is contracted with.
+
+    Read off the joint graph ``capture_training`` keeps: a GEMM operand
+    traced back past its views reaches the fake-quant that quantized it, and
+    the GEMM's other operand traced the same way names its partner.  An
+    operand no fake-quant quantized names none.
+
+    Args:
+        model: Model ``prepare_training`` prepared.
+
+    Returns:
+        ``name -> partner names``, by the names in
+        ``model.training_quantizers``.
+    """
+    joint = model.forward.graphs["joint"]
+    names = {
+        id(module): name
+        for name, module in model.training_quantizers.named_children()
+    }
+    partners = {name: set() for name in names.values()}
+    for gemm in joint.graph.nodes:
+        if gemm.target not in _OPS:
+            continue
+        quantized = []
+        for operand in gemm.args[:2]:
+            while operand.target in _VIEWS:
+                operand = operand.args[0]
+            quantized.append(
+                names[id(joint.get_submodule(operand.args[0].target))]
+                if operand.target is _fake_quantize
+                else None
+            )
+        first, second = quantized
+        if first is not None and second is not None:
+            partners[first].add(second)
+            partners[second].add(first)
+    return partners
 
 
 def disable_observers(model: nn.Module) -> None:

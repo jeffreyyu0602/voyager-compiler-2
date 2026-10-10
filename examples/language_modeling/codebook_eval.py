@@ -212,15 +212,6 @@ def parse_args(parser=None):
         ),
     )
     parser.add_argument(
-        "--scale_weighted",
-        action="store_true",
-        help=(
-            "Also weight each sample by its block's squared scale, so the "
-            "fit minimizes the error deployment makes rather than the "
-            "error in normalized units."
-        ),
-    )
-    parser.add_argument(
         "--quantized_scale",
         action="store_true",
         help=(
@@ -440,8 +431,8 @@ def main(args):
         )
         frozen = 0
         for module in graph.modules():
-            if hasattr(module, "observer_enabled"):
-                module.observer_enabled[0] = 0
+            if hasattr(module, "disable_observer"):
+                module.disable_observer()
                 frozen += 1
         logger.info("observation disabled on %d fake-quants", frozen)
 
@@ -458,7 +449,6 @@ def main(args):
                     pick.partition(":") for pick in args.granularity
                 )
             },
-            scale_weighted=args.scale_weighted,
             quantized_scale=args.quantized_scale,
             dump=args.dump,
         )
@@ -502,7 +492,7 @@ def main(args):
         graph, test, args.max_length, args.stride, device
     ).item()
     worst = sorted(
-        ((module.max_outlier_pct, name) for name, module in filtered),
+        ((module.max_outlier_pct.item(), name) for name, module in filtered),
         reverse=True,
     )[:5]
     for pct, name in worst:

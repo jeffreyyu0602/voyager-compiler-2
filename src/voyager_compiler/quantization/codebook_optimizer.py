@@ -9,8 +9,8 @@ candidates -- every value the entry dtype holds in the range, or an even
 spread across it when the entries keep the model's dtype -- and nothing here
 assumes their number or their spacing.
 
-``optimal_codebook`` fits the levels to measured samples: the exact
-weighted-MSE minimum over an accumulated ``Histogram``, by dynamic
+``optimal_codebooks`` fits the levels to measured samples: the exact
+weighted-MSE minimum over each accumulated ``Histogram``, by dynamic
 programming.  Weighting each sample by its channel's downstream energy is
 what makes it minimize layer-output error rather than tensor MSE.  Squared
 error alone is blind to zero and will spend that level elsewhere, which
@@ -18,32 +18,96 @@ under block scaling forces a block's many small values to at least one step
 off zero -- pass ``pin_zero`` to forbid it.
 """
 
+import contextlib
 import enum
+import functools
 import json
 import logging
 import os
 
-import numpy as np
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
 from voyager_compiler.ops import calculate_mx_qparam, expand
-from voyager_compiler.quantization.fake_quantize import entry_levels
+from voyager_compiler.quantization.fake_quantize import (
+    MXFakeQuantize,
+    _rotate,
+    calculate_global_scale,
+    entry_levels,
+)
+from voyager_compiler.quantization.training import gemm_partners
 
 logger = logging.getLogger(__name__)
 
 EPS = 1e-12
-
-#: Bins the range is split into evenly, beside the edges the solver needs.
-#: The solver reads only those; these give anyone reading the histogram an
-#: even resolution across the range.
-HISTOGRAM_BINS = 4001
 
 #: Elements one ``Histogram.add`` converts to float64 at a time.  Widening
 #: an operand and forming the two products is the accumulator's whole
 #: memory cost, and a model's largest weight runs to half a billion
 #: elements, so the pass is taken in slices rather than whole.
 ACCUMULATE_CHUNK = 1 << 25
+
+#: Copies of each bin ``bin_blocks`` spreads its adds over on a GPU.
+#: Neighbouring elements add into different copies, so the many elements of
+#: one bin -- a ReLU output's zeros -- do not queue on one address; the
+#: copies are summed after.
+BIN_COPIES = 512
+
+#: Float64 elements one round of a batched solve holds, per device type: a
+#: chunk of histograms times the candidate pairs each searches.  On a CPU
+#: about 16 MiB, so a round stays in cache; a round is bandwidth-bound
+#: there, and a larger chunk is slower.  On a GPU 128 MiB, which with the
+#: temporaries the gap tables are built through peaks near 1 GiB.
+SOLVE_CHUNK = {"cpu": 1 << 21, "cuda": 1 << 24}
+
+
+@functools.lru_cache(maxsize=None)
+def _bin_grid(levels, device):
+    """Return the bins over a set of candidates, built once per device.
+
+    Args:
+        levels: The candidate levels, ascending, as a tuple.
+        device: Where the tensors live.
+
+    Returns:
+        ``(edges, midpoint_bins)``: the ascending float64 bin boundaries,
+        and ``midpoint_bins[a, b]``, the bin the midpoint of candidates
+        ``a`` and ``b`` starts.
+    """
+    if device.type != "cpu":
+        cpu = _bin_grid(levels, torch.device("cpu"))
+        return tuple(tensor.to(device) for tensor in cpu)
+    level = torch.tensor(levels, dtype=torch.float64)
+    midpoints = (level[:, None] + level[None, :]) / 2
+    edges = midpoints.reshape(-1).unique()
+    midpoint_bins = torch.searchsorted(edges, midpoints, right=True) - 1
+    return edges, midpoint_bins.clamp_(0, edges.numel() - 1)
+
+
+@functools.lru_cache(maxsize=None)
+def _search_edges(levels, device):
+    """Return the interior bin edges as ``bin_blocks`` searches them.
+
+    Each edge is the smallest float32 at or above the exact one.  The values
+    searched are float32, so a value reaches that edge exactly when it
+    reaches the exact one, and is binned as ``Histogram.add`` bins it.
+
+    Args:
+        levels: The candidate levels, ascending, as a tuple.
+        device: Where the tensor lives.
+
+    Returns:
+        The edges between the first and last, as float32, padded with +inf
+        to a power of two above their count.
+    """
+    edges = _bin_grid(levels, torch.device("cpu"))[0][1:-1]
+    inner = edges.float()
+    up = torch.nextafter(inner, torch.full_like(inner, torch.inf))
+    inner = torch.where(inner.double() < edges, up, inner)
+    pad = torch.full(
+        ((1 << inner.numel().bit_length()) - inner.numel(),), torch.inf
+    )
+    return torch.cat([inner, pad]).to(device)
 
 
 class Histogram:
@@ -55,50 +119,55 @@ class Histogram:
     an approximation of sampling but a replacement for it: no draw to vary
     between runs, no bound on how much data one fit may see, and a few
     kilobytes of state per tensor instead of gigabytes of retained samples.
-    A fourth sum, the unweighted element count, is kept alongside them: the
-    solver never reads it, but it says how many elements each bin's weight
-    was gathered from, which is what separates a heavy bin from a crowded
-    one.
 
     A value rounds to its nearest level, so it switches level halfway
     between two.  The bins have an edge at the midpoint of every pair of
     candidates, which leaves no bin straddling a switch wherever the solver
-    puts the levels, and so makes its cost exact on any grid.
+    puts the levels, and so makes its cost exact on any grid.  Those are
+    the only edges, since the solver reads nothing between them.  The bins
+    depend on the candidates alone, so histograms over the same ones share
+    them.
 
     Args:
         levels: The candidate levels, ascending.
-        even_bins: Bins the range is also split into evenly, beside the
-            midpoint edges.
 
     Attributes:
-        levels: The candidate levels, ascending.
+        levels: The candidate levels, ascending, as a float64 tensor.
         quant_min: The lowest candidate, and the low edge.
         quant_max: The highest candidate, and the high edge.
-        bins: How many bins the midpoint and even edges make together.
+        bins: How many bins the midpoint edges make.
     """
 
-    def __init__(self, levels, even_bins=HISTOGRAM_BINS):
-        self.levels = np.asarray(levels, dtype=np.float64)
+    def __init__(self, levels):
+        self.levels = torch.as_tensor(levels, dtype=torch.float64).cpu()
         self.quant_min = float(self.levels[0])
         self.quant_max = float(self.levels[-1])
-        midpoints = (self.levels[:, None] + self.levels[None, :]) / 2
-        self._edges = np.unique(
-            np.concatenate(
-                [
-                    np.linspace(self.quant_min, self.quant_max, even_bins + 1),
-                    midpoints.ravel(),
-                ]
-            )
-        )
-        self.bins = self._edges.size - 1
+        self._candidates = tuple(self.levels.tolist())
+        self.bins = self.edges().numel() - 1
         self.weight = None
         self.total = None
         self.square = None
-        self.count = None
 
-    def edges(self):
-        """Return the bin boundaries the sums are taken between."""
-        return self._edges
+    def edges(self, device="cpu"):
+        """Return the bin boundaries, on ``device``."""
+        return _bin_grid(self._candidates, torch.device(device))[0]
+
+    def midpoint_bins(self, device="cpu"):
+        """Return ``[a, b]``, the bin candidates a and b's midpoint starts."""
+        return _bin_grid(self._candidates, torch.device(device))[1]
+
+    def search_edges(self, device):
+        """Return the interior edges as ``bin_blocks`` searches them."""
+        return _search_edges(self._candidates, torch.device(device))
+
+    def sums(self, device):
+        """Return the ``[3, bins]`` sums, created on ``device`` at first use."""
+        if self.weight is None:
+            self.moments = torch.zeros(
+                3, self.bins, dtype=torch.float64, device=device
+            )
+            self.weight, self.total, self.square = self.moments
+        return self.moments
 
     def add(self, values, weights):
         """Accumulate one tensor's normalized values into the bins.
@@ -107,17 +176,8 @@ class Histogram:
             values: Flat tensor of ``x / blockscale``.
             weights: Per-element weight, broadcastable to ``values``.
         """
-        if self.weight is None:
-            self.weight, self.total, self.square = (
-                torch.zeros(
-                    self.bins, dtype=torch.float64, device=values.device
-                )
-                for _ in range(3)
-            )
-            self.count = torch.zeros(
-                self.bins, dtype=torch.int64, device=values.device
-            )
-        edges = torch.as_tensor(self._edges, device=values.device)
+        self.sums(values.device)
+        edges = self.edges(values.device)
         values = values.reshape(-1)
         weights = weights.reshape(-1).expand_as(values)
         for start in range(0, values.numel(), ACCUMULATE_CHUNK):
@@ -133,172 +193,217 @@ class Histogram:
             self.weight.index_add_(0, index, share)
             self.total.index_add_(0, index, share * piece)
             self.square.index_add_(0, index, share * piece * piece)
-            self.count += torch.bincount(index, minlength=self.bins)
 
     def cumulative(self):
-        """Return the three running sums the segment cost is read from."""
+        """Return the three running sums the segment cost is read from.
+
+        Each is led by a zero and stays on the device the sums are on.
+        """
         return tuple(
-            np.concatenate([[0], moment.cpu().numpy().cumsum()])
+            torch.nn.functional.pad(moment.cumsum(0), (1, 0))
             for moment in (self.weight, self.total, self.square)
         )
 
 
 #: Candidates across the range when the entries keep the model's dtype and
-#: so have no grid of their own.  The dynamic program holds a cube of them,
-#: so its cost is n^3; an odd count keeps an exact zero for ``pin_zero``.
-FLOAT_RESOLUTION = 257
+#: so have no grid of their own.  513 spaces them a 256th of the top value
+#: apart, bf16's own spacing just below a power-of-two top, so each is exact
+#: in bf16 and none merge; an odd count keeps an exact zero for ``pin_zero``.
+FLOAT_RESOLUTION = 513
 
 
-def codebook_qmap(entries, device=None):
-    """Build the 65536-entry bf16 lookup table a fake-quant consumes.
+#: Tables one round of ``codebook_qmaps`` builds.  Each holds a 65536-entry
+#: index while it is built, about 1 MiB with its temporaries, so a round
+#: stays near 128 MiB however many tables a refit installs.
+QMAP_CHUNK = 128
+
+
+def codebook_qmaps(tables, device=None):
+    """Build the 65536-entry bf16 lookup table a fake-quant consumes, per table.
+
+    A value maps to its nearest entry, and one halfway between two to the
+    lower, so the entry it takes is the number of midpoints below it.  A NaN
+    bit pattern maps to the lowest entry.
 
     Args:
-        entries: The codebook's entries.
-        device: Where to build the table.
+        tables: Codebooks of the same size, each ascending.
+        device: Where to build the tables.
 
     Returns:
-        A bf16 tensor mapping every bf16 bit pattern to its nearest entry.
+        A ``[tables, 65536]`` bf16 tensor mapping every bf16 bit pattern to
+        each table's nearest entry.
     """
-    codebook = torch.tensor(entries, dtype=torch.float32, device=device)
+    codebooks = torch.tensor(tables, dtype=torch.float32, device=device)
+    midpoints = (codebooks[:, :-1] + codebooks[:, 1:]) / 2
     every = (
         torch.arange(2**16, dtype=torch.int16, device=device)
         .view(torch.bfloat16)
         .float()
     )
-    index = (
-        (every.clamp(codebook.min(), codebook.max()).unsqueeze(-1) - codebook)
-        .abs()
-        .argmin(-1)
-    )
-    return codebook[index].to(torch.bfloat16)
+    every = torch.where(every.isnan(), -torch.inf, every)
+    qmaps = []
+    for start in range(0, len(codebooks), QMAP_CHUNK):
+        chunk = midpoints[start : start + QMAP_CHUNK]
+        values = every.expand(len(chunk), -1).contiguous()
+        index = torch.searchsorted(chunk, values)
+        entries = codebooks[start : start + QMAP_CHUNK].gather(1, index)
+        qmaps.append(entries.to(torch.bfloat16))
+    return torch.cat(qmaps)
 
 
-def optimal_codebook(histogram, k, pin_zero=False):
-    """Return the globally optimal codebook, by dynamic programming.
+def optimal_codebooks(histograms, k, pin_zero=True):
+    """Return each histogram's globally optimal codebook.
 
-    Levels are ``k`` distinct candidates from the histogram's ``levels``,
-    and nearest-neighbour assignment puts the boundary between two chosen
-    levels at their midpoint.  Cluster membership is therefore an interval,
-    which makes the exact minimizer of the weighted squared error a shortest
-    path over ``(previous level, current level)`` states -- no
-    initialization, no local minima.
+    Levels are ``k`` distinct candidates from the histograms' ``levels``,
+    the lowest and highest among them.  Every value between two consecutive
+    levels rounds to the nearer of the two, so the weighted squared error is
+    a sum of one cost per gap that depends on the gap's two ends alone.  The
+    exact minimizer is therefore a shortest path over the levels, found by
+    dynamic programming -- no initialization, no local minima.  The
+    histograms have a bin edge at every candidate, so a gap's cost splits
+    between its ends without error.  Pinning zero forbids every gap that
+    straddles it, so each round of the search is two independent blocks,
+    the levels below zero and those above.  The histograms are searched
+    together, in chunks of ``SOLVE_CHUNK`` elements, on the device their
+    sums are on.
 
     Args:
-        histogram: Accumulated weighted moments of the tensor's
-            ``x / blockscale`` values.  A range starting at zero already
-            pins the zero level, so ``pin_zero`` has nothing left to do and
-            is ignored.
+        histograms: Accumulated weighted moments of tensors'
+            ``x / blockscale`` values, all over the same candidates.  A
+            range starting at zero already pins the zero level, so
+            ``pin_zero`` has nothing left to do and is ignored.
         k: Number of levels.
-        pin_zero: Force the level ``0`` into the codebook.  Minimizing
+        pin_zero: Force the level ``0`` into each codebook.  Minimizing
             squared error alone almost always spends that level
             elsewhere, which leaves a block's many small values unable
             to quantize to zero.
 
     Returns:
-        The optimal codebook as ``k`` ascending distinct levels, integers
-        when every candidate is one.
+        One optimal codebook per histogram, each ``k`` ascending distinct
+        levels, integers when every candidate is one.
 
     Raises:
         ValueError: Fewer candidates than levels asked for, so no codebook
             of this size exists on this grid.
-        RuntimeError: The shortest path did not reconstruct to ``k``
+        RuntimeError: A shortest path did not reconstruct to ``k``
             distinct levels, which is a defect in the search rather than a
             property of the data.
     """
-    levels = histogram.levels
-    n = levels.size
+    levels = histograms[0].levels
+    n = levels.numel()
     if k > n:
         raise ValueError(
             f"a {k}-level codebook cannot be drawn from the {n} candidates "
-            f"in [{histogram.quant_min}, {histogram.quant_max}]"
+            f"in [{histograms[0].quant_min}, {histograms[0].quant_max}]"
         )
     # A codebook of integers reads as the entries the hardware stores.
-    as_entry = int if np.array_equal(levels, np.round(levels)) else float
+    integral = torch.equal(levels, levels.round())
     if k <= 2:
         # Both endpoints are pinned, so there is nothing left to choose.
-        return [as_entry(level) for level in (levels[0], levels[-1])][:k]
-    bins = histogram.bins
-    edges = histogram.edges()
-    cum_w, cum_s, cum_q = histogram.cumulative()
-
-    midpoint = (levels[:, None] + levels[None, :]) / 2.0
-    at = np.clip(
-        np.searchsorted(edges, midpoint.ravel(), side="right") - 1, 0, bins
-    ).reshape(n, n)
-
-    def segment_cost(lo_bin, hi_bin, level):
-        span_w = cum_w[hi_bin] - cum_w[lo_bin]
-        span_s = cum_s[hi_bin] - cum_s[lo_bin]
-        span_q = cum_q[hi_bin] - cum_q[lo_bin]
-        return span_q - 2 * level * span_s + level * level * span_w
-
-    # step[p, c, m]: cost of the samples level c owns when its neighbours are
-    # p below and m above.
-    step = segment_cost(at[:, :, None], at[None, :, :], levels[None, :, None])
-    order = levels[:, None, None] < levels[None, :, None]
-    step = np.where(
-        order & (levels[None, :, None] < levels[None, None, :]), step, np.inf
-    )
-
-    # A second state axis records whether level 0 has been chosen yet, so
-    # `pin_zero` can require it without giving up the exact minimum.  Without
-    # the constraint that axis has length one and the recurrence is unchanged.
-    first, last = 0, n - 1
-    zero = int(np.argmin(np.abs(levels)))
+        ends = levels[[0, -1]][:k]
+        ends = (ends.long() if integral else ends).tolist()
+        return [list(ends) for _ in histograms]
+    zero = int(levels.abs().argmin())
     # Pinning is meaningless when zero is already the lowest level, since
     # that one is always chosen, or when the grid holds no exact zero.
-    pin_zero = pin_zero and zero != first and levels[zero] == 0
-    state = np.full((2 if pin_zero else 1, n, n), np.inf)
-    state[0, first, :] = segment_cost(0, at[first, :], levels[first])
-    state[0, first, first] = np.inf
-    if pin_zero:
-        state[1, first, zero] = state[0, first, zero]
-        state[0, first, zero] = np.inf
-
-    back_level, back_flag = [], []
-    for _ in range(k - 3):
-        total = state[:, :, :, None] + step[None]
-        level_choice = np.argmin(total, axis=1)
-        state = np.take_along_axis(total, level_choice[:, None], axis=1)[:, 0]
-        flag_choice = np.zeros(state.shape, dtype=np.intp)
-        if pin_zero:
-            # Every level but 0 carries its flag through; 0 sets it, and is
-            # reached from whichever flag was cheaper.
-            flag_choice[1] = 1
-            source = np.argmin(state[:, :, zero], axis=0)
-            rows = np.arange(n)
-            reached = state[source, rows, zero]
-            # The level backpointer has to follow the same flag the cost was
-            # taken from, or the reconstructed path is not the one measured.
-            reached_level = level_choice[source, rows, zero]
-            state[0, :, zero] = np.inf
-            state[1, :, zero] = reached
-            level_choice[1, :, zero] = reached_level
-            flag_choice[1, :, zero] = source
-        back_level.append(level_choice)
-        back_flag.append(flag_choice)
-
-    tail = segment_cost(at[:, last], bins, levels[last])
-    final = state + step[None, :, :, last] + tail[None, None, :]
-    if pin_zero:
-        final[0] = np.inf
-    flag, prev, cur = np.unravel_index(np.argmin(final), final.shape)
-
-    chosen = [last, int(cur), int(prev)]
-    for level_choice, flag_choice in zip(
-        reversed(back_level), reversed(back_flag)
-    ):
-        step_back = int(level_choice[flag, prev, cur])
-        flag = int(flag_choice[flag, prev, cur])
-        chosen.append(step_back)
-        prev, cur = step_back, prev
-    chosen = sorted({as_entry(levels[i]) for i in chosen})
-    if len(chosen) != k:
+    if pin_zero and zero != 0 and levels[zero] == 0:
+        # (upper levels, lower levels) each block's gaps run between.
+        blocks = [
+            (slice(0, zero + 1), slice(0, zero + 1)),
+            (slice(zero + 1, n), slice(zero, n)),
+        ]
+    else:
+        blocks = [(slice(0, n), slice(0, n))]
+    pairs = sum(
+        (upper.stop - upper.start) * (lower.stop - lower.start)
+        for upper, lower in blocks
+    )
+    device = histograms[0].weight.device
+    chunk = max(1, SOLVE_CHUNK[device.type] // pairs)
+    paths = torch.cat(
+        [
+            _shortest_paths(histograms[start : start + chunk], k, blocks)
+            for start in range(0, len(histograms), chunk)
+        ]
+    )
+    if not (paths.diff(dim=1) > 0).all():
         raise RuntimeError(
-            f"the search returned {len(chosen)} distinct levels for a "
-            f"{k}-level codebook"
+            f"the search returned a {k}-level codebook with a repeated level"
         )
-    return chosen
+    codebooks = levels.to(device)[paths]
+    return (codebooks.long() if integral else codebooks).tolist()
+
+
+def _shortest_paths(histograms, k, blocks):
+    """The candidates each histogram's optimal codebook takes, by index.
+
+    Every tensor below carries one leading row per histogram, so the
+    histograms are searched together on the device their sums are on.
+
+    Args:
+        histograms: Histograms over the same candidates.
+        k: Number of levels.
+        blocks: ``(upper, lower)`` slices of candidates, covering every
+            candidate once as an upper level: a gap may run from a lower
+            level to an upper one only within a block.
+
+    Returns:
+        ``[histograms, k]`` ascending candidate indices.
+    """
+    device = histograms[0].weight.device
+    cum_w, cum_s, cum_q = (
+        torch.stack(moment)
+        for moment in zip(*(histogram.cumulative() for histogram in histograms))
+    )
+    level = histograms[0].levels.to(device)
+    at = histograms[0].midpoint_bins(device)
+    # The bin each candidate starts: the midpoint of it with itself.
+    own = at.diagonal()
+    n = level.numel()
+    rows = torch.arange(len(histograms), device=device)
+
+    def segment_cost(lo_bin, hi_bin, level):
+        span_w = cum_w[:, hi_bin] - cum_w[:, lo_bin]
+        span_s = cum_s[:, hi_bin] - cum_s[:, lo_bin]
+        span_q = cum_q[:, hi_bin] - cum_q[:, lo_bin]
+        return span_q - 2 * level * span_s + level * level * span_w
+
+    # gap[:, b, a]: cost of the samples between levels a < b, each rounded
+    # to the nearer of the two.  The lower level runs along the last axis, so
+    # each round's minimum over it reads contiguous memory.
+    gaps = []
+    for upper, lower in blocks:
+        middle = at[upper, lower]
+        to_lower = segment_cost(own[None, lower], middle, level[None, lower])
+        to_upper = segment_cost(middle, own[upper, None], level[upper, None])
+        ascending = level[None, lower] < level[upper, None]
+        gaps.append(torch.where(ascending, to_lower + to_upper, torch.inf))
+
+    # state[:, c]: cost of the cheapest codebook so far whose highest level
+    # is c, counting the samples up to c.
+    state = torch.full(
+        (len(histograms), n), torch.inf, dtype=torch.float64, device=device
+    )
+    state[:, 0] = segment_cost(0, int(own[0]), level[0])
+    back = []
+    for _ in range(k - 1):
+        reached = torch.empty_like(state)
+        choice = torch.empty_like(state, dtype=torch.long)
+        for (upper, lower), gap in zip(blocks, gaps):
+            cost, source = (state[:, None, lower] + gap).min(dim=2)
+            reached[:, upper] = cost
+            choice[:, upper] = source + lower.start
+        state = reached
+        back.append(choice)
+
+    # The highest candidate ends every codebook, so the samples above it
+    # cost the same on every path and are left out.
+    cur = torch.full_like(rows, n - 1)
+    chosen = [cur]
+    for choice in reversed(back):
+        cur = choice[rows, cur]
+        chosen.append(cur)
+    return torch.stack(chosen[::-1], dim=1)
 
 
 def _contraction_last(tensor, ch_axis):
@@ -467,33 +572,54 @@ def _operand_name(scope, consumer, order, position):
     return f"{scope}|{role or f'mm{order}.{position}'}"
 
 
+def _global_scale(module, tensor):
+    """Return ``tensor``'s global scale as ``module``'s forward computes it.
+
+    It is taken over the whole operand, so a caller that splits the operand
+    into grid cells computes it once and hands the same scale to every cell.
+
+    Args:
+        module: The fake-quant.
+        tensor: The whole operand, as ``module.prepare`` returns it.
+
+    Returns:
+        A 0-d tensor, or None when the module has no global scale.
+    """
+    if not getattr(module, "global_scale", False):
+        return None
+    return calculate_global_scale(tensor, module.quant_max, module.scale_max)
+
+
 def _accumulate(
     tensor,
     module,
     energy,
     histogram,
-    scale_weighted=False,
-    quantized_scale=False,
+    global_scale,
+    quantized_scale=True,
 ):
     """Bin one operand's normalized values, weighted by its partner.
 
     Every element is counted, so what the fit sees is the tensor itself
-    rather than a draw from it.  An operand whose fake-quant holds an
-    outlier threshold is filtered the way deployment filters it: a value
-    at or past the threshold leaves the block maximum and gets zero
-    weight, so the fit sees the distribution the codebook will quantize.
+    rather than a draw from it.  Each element is also weighted by its
+    block's squared scale: the levels are fitted in normalized space, but
+    deployment multiplies the residual back by the block scale, so a
+    block's share of the output error grows with that scale squared.  An
+    outlier arrives as a zero and is binned as one: the pinned zero level
+    quantizes it without error, so it adds nothing to any codebook's cost.
+    On a GPU the whole pass runs as one kernel, ``bin_blocks``, to the same
+    bins.
 
     Args:
-        tensor: The operand, as it enters its fake-quant.
+        tensor: The operand as its fake-quant quantizes it -- rotated, its
+            outliers zeroed -- as ``module.prepare`` returns it.
         module: That fake-quant, which knows the block geometry.
         energy: The partner's per-channel energy, or None for a flat fit.
         histogram: Where the weighted moments accumulate.
-        scale_weighted: Also weight each element by its block's squared
-            scale.  The levels are fitted in normalized space, but
-            deployment multiplies the residual back by the block scale,
-            so a block's contribution to the output error grows with that
-            scale squared.  Without it every block votes equally on where
-            the levels sit, however large its values are.
+        global_scale: The whole operand's global scale, from
+            ``_global_scale``, or None.  A quantized scale divides it out
+            before the scale codebook and multiplies it back after, as
+            deployment does; the exact scale has no use for it.
         quantized_scale: Normalize by the scale deployment can store --
             the block maximum pushed through the scale codebook, and its
             power-of-two floor when the module forces one -- rather than
@@ -504,13 +630,37 @@ def _accumulate(
     ordered = _contraction_last(tensor.detach(), module.ch_axis)
     if ordered.numel() < module.block_size:
         return
-    threshold = getattr(module, "outlier_threshold", None)
-    if isinstance(threshold, torch.Tensor) and threshold.numel() == 0:
-        threshold = None
-    kept = None
-    if threshold is not None:
-        kept = ordered.abs() < threshold
-        ordered = ordered * kept
+    if energy is not None and energy.numel() != ordered.shape[-1]:
+        raise ValueError(
+            f"the partner energy has {energy.numel()} channels but the "
+            f"operand contracts over {ordered.shape[-1]}; a table contracted "
+            f"over tokens needs every step padded to one length"
+        )
+    if not quantized_scale:
+        global_scale = None
+    power_of_two = quantized_scale and getattr(module, "power_2_scale", False)
+    scale_qmap = (
+        getattr(module, "scale_qmap", None) if quantized_scale else None
+    )
+    if tensor.is_cuda:
+        # Deferred: triton ships only with the CUDA builds of torch.
+        from voyager_compiler.quantization.histogram_kernel import bin_blocks
+
+        axis = module.ch_axis
+        bin_blocks(
+            tensor.detach(),
+            axis[0] if isinstance(axis, (tuple, list)) else axis,
+            module.block_size,
+            module.quant_max,
+            energy,
+            histogram.search_edges(tensor.device),
+            histogram.sums(tensor.device),
+            BIN_COPIES,
+            power_of_two,
+            scale_qmap,
+            global_scale,
+        )
+        return
     ordered = ordered.float()
     # One scale serves both the normalization and the squared-scale weight,
     # so the two halves of the objective refer to the same number -- the
@@ -521,15 +671,12 @@ def _accumulate(
         axes=-1,
         block_size=module.block_size,
         quant_max=module.quant_max,
-        force_scale_power_of_two=(
-            getattr(module, "power_2_scale", False)
-            if quantized_scale
-            else False
-        ),
-        scale_qmap=(
-            getattr(module, "scale_qmap", None) if quantized_scale else None
-        ),
+        force_scale_power_of_two=power_of_two,
+        scale_qmap=scale_qmap,
+        global_scale=global_scale,
     )
+    if global_scale is not None:
+        scale = scale * global_scale
     scale = expand(scale, ordered.shape, module.block_size)
     normalized = (ordered / scale).reshape(-1)
     if energy is None:
@@ -539,10 +686,7 @@ def _accumulate(
         # position modulo the channel count -- which is what tiling the
         # energy across the flattened tensor spells.
         weights = energy.repeat(normalized.numel() // energy.numel())
-    if kept is not None:
-        weights = weights * kept.reshape(-1)
-    if scale_weighted:
-        weights = weights * (scale**2).reshape(-1)
+    weights = weights * (scale**2).reshape(-1)
     histogram.add(normalized, weights)
 
 
@@ -644,6 +788,39 @@ def leading_split(counts):
     return lead[0]
 
 
+def _candidate_levels(module, nonnegative, resolution):
+    """The levels a fake-quant's table is fitted from, ascending.
+
+    An entry dtype offers its own values.  Entries that keep the model's
+    dtype are bfloat16, so the candidates are ``resolution`` bfloat16
+    values spread across the range, mirrored about zero when it is signed
+    so that it holds an exact 0.  A tensor that never goes negative -- a
+    softmax output -- keeps only the non-negative candidates, so that no
+    level is spent on values that cannot occur.
+
+    Args:
+        module: The fake-quant.
+        nonnegative: Whether the tensor it quantizes never goes negative.
+        resolution: Candidates across the range for entries that keep the
+            model's dtype.
+
+    Returns:
+        The candidates as a float64 tensor.
+    """
+    low = 0.0 if nonnegative else -module.quant_max
+    if module.code_dtype is None:
+        if low < 0:
+            half = torch.linspace(0, module.quant_max, resolution // 2 + 1)
+            spread = torch.cat([-half.flip(0)[:-1], half])
+        else:
+            spread = torch.linspace(0, module.quant_max, resolution)
+        candidates = spread.bfloat16().float().unique()
+    else:
+        candidates = entry_levels(module.code_dtype)
+    candidates = candidates.double()
+    return candidates[(candidates >= low) & (candidates <= module.quant_max)]
+
+
 def install_codebook(module, levels, counts=None):
     """Write fitted levels into a fake-quant, in place.
 
@@ -664,7 +841,7 @@ def install_codebook(module, levels, counts=None):
     """
     device = module.qmap.device
     if counts is None:
-        module.qmap = codebook_qmap(levels, device)
+        module.qmap = codebook_qmaps([levels], device)[0]
     else:
         module.qmap = torch.tensor(
             levels, dtype=torch.float32, device=device
@@ -777,7 +954,7 @@ def _accumulate_fisher(
     def note_grad(name, module, grad):
         if grad is None:
             return
-        grad = grad.detach().float()
+        grad = _as_quantized(module, grad.detach().float())
         if name in grid:
             per = torch.stack(
                 [
@@ -791,8 +968,9 @@ def _accumulate_fisher(
             per = per_channel(grad, module.ch_axis)
         fisher[name] = per if name not in fisher else fisher[name] + per
 
-    def note_weight(name, activation, grad):
+    def note_weight(name, module, activation, grad):
         rows = activation.detach().reshape(-1, activation.shape[-1]).float()
+        rows = _as_quantized(module, rows)
         grads = grad.detach().reshape(-1, grad.shape[-1]).float().pow(2)
         if name in grid:
             # The weight is ``[out, in]`` -- one axis from each factor --
@@ -835,8 +1013,8 @@ def _accumulate_fisher(
             tapped[consumer] = consumer.target
             consumer.target = _tap_output(
                 consumer.target,
-                lambda activation, grad, name=name: note_weight(
-                    name, activation, grad
+                lambda activation, grad, name=name, module=module: note_weight(
+                    name, module, activation, grad
                 ),
             )
     if tapped:
@@ -895,12 +1073,10 @@ def fit_codebooks(
     weighting=Weighting.PARTNER,
     weight_by=(),
     granularity=None,
-    scale_weighted=False,
-    quantized_scale=False,
     pin_zero=True,
     quantized_inputs=False,
+    quantized_scale=True,
     dump=None,
-    histograms=None,
     max_levels=None,
     resolution=FLOAT_RESOLUTION,
 ):
@@ -935,14 +1111,10 @@ def fit_codebooks(
             ``n`` splits it into ``n``, ``1`` shares one across it.
             ``(-1, 1, 1)`` is one table per attention head, ``(28, 16)``
             a grid over a weight's last two axes.
-        scale_weighted: Weight each element by its block's squared scale, so
-            the fit minimizes the error deployment makes.
-        quantized_scale: Normalize by quantized block scale.
         pin_zero: Force a zero level.
         quantized_inputs: Sample with the fake-quants live.
+        quantized_scale: Normalize by quantized block scale.
         dump: Path to write the fitted tables to, as JSON.
-        histograms: Dict filled with ``name -> accumulated histograms``,
-            one per table the tensor is fitted.  Fresh by default.
         max_levels: Fit at most this many levels per table.  None fills the
             index, and a table never holds more levels than its grid.
         resolution: Candidates across the range for a table whose entries
@@ -1014,16 +1186,16 @@ def fit_codebooks(
     energies, floors, fisher_weights = {}, {}, {}
     # Settled the first time an operand is binned, once its rank is known.
     settled_counts = {}
-    histograms = {} if histograms is None else histograms
+    histograms = {}
 
     live = {
-        module: module.fake_quant_enabled.clone()
+        module: module.fake_quant_enabled
         for module in model.modules()
         if hasattr(module, "qmap")
     }
     if not quantized_inputs:
         for module in live:
-            module.fake_quant_enabled.zero_()
+            module.disable_fake_quant()
 
     def note_energy(key, ch_axis, tensor):
         axis = leading.get(key)
@@ -1040,6 +1212,7 @@ def fit_codebooks(
         energies[key] = share if held is None else held + share
 
     def measure(name, module, tensor):
+        tensor = _as_quantized(module, tensor)
         note_energy(name, module.ch_axis, tensor)
         lowest = tensor.detach().min()
         held = floors.get(name)
@@ -1060,30 +1233,13 @@ def fit_codebooks(
             if isinstance(module.ch_axis, (tuple, list))
             else module.ch_axis
         )
-        cells = _grid_cells(tensor, counts)
+        prepared = module.prepare(tensor.detach())
+        cells = _grid_cells(prepared, counts)
         if name not in histograms:
-            # A tensor that never went negative -- a softmax output -- would
-            # spend half its levels on values that cannot occur.  The floor
-            # is read off the whole tensor in the pass before this one.
-            low = 0.0 if floors[name].item() >= 0 else -module.quant_max
-            if module.code_dtype is None:
-                # The fake-quant's table holds bfloat16 entries, so the
-                # candidates are bfloat16 values spread across the range; a
-                # signed range is mirrored about zero so it holds an exact 0.
-                if low < 0:
-                    half = torch.linspace(
-                        0, module.quant_max, resolution // 2 + 1
-                    )
-                    spread = torch.cat([-half.flip(0)[:-1], half])
-                else:
-                    spread = torch.linspace(0, module.quant_max, resolution)
-                candidates = spread.bfloat16().float().unique()
-            else:
-                candidates = entry_levels(module.code_dtype)
-            candidates = candidates.double().numpy()
-            candidates = candidates[
-                (candidates >= low) & (candidates <= module.quant_max)
-            ]
+            # The floor is read off the whole tensor in the pass before this.
+            candidates = _candidate_levels(
+                module, floors[name].item() >= 0, resolution
+            )
             histograms[name] = [Histogram(candidates) for _ in cells]
         energy = None
         # The operand's own loss-gradient sensitivity, not a partner's.
@@ -1097,6 +1253,7 @@ def fit_codebooks(
             for share in (energies.get(other) for other in partners[name]):
                 if share is not None:
                     energy = share if energy is None else energy + share
+        global_scale = _global_scale(module, prepared)
         for cell, ((index, slab), histogram) in enumerate(
             zip(cells, histograms[name])
         ):
@@ -1120,7 +1277,7 @@ def fit_codebooks(
                 module,
                 share,
                 histogram,
-                scale_weighted,
+                global_scale,
                 quantized_scale,
             )
 
@@ -1218,8 +1375,10 @@ def fit_codebooks(
 
                 handles += [
                     module.register_forward_pre_hook(
-                        lambda _, inputs, key=key, axis=axis, fixed=fixed: (
-                            once_energy(key, axis, fixed, inputs[0])
+                        lambda fq, inputs, key=key, axis=axis, fixed=fixed: (
+                            once_energy(
+                                key, axis, fixed, _as_quantized(fq, inputs[0])
+                            )
                         )
                     )
                     for module, key, axis, fixed in hooked
@@ -1252,7 +1411,7 @@ def fit_codebooks(
                 model.recompile()
 
     for module, enabled in live.items():
-        module.fake_quant_enabled.copy_(enabled)
+        module.enable_fake_quant(enabled)
 
     # How concentrated the weighting is decides how much of the codebook a
     # few channels own: past roughly a hundredfold ratio the levels stop
@@ -1294,13 +1453,10 @@ def fit_codebooks(
             unsigned.append(name)
         # The index addresses 2**index_bits entries, and the grid can hold
         # fewer.
-        k = min(2**module.index_bits, group[0].levels.size)
+        k = min(2**module.index_bits, group[0].levels.numel())
         if max_levels is not None:
             k = min(k, max_levels)
-        fitted = [
-            optimal_codebook(histogram, k=k, pin_zero=pin_zero)
-            for histogram in group
-        ]
+        fitted = optimal_codebooks(group, k=k, pin_zero=pin_zero)
         # A codebook carries one axis per tensor axis, so the grid the
         # fit asked for is the shape the decoder dispatches on and every
         # granularity has a layout.
@@ -1381,3 +1537,178 @@ def load_codebooks(model, tables, skip=()):
             unfitted[0],
         )
     return sorted(tables)
+
+
+@contextlib.contextmanager
+def _pre_hooks(modules, hook):
+    """Hold ``hook(name, module, inputs)`` before each of ``modules`` runs.
+
+    Args:
+        modules: ``name -> module``.
+        hook: Called with the module's name ahead of its own arguments.
+    """
+    handles = [
+        module.register_forward_pre_hook(functools.partial(hook, name))
+        for name, module in modules.items()
+    ]
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _as_quantized(module, tensor):
+    """``tensor`` as ``module`` quantizes it: rotated first if it rotates."""
+    if getattr(module, "rht_axis", None) is None:
+        return tensor
+    return _rotate(tensor, module.rht_axis, module.rht_matrix)
+
+
+class CodebookRefitter:
+    """Refit a training model's forward lookup tables to what it now sees.
+
+    A window of training steps runs under ``measure`` and then
+    ``accumulate``.  The first records each operand's channel energy and
+    whether it goes negative; the rest bin each forward table's operand,
+    weighted by its partners' energy, as ``fit_codebooks`` bins a
+    calibration set.  ``refit`` then installs the table each histogram's
+    optimum gives.  The gradients' tables stay as they are, and a partner
+    without microscaling blocks to measure along leaves its operand
+    unweighted.
+
+    Args:
+        model: Model ``prepare_training`` prepared with lookup-table specs.
+        pin_zero: Force a zero level into every table.
+        resolution: Candidates across the range for entries that keep the
+            model's dtype.
+    """
+
+    def __init__(self, model, pin_zero=True, resolution=FLOAT_RESOLUTION):
+        quantizers = model.training_quantizers
+        self.modules = dict(quantizers.named_children())
+        self.forward_tables = [
+            name
+            for name, module in self.modules.items()
+            if isinstance(module, MXFakeQuantize)
+            and module.is_codebook_quantization
+            and name not in quantizers.gradients
+        ]
+        partners = gemm_partners(model)
+        self.partners = {
+            name: [
+                partner
+                for partner in sorted(partners[name])
+                if isinstance(self.modules[partner], MXFakeQuantize)
+            ]
+            for name in self.forward_tables
+        }
+        self.pin_zero = pin_zero
+        self.resolution = resolution
+        self.energies = {}
+        self.nonnegative = {}
+        self.histograms = {}
+
+    @contextlib.contextmanager
+    def measure(self):
+        """Start a window: record each operand's channel energy and sign.
+
+        Hooks the forward tables and their partners for the step it wraps.
+        Each sign stays on the device until the step ends, and one read then
+        brings them all back.
+        """
+        self.energies, self.nonnegative, self.histograms = {}, {}, {}
+        names = set(self.forward_tables).union(*self.partners.values())
+        with _pre_hooks({n: self.modules[n] for n in names}, self._record):
+            yield
+        signs = torch.stack(list(self.nonnegative.values())).tolist()
+        self.nonnegative = dict(zip(self.nonnegative, signs))
+
+    def accumulate(self):
+        """Hook the forward tables to bin their operands, after ``measure``
+        in the same window."""
+        tables = {name: self.modules[name] for name in self.forward_tables}
+        return _pre_hooks(tables, self._bin)
+
+    def refit(self):
+        """Install the table each binned histogram's optimum gives.
+
+        Histograms over the same candidates, fitted to the same number of
+        levels, are solved together, and their lookup tables built together.
+
+        Returns:
+            ``name -> fitted levels``.
+        """
+        groups = {}
+        for name, histogram in self.histograms.items():
+            k = min(
+                2 ** self.modules[name].index_bits, histogram.levels.numel()
+            )
+            key = (tuple(histogram.levels.tolist()), k)
+            groups.setdefault(key, []).append(name)
+        fitted = {}
+        for (_, k), names in groups.items():
+            codebooks = optimal_codebooks(
+                [self.histograms[name] for name in names], k, self.pin_zero
+            )
+            fitted.update(zip(names, codebooks))
+            device = self.modules[names[0]].qmap.device
+            for name, qmap in zip(names, codebook_qmaps(codebooks, device)):
+                self.modules[name].qmap = qmap
+        return fitted
+
+    def _record(self, name, module, inputs):
+        """Add one operand's channel energy and sign to the window's."""
+        tensor = _as_quantized(module, inputs[0])
+        energy = _channel_energy(tensor, module.ch_axis)
+        self.energies[name] = self.energies.get(name, 0) + energy
+        nonnegative = (tensor >= 0).all()
+        held = self.nonnegative.get(name)
+        self.nonnegative[name] = (
+            nonnegative if held is None else held & nonnegative
+        )
+
+    def _bin(self, name, module, inputs):
+        """Bin one forward table's operand, weighted by its partners."""
+        if name not in self.histograms:
+            candidates = _candidate_levels(
+                module, self.nonnegative[name], self.resolution
+            )
+            self.histograms[name] = Histogram(candidates)
+        energies = [
+            self.energies[partner]
+            for partner in self.partners[name]
+            if partner in self.energies
+        ]
+        operand = module.prepare(inputs[0])
+        _accumulate(
+            operand,
+            module,
+            sum(energies) if energies else None,
+            self.histograms[name],
+            _global_scale(module, operand),
+        )
+
+
+def refit_window(refitter, step, every, collect):
+    """The context a training step runs in, to refit every ``every`` steps.
+
+    The ``collect`` steps before each refit form its window: the first
+    measures and the rest accumulate.  Every other step runs unhooked.
+
+    Args:
+        refitter: The model's ``CodebookRefitter``.
+        step: Steps completed before this one.
+        every: Steps between refits.
+        collect: Steps each window spans, at least two.
+
+    Returns:
+        A context manager.
+    """
+    position = step % every
+    start = every - collect
+    if position == start:
+        return refitter.measure()
+    if position > start:
+        return refitter.accumulate()
+    return contextlib.nullcontext()
