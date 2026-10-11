@@ -403,9 +403,6 @@ def _random_bytes(seed: torch.Tensor, shape, device) -> torch.Tensor:
     return ((words[..., None] >> shifts) & 0xFF).flatten()[:numel].view(shape)
 
 
-# Inductor cannot lower ``searchsorted`` against levels sorted in the same
-# graph, so under ``torch.compile`` this runs eagerly.
-@torch.compiler.disable
 def _neighbors(value: torch.Tensor, qmap: torch.Tensor):
     """The levels of ``qmap`` on either side of each element.
 

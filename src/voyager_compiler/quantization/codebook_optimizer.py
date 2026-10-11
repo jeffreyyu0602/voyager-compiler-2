@@ -21,9 +21,12 @@ off zero -- pass ``pin_zero`` to forbid it.
 import contextlib
 import enum
 import functools
+import itertools
 import json
 import logging
+import math
 import os
+from typing import NamedTuple
 
 import torch
 
@@ -36,6 +39,7 @@ from voyager_compiler.quantization.fake_quantize import (
     entry_levels,
 )
 from voyager_compiler.quantization.training import gemm_partners
+from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
 
@@ -442,17 +446,6 @@ def _channel_energy(tensor, ch_axis):
     return flat.reshape(-1, flat.shape[-1]).pow(2).mean(0)
 
 
-def _constant(node):
-    """Whether a node yields the same tensor on every calibration entry.
-
-    A parameter is, and so is a fake-quant reading one directly.
-    """
-    return node.op == "get_attr" or (
-        node.op == "call_module"
-        and getattr(node.args[0], "op", None) == "get_attr"
-    )
-
-
 #: Ops that contract their first two arguments against each other, mapped
 #: to the axis each of the two positions contracts along.  Only there is a
 #: codebook's job defined: the block runs along the contraction axis, and
@@ -593,12 +586,14 @@ def _global_scale(module, tensor):
 def _accumulate(
     tensor,
     module,
-    energy,
-    histogram,
+    energies,
+    histograms,
+    counts,
     global_scale,
     quantized_scale=True,
 ):
-    """Bin one operand's normalized values, weighted by its partner.
+    """Bin one operand's normalized values into each grid cell's histogram,
+    weighted by its partner.
 
     Every element is counted, so what the fit sees is the tensor itself
     rather than a draw from it.  Each element is also weighted by its
@@ -607,15 +602,17 @@ def _accumulate(
     block's share of the output error grows with that scale squared.  An
     outlier arrives as a zero and is binned as one: the pinned zero level
     quantizes it without error, so it adds nothing to any codebook's cost.
-    On a GPU the whole pass runs as one kernel, ``bin_blocks``, to the same
-    bins.
+    On a GPU the whole operand, every cell of it, runs as one kernel,
+    ``bin_blocks``, to the same bins.
 
     Args:
         tensor: The operand as its fake-quant quantizes it -- rotated, its
             outliers zeroed -- as ``module.prepare`` returns it.
         module: That fake-quant, which knows the block geometry.
-        energy: The partner's per-channel energy, or None for a flat fit.
-        histogram: Where the weighted moments accumulate.
+        energies: Each cell's partner energy per channel, or None for a
+            flat fit.
+        histograms: Each cell's histogram, in ``_grid_cells`` order.
+        counts: Cells along each axis, as ``_resolve_counts`` gives them.
         global_scale: The whole operand's global scale, from
             ``_global_scale``, or None.  A quantized scale divides it out
             before the scale codebook and multiplies it back after, as
@@ -627,14 +624,16 @@ def _accumulate(
             former, so the latter places the levels against values it
             never sees.
     """
-    ordered = _contraction_last(tensor.detach(), module.ch_axis)
-    if ordered.numel() < module.block_size:
+    cells = _grid_cells(tensor.detach(), counts)
+    first = _contraction_last(cells[0][1], module.ch_axis)
+    if first.numel() < module.block_size:
         return
-    if energy is not None and energy.numel() != ordered.shape[-1]:
+    channels = first.shape[-1]
+    if energies is not None and any(e.numel() != channels for e in energies):
         raise ValueError(
-            f"the partner energy has {energy.numel()} channels but the "
-            f"operand contracts over {ordered.shape[-1]}; a table contracted "
-            f"over tokens needs every step padded to one length"
+            f"the partner energy has {energies[0].numel()} channels but the "
+            f"operand contracts over {channels}; a table contracted over "
+            f"tokens needs every step padded to one length"
         )
     if not quantized_scale:
         global_scale = None
@@ -652,42 +651,46 @@ def _accumulate(
             axis[0] if isinstance(axis, (tuple, list)) else axis,
             module.block_size,
             module.quant_max,
-            energy,
-            histogram.search_edges(tensor.device),
-            histogram.sums(tensor.device),
+            None if energies is None else torch.stack(energies),
+            histograms[0].search_edges(tensor.device),
+            [histogram.sums(tensor.device) for histogram in histograms],
+            counts,
             BIN_COPIES,
             power_of_two,
             scale_qmap,
             global_scale,
         )
         return
-    ordered = ordered.float()
-    # One scale serves both the normalization and the squared-scale weight,
-    # so the two halves of the objective refer to the same number -- the
-    # one deployment computes: its blocks pad out along the contraction
-    # axis rather than running past it.
-    scale = calculate_mx_qparam(
-        ordered,
-        axes=-1,
-        block_size=module.block_size,
-        quant_max=module.quant_max,
-        force_scale_power_of_two=power_of_two,
-        scale_qmap=scale_qmap,
-        global_scale=global_scale,
-    )
-    if global_scale is not None:
-        scale = scale * global_scale
-    scale = expand(scale, ordered.shape, module.block_size)
-    normalized = (ordered / scale).reshape(-1)
-    if energy is None:
-        weights = torch.ones_like(normalized)
-    else:
-        # The contraction axis is last, so an element's channel is its
-        # position modulo the channel count -- which is what tiling the
-        # energy across the flattened tensor spells.
-        weights = energy.repeat(normalized.numel() // energy.numel())
-    weights = weights * (scale**2).reshape(-1)
-    histogram.add(normalized, weights)
+    if energies is None:
+        energies = [None] * len(cells)
+    for (_, slab), energy, histogram in zip(cells, energies, histograms):
+        ordered = _contraction_last(slab, module.ch_axis).float()
+        # One scale serves both the normalization and the squared-scale
+        # weight, so the two halves of the objective refer to the same
+        # number -- the one deployment computes: its blocks pad out along
+        # the contraction axis rather than running past it.
+        scale = calculate_mx_qparam(
+            ordered,
+            axes=-1,
+            block_size=module.block_size,
+            quant_max=module.quant_max,
+            force_scale_power_of_two=power_of_two,
+            scale_qmap=scale_qmap,
+            global_scale=global_scale,
+        )
+        if global_scale is not None:
+            scale = scale * global_scale
+        scale = expand(scale, ordered.shape, module.block_size)
+        normalized = (ordered / scale).reshape(-1)
+        if energy is None:
+            weights = torch.ones_like(normalized)
+        else:
+            # The contraction axis is last, so an element's channel is its
+            # position modulo the channel count -- which is what tiling the
+            # energy across the flattened tensor spells.
+            weights = energy.repeat(normalized.numel() // energy.numel())
+        weights = weights * (scale**2).reshape(-1)
+        histogram.add(normalized, weights)
 
 
 def _resolve_counts(counts, shape):
@@ -881,33 +884,8 @@ def _tap_output(call, note):
     return tapped
 
 
-def _tap_operands(call, note):
-    """Wrap an op so ``note`` sees its arguments, per call.
-
-    A partner with no fake-quant has no module to hook, but it is always
-    an argument of the contracted op reading it, so that node is pointed
-    at a wrapper the way ``_tap_output``'s is.
-
-    Args:
-        call: What the node calls today.
-        note: Called as ``note(args)`` with the op's positional arguments
-            before it runs.
-
-    Returns:
-        A stand-in with the same signature, for the node to point at.
-    """
-
-    def tapped(*args, **kwargs):
-        note(args)
-        return call(*args, **kwargs)
-
-    return tapped
-
-
-def _accumulate_fisher(
-    model, calibration, operands, grid, fisher, tap_weights=False
-):
-    """Fill per-channel loss-gradient Fisher weights, by a backward pass.
+def _accumulate_fisher(model, calibration, operands, grid, tap_weights):
+    """Return per-channel loss-gradient Fisher weights, by a backward pass.
 
     Weights each operand by the sum over calibration of its squared
     gradient of the final loss, per channel -- the Gauss-Newton diagonal,
@@ -938,14 +916,19 @@ def _accumulate_fisher(
         operands: ``name -> (module, node, partners)`` from the caller.
         grid: ``name -> granularity tuple`` for the tensors fitted more
             than one table, whose diagonal is resolved per cell here.
-        fisher: Dict filled with each operand's per-channel Fisher
-            weight.  Operands absent from it fall back to their partner.
         tap_weights: Also weight the parameters, by the taps described
             above.  A parameter's exact diagonal carries a per-token
             ``||g_t||^2`` factor that a few high-loss calibration tokens
             dominate -- a property of the calibration set rather than the
-            weight -- so the default leaves parameters on partner energy.
+            weight -- so ``fisher_activations`` leaves them on partner
+            energy.
+
+    Returns:
+        ``name -> per-channel Fisher weight``, ``[cells, channels]`` for a
+        tensor in ``grid``.  An operand absent from it reached no
+        per-token gradient and keeps the partner-energy weighting.
     """
+    fisher = {}
 
     def per_channel(grad, ch_axis):
         ordered = _contraction_last(grad, ch_axis)
@@ -1043,6 +1026,19 @@ def _accumulate_fisher(
         if tapped:
             model.recompile()
 
+    missed = sorted(set(operands) - set(fisher))
+    logger.info(
+        "%d operands weighted by their loss-gradient Fisher%s",
+        len(fisher),
+        (
+            f"; {len(missed)} reached no per-token gradient and keep the "
+            f"partner-energy weighting: {_preview(missed)}"
+            if missed
+            else ""
+        ),
+    )
+    return fisher
+
 
 class Weighting(enum.Enum):
     """Which sensitivity weights each sample in a codebook fit.
@@ -1082,16 +1078,23 @@ def fit_codebooks(
 ):
     """Fit a codebook to every tensor a prepared model quantizes, in place.
 
-    Runs the calibration set twice: once to measure channel energies and
-    signs -- a partner needs no codebook of its own to be measured: one
-    with any fake-quant is hooked there, and a bare tensor is read at the
-    contracted op that consumes it -- and once to
-    bin every element of each operand weighted by its *partner's* energy,
-    so the fit minimizes layer-output error rather than tensor MSE.
-    Nothing is sampled, so a fit is reproducible and sees the whole
-    tensor.  Block size, contraction axis and range come
-    from the fake-quant the quantizer already attached to each tensor, and
-    the fitted levels are written back into that module's lookup table.
+    Block size, contraction axis and range come from the fake-quant the
+    quantizer attached to each tensor, and the fitted levels are written
+    back into it.  The fit runs in four stages:
+
+    1. Plan (``_plan_fit``): from the graph alone, which tensors are
+       fitted, which partners weight each, and where each tensor is read.
+    2. Measure (``_measuring``): a pass records every tensor's channel
+       energy and every fitted tensor's sign and shape.  Under a Fisher
+       weighting it rides the Fisher pass, which runs every input forward
+       anyway.
+    3. Collect (``_new_fits``, ``_collecting``): a second pass bins every
+       element of each fitted tensor, weighted by its partners' energy or
+       its own Fisher diagonal, so the fit minimizes output error rather
+       than tensor MSE.  Nothing is sampled, so a fit is reproducible and
+       sees the whole tensor.
+    4. Solve (``_solve_fits``): each histogram's exact optimum becomes a
+       table, and the tables are installed.
 
     Args:
         model: Graph module from ``prepare_pt2e``, before ``convert_pt2e``.
@@ -1125,11 +1128,11 @@ def fit_codebooks(
         as a list of levels, a grid of them as
         ``{"granularity": counts, "levels": tables}``.
     """
-    operands = _quantized_operands(model, skip)
+    plan = _plan_fit(model, skip, weight_by, granularity)
     logger.info(
         "fitting %d tensors over %d calibration inputs, weighting a shared "
         "tensor by %s",
-        len(operands),
+        len(plan.operands),
         len(calibration),
         (
             f"its {', '.join(weight_by)} partner"
@@ -1147,46 +1150,12 @@ def fit_codebooks(
             "sampling unweighted: the fit minimizes tensor MSE rather than "
             "layer-output error, which recovers less than half as much"
         )
-    named = {node: name for name, (_, node, _) in operands.items()}
-    partners = {
-        name: [
-            named.get(partner, partner.name)
-            for partner in group
-            if not weight_by
-            or any(pick in named.get(partner, "") for pick in weight_by)
-        ]
-        or [named.get(partner, partner.name) for partner in group]
-        for name, (_, _, group) in operands.items()
-    }
-    grid = {}
-    for pattern, counts in (granularity or {}).items():
-        for name in operands:
-            if pattern in name:
-                grid[name] = tuple(counts)
-    # Which axis, if any, each tensor's tables are indexed by.  Fitting
-    # accepts any granularity; whether the result can be written into a
-    # qmap is settled once, where the tables are installed.
-    indexed = {name: leading_split(counts) for name, counts in grid.items()}
-    # A split tensor's error reaches the output through its partner's own
-    # slice of that axis, so the partner's energy is measured there too.
-    leading = {name: axis for name, axis in indexed.items() if axis is not None}
-    leading.update(
-        {
-            other: axis
-            for name, axis in list(leading.items())
-            for other in partners[name]
-        }
-    )
-    if grid:
+    if plan.grid:
         logger.info(
             "fitting %d of them more than one codebook: %s",
-            len(grid),
-            ", ".join(sorted(grid)[:3]) + (" ..." if len(grid) > 3 else ""),
+            len(plan.grid),
+            _preview(sorted(plan.grid)),
         )
-    energies, floors, fisher_weights = {}, {}, {}
-    # Settled the first time an operand is binned, once its rank is known.
-    settled_counts = {}
-    histograms = {}
 
     live = {
         module: module.fake_quant_enabled
@@ -1197,105 +1166,112 @@ def fit_codebooks(
         for module in live:
             module.disable_fake_quant()
 
-    def note_energy(key, ch_axis, tensor):
-        axis = leading.get(key)
-        if axis is not None:
-            share = torch.stack(
-                [
-                    _channel_energy(piece, ch_axis)
-                    for piece in tensor.unbind(axis)
-                ]
+    fisher = {}
+    with _measuring(model, plan) as measured:
+        if weighting in (Weighting.FISHER_ACTIVATIONS, Weighting.FISHER_ALL):
+            fisher = _accumulate_fisher(
+                model,
+                calibration,
+                plan.operands,
+                plan.grid,
+                tap_weights=weighting is Weighting.FISHER_ALL,
             )
         else:
-            share = _channel_energy(tensor, ch_axis)
-        held = energies.get(key)
-        energies[key] = share if held is None else held + share
+            _run_calibration(model, calibration, "measure")
 
-    def measure(name, module, tensor):
-        tensor = _as_quantized(module, tensor)
-        note_energy(name, module.ch_axis, tensor)
-        lowest = tensor.detach().min()
-        held = floors.get(name)
-        floors[name] = lowest if held is None else torch.minimum(held, lowest)
+    fits = _new_fits(plan, measured, fisher, weighting, resolution)
+    with _collecting(model, plan, fits, quantized_scale):
+        _run_calibration(model, calibration, "collect")
 
-    def collect(name, module, tensor):
-        counts = settled_counts.get(name)
-        if counts is None:
-            counts = (
-                _resolve_counts(grid[name], tensor.shape)
-                if name in grid
-                else (1,) * tensor.dim()
-            )
-            settled_counts[name] = counts
-        axis = leading.get(name)
-        channel = (
-            module.ch_axis[0]
-            if isinstance(module.ch_axis, (tuple, list))
-            else module.ch_axis
-        )
-        prepared = module.prepare(tensor.detach())
-        cells = _grid_cells(prepared, counts)
-        if name not in histograms:
-            # The floor is read off the whole tensor in the pass before this.
-            candidates = _candidate_levels(
-                module, floors[name].item() >= 0, resolution
-            )
-            histograms[name] = [Histogram(candidates) for _ in cells]
-        energy = None
-        # The operand's own loss-gradient sensitivity, not a partner's.
-        # Only a Fisher mode fills that dict, so membership is the test.
-        from_fisher = name in fisher_weights
-        if from_fisher:
-            energy = fisher_weights[name]
-        elif weighting is not Weighting.NONE:
-            # A tensor read by several ops reaches the output through all of
-            # them, so the energies of its partners add.
-            for share in (energies.get(other) for other in partners[name]):
-                if share is not None:
-                    energy = share if energy is None else energy + share
-        global_scale = _global_scale(module, prepared)
-        for cell, ((index, slab), histogram) in enumerate(
-            zip(cells, histograms[name])
-        ):
-            share = energy
-            if share is not None and share.dim() == 2:
-                if from_fisher:
-                    share = share[cell]
-                elif axis is None:
-                    share = share.mean(0)
-                else:
-                    start = index[axis] * share.shape[0] // counts[axis]
-                    stop = (index[axis] + 1) * share.shape[0] // counts[axis]
-                    share = share[start : max(stop, start + 1)].mean(0)
-            if share is not None and not from_fisher and counts[channel] > 1:
-                # The energy indexes the contraction axis, so only a cell
-                # split along it holds a slice of the channels; any other
-                # split leaves every cell the whole vector.
-                share = share.chunk(counts[channel])[index[channel]]
-            _accumulate(
-                slab,
-                module,
-                share,
-                histogram,
-                global_scale,
-                quantized_scale,
-            )
+    for module, enabled in live.items():
+        module.enable_fake_quant(enabled)
 
-    # A parameter is the same tensor on every calibration input, so binning
-    # it once is binning it every time: the three moments scale together and
-    # the cost the solver minimizes scales with them, which leaves its
-    # minimum where it was.  Visiting one anyway is most of the work, since
-    # a model's parameters outweigh one input's activations many times over.
-    static = {
-        name for name, (_, node, _) in operands.items() if _constant(node)
+    _log_concentration("fisher", fisher)
+    _log_concentration("partner energy", measured.energies)
+    tables = _solve_fits(plan.operands, fits, pin_zero, max_levels)
+    _install_tables(plan.operands, tables)
+    if dump is not None:
+        with open(dump, "w") as handle:
+            json.dump(tables, handle, indent=2, sort_keys=True)
+        logger.info("wrote %d codebooks to %s", len(tables), dump)
+    return tables
+
+
+class _Plan(NamedTuple):
+    """What a fit reads, decided from the graph before any input runs.
+
+    A tensor whose energy is measured goes by a key: a fitted tensor by its
+    name, any other partner by its node's name.
+
+    Attributes:
+        operands: ``name -> (fake-quant, node, partner nodes)`` for every
+            tensor fitted, from ``_quantized_operands``.
+        sources: ``key -> (node, axis, fake-quant)`` for every tensor
+            measured: the node yielding it, the axis it is contracted over,
+            and the fake-quant whose rotation it takes, None for a partner
+            no fake-quant reads.
+        partners: ``name -> keys`` of the partners whose energy weights
+            each fitted tensor.
+        grid: ``name -> granularity`` for each tensor fitted more than one
+            table.
+        leading: ``key -> axis`` for each tensor measured per slice along a
+            leading axis: one whose tables split that axis, and its
+            partners.
+    """
+
+    operands: dict
+    sources: dict
+    partners: dict
+    grid: dict
+    leading: dict
+
+
+def _plan_fit(model, skip, weight_by, granularity):
+    """Decide from the graph what a fit reads and what weights each tensor.
+
+    A fitted tensor is read where its fake-quant reads it.  So is a partner
+    that is not fitted but has a fake-quant, and a partner with none is the
+    tensor its contracted op reads; either is measured along the axis that
+    op contracts it over.
+
+    Args:
+        model: Graph module from ``prepare_pt2e``.
+        skip: Substrings of operand names to leave alone.
+        weight_by: Substrings picking the partners that weight a tensor
+            read by several ops; see ``fit_codebooks``.
+        granularity: ``name substring -> counts``; see ``fit_codebooks``.
+
+    Returns:
+        The ``_Plan``.
+
+    Raises:
+        ValueError: A granularity splits more than one leading axis.
+    """
+    operands = _quantized_operands(model, skip)
+    named = {node: name for name, (_, node, _) in operands.items()}
+
+    sources = {
+        name: (node.args[0], module.ch_axis, module)
+        for name, (module, node, _) in operands.items()
     }
-
-    outside, hooked, covered = {}, [], set()
-    for _, node, group in operands.values():
-        for partner in group:
-            if partner in named or partner in covered:
+    partners = {}
+    for name, (_, node, group) in operands.items():
+        # Only a fitted partner has a name for ``weight_by`` to pick; when
+        # it picks none, every partner weights the tensor.
+        picked = [
+            partner
+            for partner in group
+            if any(pick in named.get(partner, "") for pick in weight_by)
+        ]
+        chosen = picked or group
+        partners[name] = [
+            named.get(partner, partner.name) for partner in chosen
+        ]
+        # A partner that is not fitted is read where its own fake-quant
+        # reads it, or as the tensor itself when it has none.
+        for partner in chosen:
+            if partner in named or partner.name in sources:
                 continue
-            covered.add(partner)
             consumer = next(
                 user
                 for user in node.users
@@ -1303,186 +1279,381 @@ def fit_codebooks(
                 and node in user.args[:2]
                 and partner in user.args[:2]
             )
-            spot = consumer.args[:2].index(partner)
-            axis = CONTRACTED_OPS[consumer.target][spot]
-            if partner.op == "call_module":
-                hooked.append(
-                    (
-                        model.get_submodule(partner.target),
-                        partner.name,
-                        axis,
-                        _constant(partner),
-                    )
-                )
-            else:
-                outside.setdefault(consumer, []).append(
-                    (spot, partner.name, axis, _constant(partner))
-                )
-
-    if weighting in (Weighting.FISHER_ACTIVATIONS, Weighting.FISHER_ALL):
-        _accumulate_fisher(
-            model,
-            calibration,
-            operands,
-            grid,
-            fisher_weights,
-            tap_weights=weighting is Weighting.FISHER_ALL,
-        )
-        missed = sorted(set(operands) - set(fisher_weights))
-        logger.info(
-            "%d operands weighted by their loss-gradient Fisher%s",
-            len(fisher_weights),
-            (
-                ""
-                if not missed
-                else (
-                    f"; {len(missed)} reached no per-token gradient and keep "
-                    f"the partner-energy weighting: {', '.join(missed[:3])}"
-                    + (" ..." if len(missed) > 3 else "")
-                )
-            ),
-        )
-    passes = (measure, collect)
-
-    with torch.no_grad():
-        for visit in passes:
-            settled = set()
-
-            def once(name, module, tensor, visit=visit, settled=settled):
-                if name in static:
-                    if name in settled:
-                        return
-                    settled.add(name)
-                visit(name, module, tensor)
-
-            handles = [
-                module.register_forward_pre_hook(
-                    lambda _, inputs, name=name, module=module: once(
-                        name, module, inputs[0]
-                    )
-                )
-                for name, (module, _, _) in operands.items()
+            axis = CONTRACTED_OPS[consumer.target][
+                consumer.args[:2].index(partner)
             ]
-            tapped = {}
-            if visit is measure:
+            if partner.op == "call_module":
+                fake_quant = model.get_submodule(partner.target)
+                sources[partner.name] = (partner.args[0], axis, fake_quant)
+            else:
+                sources[partner.name] = (partner, axis, None)
 
-                def once_energy(key, axis, fixed, tensor, settled=settled):
-                    if fixed:
-                        if key in settled:
-                            return
-                        settled.add(key)
-                    note_energy(key, axis, tensor)
+    grid = {
+        name: tuple(counts)
+        for pattern, counts in (granularity or {}).items()
+        for name in operands
+        if pattern in name
+    }
+    leading = {}
+    for name, counts in grid.items():
+        axis = leading_split(counts)
+        if axis is not None:
+            leading[name] = axis
+    # A split tensor's error reaches the output through its partners' own
+    # slices of that axis, so they are measured per slice too.
+    for name, axis in list(leading.items()):
+        for other in partners[name]:
+            leading[other] = axis
+    return _Plan(operands, sources, partners, grid, leading)
 
-                handles += [
-                    module.register_forward_pre_hook(
-                        lambda fq, inputs, key=key, axis=axis, fixed=fixed: (
-                            once_energy(
-                                key, axis, fixed, _as_quantized(fq, inputs[0])
-                            )
-                        )
-                    )
-                    for module, key, axis, fixed in hooked
-                ]
-                for consumer, jobs in outside.items():
 
-                    def note(args, jobs=jobs):
-                        for spot, key, axis, fixed in jobs:
-                            once_energy(key, axis, fixed, args[spot])
+class _Measurements(NamedTuple):
+    """What the measuring pass records, filled while it runs.
 
-                    tapped[consumer] = consumer.target
-                    consumer.target = _tap_operands(consumer.target, note)
-                if tapped:
-                    model.recompile()
-            step = max(1, len(calibration) // 10)
-            for index, entry in enumerate(calibration):
-                model(*entry)
-                if (index + 1) % step == 0:
-                    logger.info(
-                        "%s pass: %d/%d windows",
-                        visit.__name__,
-                        index + 1,
-                        len(calibration),
-                    )
-            for handle in handles:
-                handle.remove()
-            for consumer, target in tapped.items():
-                consumer.target = target
-            if tapped:
-                model.recompile()
+    Attributes:
+        energies: ``key -> energy per channel``, summed over the pass, for
+            every partner; ``[slices, channels]`` for a key measured per
+            slice.
+        floors: ``name -> lowest value`` of each fitted tensor.
+        shapes: ``name -> shape`` of each fitted tensor.
+    """
 
-    for module, enabled in live.items():
-        module.enable_fake_quant(enabled)
+    energies: dict
+    floors: dict
+    shapes: dict
 
-    # How concentrated the weighting is decides how much of the codebook a
-    # few channels own: past roughly a hundredfold ratio the levels stop
-    # serving the bulk of the tensor and serve those channels instead.
-    for label, weights in (
-        ("fisher", fisher_weights),
-        ("partner energy", energies),
-    ):
-        spread = [
-            (
-                one.reshape(-1).max() / one.reshape(-1).median().clamp_min(EPS)
-            ).item()
-            for one in weights.values()
-            if one is not None and one.numel() > 1
-        ]
-        if spread:
-            spread = torch.tensor(spread)
-            logger.info(
-                "%s concentration over %d tensors (max/median per "
-                "tensor): median %.3g, p90 %.3g, worst %.3g",
-                label,
-                len(spread),
-                spread.median(),
-                spread.quantile(0.9),
-                spread.max(),
+
+@contextlib.contextmanager
+def _measuring(model, plan):
+    """Measure every tensor the plan names during the passes run inside.
+
+    Each tensor is rotated as its fake-quant rotates it before it is
+    measured.
+
+    Args:
+        model: The prepared graph module.
+        plan: What the fit reads, from ``_plan_fit``.
+
+    Yields:
+        The ``_Measurements``, filled as the passes run.
+    """
+    measured = _Measurements({}, {}, {})
+    # Only a partner's energy weights anything.
+    partners = {key for keys in plan.partners.values() for key in keys}
+
+    @torch.no_grad()
+    def measure(key, tensor):
+        _, axis, fake_quant = plan.sources[key]
+        tensor = _as_quantized(fake_quant, tensor)
+        if key in partners:
+            slices = plan.leading.get(key)
+            if slices is None:
+                energy = _channel_energy(tensor, axis)
+            else:
+                energy = torch.stack(
+                    [
+                        _channel_energy(piece, axis)
+                        for piece in tensor.unbind(slices)
+                    ]
+                )
+            held = measured.energies.get(key)
+            measured.energies[key] = energy if held is None else held + energy
+        if key in plan.operands:
+            lowest = tensor.min()
+            held = measured.floors.get(key)
+            measured.floors[key] = (
+                lowest if held is None else torch.minimum(held, lowest)
             )
+            measured.shapes.setdefault(key, tensor.shape)
 
+    reads = [(key, node) for key, (node, _, _) in plan.sources.items()]
+    with _reading(model, measure, reads):
+        yield measured
+
+
+class _Fit(NamedTuple):
+    """One fitted tensor's grid of histograms, as the collecting pass bins it.
+
+    Attributes:
+        counts: Tables along each axis, resolved against its shape.
+        histograms: Each cell's histogram, in ``_grid_cells`` order.
+        energies: Each cell's weight per channel, or None for a flat fit.
+    """
+
+    counts: tuple
+    histograms: list
+    energies: list | None
+
+
+def _new_fits(plan, measured, fisher, weighting, resolution):
+    """Set up each measured tensor's histograms and the weight of each cell.
+
+    The grid resolves against the shape the measuring pass saw, and the
+    candidates against the sign it saw.  A cell is weighted by the
+    tensor's own Fisher diagonal when the Fisher pass reached it, or else
+    by its partners' summed energy cut to the cell, unless the fit is
+    unweighted.
+
+    Args:
+        plan: What the fit reads, from ``_plan_fit``.
+        measured: What the measuring pass recorded.
+        fisher: ``name -> Fisher diagonal`` from ``_accumulate_fisher``,
+            empty under any other weighting.
+        weighting: The ``Weighting`` asked for.
+        resolution: Candidates across the range for entries that keep the
+            model's dtype.
+
+    Returns:
+        ``name -> _Fit``.
+    """
+    fits = {}
+    for name, shape in measured.shapes.items():
+        module = plan.operands[name][0]
+        if name in plan.grid:
+            counts = _resolve_counts(plan.grid[name], shape)
+        else:
+            counts = (1,) * len(shape)
+        candidates = _candidate_levels(
+            module, measured.floors[name].item() >= 0, resolution
+        )
+        histograms = [Histogram(candidates) for _ in range(math.prod(counts))]
+        shares = [
+            measured.energies[key]
+            for key in plan.partners[name]
+            if key in measured.energies
+        ]
+        if name in fisher:
+            # A tensor with a grid has its diagonal measured per cell.
+            own = fisher[name]
+            energies = list(own) if own.dim() == 2 else [own] * len(histograms)
+        elif weighting is Weighting.NONE or not shares:
+            energies = None
+        else:
+            energies = _partner_cells(
+                sum(shares), counts, plan.leading.get(name), module.ch_axis
+            )
+        fits[name] = _Fit(counts, histograms, energies)
+    return fits
+
+
+def _partner_cells(energy, counts, axis, ch_axis):
+    """Cut a fitted tensor's summed partner energy to each of its cells.
+
+    An energy measured per slice gives a cell the mean of the slices its
+    stretch of ``axis`` covers, or of all of them when ``axis`` is None.
+    The energy runs along the contraction axis, so only a split along that
+    axis gives each cell its own share of the channels.
+
+    Args:
+        energy: Energy per channel, or ``[slices, channels]`` measured per
+            slice along ``axis``.
+        counts: The tensor's resolved grid.
+        axis: The leading axis the slices run along, or None.
+        ch_axis: The tensor's contraction axis, as its fake-quant gives it.
+
+    Returns:
+        One energy per cell, in ``_grid_cells`` order.
+    """
+    channel = ch_axis[0] if isinstance(ch_axis, (tuple, list)) else ch_axis
+    shares = []
+    for index in itertools.product(*(range(count) for count in counts)):
+        share = energy
+        if share.dim() == 2:
+            if axis is None:
+                share = share.mean(0)
+            else:
+                start = index[axis] * len(share) // counts[axis]
+                stop = (index[axis] + 1) * len(share) // counts[axis]
+                share = share[start : max(stop, start + 1)].mean(0)
+        if counts[channel] > 1:
+            share = share.chunk(counts[channel])[index[channel]]
+        shares.append(share)
+    return shares
+
+
+@contextlib.contextmanager
+def _collecting(model, plan, fits, quantized_scale):
+    """Bin each fitted tensor into its cells during the passes run inside.
+
+    Args:
+        model: The prepared graph module.
+        plan: What the fit reads, from ``_plan_fit``.
+        fits: ``name -> _Fit`` from ``_new_fits``.
+        quantized_scale: Normalize by the scale deployment stores; see
+            ``_accumulate``.
+    """
+
+    @torch.no_grad()
+    def collect(name, tensor):
+        module = plan.operands[name][0]
+        fit = fits[name]
+        prepared = module.prepare(tensor)
+        _accumulate(
+            prepared,
+            module,
+            fit.energies,
+            fit.histograms,
+            fit.counts,
+            _global_scale(module, prepared),
+            quantized_scale,
+        )
+
+    reads = [(name, plan.sources[name][0]) for name in fits]
+    with _reading(model, collect, reads):
+        yield
+
+
+def _solve_fits(operands, fits, pin_zero, max_levels):
+    """Solve each fitted tensor's histograms for their optimal tables.
+
+    Args:
+        operands: ``name -> (fake-quant, node, partner nodes)``.
+        fits: ``name -> _Fit``, binned.
+        pin_zero: Force a zero level.
+        max_levels: Fit at most this many levels per table, or None.
+
+    Returns:
+        ``name -> levels``, as ``fit_codebooks`` returns them.
+    """
     tables, unsigned = {}, []
     for name, (module, _, _) in operands.items():
-        group = histograms.get(name)
-        if group is None or group[0].weight is None:
+        fit = fits.get(name)
+        if fit is None or fit.histograms[0].weight is None:
             logger.warning(
                 "%s: nothing accumulated, so it keeps the table it was "
                 "seeded with",
                 name,
             )
             continue
-        if group[0].quant_min == 0.0:
+        first = fit.histograms[0]
+        if first.quant_min == 0.0:
             unsigned.append(name)
         # The index addresses 2**index_bits entries, and the grid can hold
         # fewer.
-        k = min(2**module.index_bits, group[0].levels.numel())
+        k = min(2**module.index_bits, first.levels.numel())
         if max_levels is not None:
             k = min(k, max_levels)
-        fitted = optimal_codebooks(group, k=k, pin_zero=pin_zero)
-        # A codebook carries one axis per tensor axis, so the grid the
-        # fit asked for is the shape the decoder dispatches on and every
-        # granularity has a layout.
-        counts = settled_counts[name]
-        if all(count == 1 for count in counts):
+        fitted = optimal_codebooks(fit.histograms, k=k, pin_zero=pin_zero)
+        # A codebook carries one axis per tensor axis, so the grid the fit
+        # asked for is the shape the decoder dispatches on.
+        if all(count == 1 for count in fit.counts):
             tables[name] = fitted[0]
-            install_codebook(module, tables[name])
         else:
-            install_codebook(module, fitted, counts)
-            tables[name] = {"granularity": list(counts), "levels": fitted}
+            tables[name] = {"granularity": list(fit.counts), "levels": fitted}
         logger.debug("%s: %s", name, tables[name])
 
     logger.info("fitted %d of %d tensors", len(tables), len(operands))
     if unsigned:
         logger.info(
             "%d never went negative, so their levels span [0, quant_max]: "
-            "%s%s",
+            "%s",
             len(unsigned),
-            ", ".join(unsigned[:3]),
-            " ..." if len(unsigned) > 3 else "",
+            _preview(unsigned),
         )
-    if dump is not None:
-        with open(dump, "w") as handle:
-            json.dump(tables, handle, indent=2, sort_keys=True)
-        logger.info("wrote %d codebooks to %s", len(tables), dump)
     return tables
+
+
+def _install_tables(operands, tables):
+    """Install tables into their fake-quants, in place.
+
+    Args:
+        operands: ``name -> (fake-quant, node, partner nodes)``.
+        tables: ``name -> levels``, as ``fit_codebooks`` returns them.
+    """
+    for name, entry in tables.items():
+        module = operands[name][0]
+        if isinstance(entry, dict):
+            install_codebook(module, entry["levels"], entry["granularity"])
+        else:
+            install_codebook(module, entry)
+
+
+@contextlib.contextmanager
+def _reading(model, visit, reads):
+    """Hand each tensor to ``visit`` during the passes run inside.
+
+    A parameter is the same tensor on every calibration input, so reading
+    it once is reading it every time: the moments scale together and the
+    solver's minimum stays where it was.  It is read once, off the model,
+    on entry.  Any other tensor is read by a call inserted after the node
+    yielding it, on every forward pass; the calls are erased on exit, which
+    leaves the graph as it was.
+
+    Args:
+        model: The prepared graph module.
+        visit: Called as ``visit(key, tensor)`` with each tensor.
+        reads: ``(key, node)`` per tensor: ``node`` yields it.
+    """
+    graph = model.graph
+    inserted = []
+    try:
+        for key, node in reads:
+            if node.op == "get_attr":
+                visit(key, fetch_attr(model, node.target))
+                continue
+            with graph.inserting_after(node):
+                inserted.append(graph.call_function(visit, (key, node)))
+        model.recompile()
+        yield
+    finally:
+        for read in inserted:
+            graph.erase_node(read)
+        model.recompile()
+
+
+def _run_calibration(model, calibration, label):
+    """Run the calibration set forward, logging progress every tenth.
+
+    Args:
+        model: The prepared graph module.
+        calibration: Entries of positional arguments for it.
+        label: The pass's name, for the progress messages.
+    """
+    step = max(1, len(calibration) // 10)
+    with torch.no_grad():
+        for index, entry in enumerate(calibration):
+            model(*entry)
+            if (index + 1) % step == 0:
+                logger.info(
+                    "%s pass: %d/%d windows",
+                    label,
+                    index + 1,
+                    len(calibration),
+                )
+
+
+def _log_concentration(label, weights):
+    """Log how concentrated each tensor's weighting is, as max over median.
+
+    Past roughly a hundredfold the levels stop serving the bulk of a tensor
+    and serve its few heaviest channels instead.
+
+    Args:
+        label: What the weights are, for the message.
+        weights: ``key -> weight per channel``.
+    """
+    spread = [
+        (one.reshape(-1).max() / one.reshape(-1).median().clamp_min(EPS)).item()
+        for one in weights.values()
+        if one.numel() > 1
+    ]
+    if not spread:
+        return
+    spread = torch.tensor(spread)
+    logger.info(
+        "%s concentration over %d tensors (max/median per tensor): median "
+        "%.3g, p90 %.3g, worst %.3g",
+        label,
+        len(spread),
+        spread.median(),
+        spread.quantile(0.9),
+        spread.max(),
+    )
+
+
+def _preview(names):
+    """Join the first three names, adding `` ...`` when there are more."""
+    return ", ".join(names[:3]) + (" ..." if len(names) > 3 else "")
 
 
 def load_codebooks(model, tables, skip=()):
@@ -1520,12 +1691,7 @@ def load_codebooks(model, tables, skip=()):
             f"{len(unknown)} codebooks do not match anything this model "
             f"quantizes, starting with {unknown[0]}"
         )
-    for name, entry in tables.items():
-        module = operands[name][0]
-        if isinstance(entry, dict):
-            install_codebook(module, entry["levels"], entry["granularity"])
-        else:
-            install_codebook(module, entry)
+    _install_tables(operands, tables)
     logger.info("installed %d codebooks", len(tables))
 
     unfitted = sorted(set(operands) - set(tables))
@@ -1684,8 +1850,9 @@ class CodebookRefitter:
         _accumulate(
             operand,
             module,
-            sum(energies) if energies else None,
-            self.histograms[name],
+            [sum(energies)] if energies else None,
+            [self.histograms[name]],
+            (1,) * operand.dim(),
             _global_scale(module, operand),
         )
 
