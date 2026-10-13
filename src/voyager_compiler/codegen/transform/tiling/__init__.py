@@ -1,59 +1,90 @@
-"""Choosing tile sizes: the analytic per-op tilers and the mapping search.
+"""Choosing tile sizes: the tile searches every backend shares.
 
-``search`` sizes a vector / GEMV / attention op against its own DRAM cost
-model; ``tiler`` drives the ``interstellar`` loop-nest mapper for everything
-the matrix unit runs.  Nothing here imports ``bufferize`` — the dependency
-runs one way, so the builders can ask for a tiling without a cycle.
+``matrix_search`` maps a GEMM / conv through ``interstellar``,
+``grid_search`` tiles a vector, GEMV or pool op and ``attention_search`` a
+flash attention; ``csr_slice_planning`` chooses outlier-CSR slice widths
+jointly for the GEMMs they couple.  Each asks the backend's ``RuntimeModel``
+(``runtime_model``) to prepare each op, then whether a candidate fits and
+what it costs, and stamps the winner as ``meta["tile_result"]``; ``tiler``
+holds what they share.  ``lowering`` and ``traversal`` hold the graph facts
+and the builders' walks every model reads; the models themselves live with
+their backends (``voyager_compiler.backend``).  Nothing here imports
+``bufferize`` or a backend — the dependencies run one way, so the builders
+can ask for a tiling without a cycle.
 """
 
-from voyager_compiler.codegen.transform.tiling.cost import (
-    attention_kv_last,
-    attention_tile_latency,
-    gemv_tile_latency,
-    vector_op_utilization,
-    vector_tile_latency,
+from voyager_compiler.codegen.transform.tiling.attention_search import (
+    attention_op_tiling,
 )
-from voyager_compiler.codegen.transform.tiling.search import (
-    DEFAULT_RUNTIME_TOLERANCE,
-    attention_head_pad,
+from voyager_compiler.codegen.transform.tiling.csr_slice_planning import (
+    DEFAULT_MIN_CSR_SLICE,
+    plan_csr_slices,
+)
+from voyager_compiler.codegen.transform.tiling.grid_search import (
     gemv_op_tiling,
     pool_op_tiling,
     vector_op_tiling,
 )
-from voyager_compiler.codegen.transform.tiling.sparse import (
-    DEFAULT_MIN_CSR_SLICE,
-    plan_csr_slices,
-)
-from voyager_compiler.codegen.transform.tiling.tiler import (
+from voyager_compiler.codegen.transform.tiling.matrix_search import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
-    TileConstraint,
-    TilerContext,
-    attention_op_tiling,
-    build_interstellar_tiler,
     get_tiling,
     prefetch_tilings,
 )
+from voyager_compiler.codegen.transform.tiling.runtime_model import (
+    AttentionSpace,
+    AttentionTiling,
+    Cost,
+    Fused,
+    GridSpace,
+    GridTiling,
+    KernelInput,
+    MatrixSpace,
+    OpModel,
+    Placement,
+    Role,
+    RuntimeModel,
+    TileResult,
+    pad_head,
+)
+from voyager_compiler.codegen.transform.tiling.tiler import (
+    DEFAULT_RUNTIME_TOLERANCE,
+    TileConstraint,
+    Tiler,
+    build_tiler,
+)
+from voyager_compiler.codegen.transform.tiling.traversal import (
+    attention_kv_last,
+)
 
 __all__ = [
+    "AttentionSpace",
+    "AttentionTiling",
     "CONV_L3_ORDER",
+    "Cost",
     "DEFAULT_MIN_CSR_SLICE",
     "DEFAULT_RUNTIME_TOLERANCE",
+    "Fused",
     "GEMM_L3_ORDER",
+    "GridSpace",
+    "GridTiling",
+    "KernelInput",
+    "MatrixSpace",
+    "OpModel",
+    "Placement",
+    "Role",
+    "RuntimeModel",
     "TileConstraint",
-    "TilerContext",
-    "attention_head_pad",
+    "TileResult",
+    "Tiler",
     "attention_kv_last",
     "attention_op_tiling",
-    "attention_tile_latency",
-    "build_interstellar_tiler",
+    "build_tiler",
     "gemv_op_tiling",
-    "gemv_tile_latency",
     "get_tiling",
+    "pad_head",
     "plan_csr_slices",
     "pool_op_tiling",
     "prefetch_tilings",
     "vector_op_tiling",
-    "vector_op_utilization",
-    "vector_tile_latency",
 ]

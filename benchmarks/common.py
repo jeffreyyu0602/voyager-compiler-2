@@ -107,7 +107,7 @@ from voyager_compiler.codegen.transform.bufferize import (
 )
 from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
-    build_interstellar_tiler,
+    build_tiler,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
 from voyager_compiler.quantization.fake_quantize import (
@@ -824,7 +824,7 @@ def _calibrate(gm, example_args, example_kwargs, mask_dtype):
 
 def _frontend(cfg: SweepConfig):
     """Export -> quantize -> transform -> ShapeProp for ``cfg``, and build the
-    interstellar tiler.  Returns ``(gm, model, tiler)`` -- the graph is
+    ``Tiler``.  Returns ``(gm, model, tiler)`` -- the graph is
     transformed and tile-ready but *not* yet whole-graph bufferized, so both the
     whole-graph and the per-module paths can share this."""
     is_decode = cfg.mode == "decode"
@@ -877,9 +877,7 @@ def _frontend(cfg: SweepConfig):
     )
     ShapeProp(gm).propagate(*map(fake_like, flat_args))
 
-    tiler = build_interstellar_tiler(
-        cfg.acc_config, runtime_tolerance=cfg.runtime_tolerance
-    )
+    tiler = build_tiler(cfg.acc_config, runtime_tolerance=cfg.runtime_tolerance)
     return gm, model, tiler
 
 

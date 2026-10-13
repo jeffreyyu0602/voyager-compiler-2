@@ -105,6 +105,21 @@ def get_anchor_node(node):
     return anchor_node
 
 
+def tail_targets(node) -> tuple:
+    """The targets of the arithmetic ops a fused ``node`` runs after its
+    anchor, in order; none for a bare op."""
+    submod = node.meta.get("submodule")
+    if node.op != "call_module" or submod is None:
+        return ()
+    ops = [n for n in submod.graph.nodes if n.op == "call_function"]
+    anchor = get_anchor_node(node)
+    if anchor not in ops:
+        return ()
+    return tuple(
+        n.target for n in ops[ops.index(anchor) + 1 :] if is_compute_op(n)
+    )
+
+
 def bound_operands(node, submod) -> dict:
     """Each ``submod`` placeholder -> the operand ``node`` binds to it.
 

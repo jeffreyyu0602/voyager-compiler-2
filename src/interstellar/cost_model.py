@@ -634,11 +634,12 @@ def get_access(point, layer, resource):
     return [access_list, array_costs]
 
 
-def _level_bytes(point, layer, level, resource, counts, partitioning_accum):
-    """Byte footprint of ``counts`` at a byte-pool level (L2+), via the layer's
-    ``size_fn``.  The loop nest gives element counts; turning those into bytes
-    (element widths, scale tensors, fused operands, bank packing) is the
-    caller's policy.
+def _level_bytes(point, layer, level, resource, partitioning_accum):
+    """Byte footprint of ``point``'s tile at a byte-pool level (L2+).
+
+    The layer's ``size_fn`` answers it: sizing a tile in bytes (element
+    counts, element widths, scale tensors, fused operands, bank packing) is
+    the caller's policy.
     """
     buf = resource.buffer(level)
     bank_size = buf.bank_size
@@ -646,12 +647,14 @@ def _level_bytes(point, layer, level, resource, counts, partitioning_accum):
     if isinstance(capacity, list):
         capacity = capacity[0]
     num_banks = capacity // bank_size if bank_size else None
-    return layer.size_fn(
-        counts, point, level, partitioning_accum, bank_size, num_banks
-    )
+    return layer.size_fn(point, level, partitioning_accum, bank_size, num_banks)
 
 
 def get_bank_size(point, layer, level, resource):
+    if level > 1 and layer.size_fn is not None:
+        # L2/L3 are flat byte pools.  No partitioning: this is one bank's (one
+        # PE's) worth, not the spatially replicated block.
+        return _level_bytes(point, layer, level, resource, None)
 
     blocking_accum_list = []
     for i in range(le.NUM):
@@ -659,26 +662,14 @@ def get_bank_size(point, layer, level, resource):
             reduce(mul, point.loop_blocking(i)[: level + 1], 1)
         )
 
-    if_bank_size = get_if_bank_size(blocking_accum_list, layer)
-    of_bank_size = get_of_bank_size(blocking_accum_list)
-    fl_bank_size = get_fl_bank_size(blocking_accum_list)
-
-    if level <= 1 or layer.size_fn is None:
-        # L0/L1 are slot arrays: each element occupies a fixed-width slot (the max
-        # dtype in a mixed-precision design; narrower dtypes are padded), so the
-        # fit is checked in element counts, independent of the layer's dtype.
-        # Without a ``size_fn`` every level is sized this way.
-        return (if_bank_size, of_bank_size, fl_bank_size)
-
-    # L2/L3 are flat byte pools.  No partitioning: this is one bank's (one PE's)
-    # worth, not the spatially replicated block.
-    return _level_bytes(
-        point,
-        layer,
-        level,
-        resource,
-        (if_bank_size, of_bank_size, fl_bank_size),
-        None,
+    # L0/L1 are slot arrays: each element occupies a fixed-width slot (the max
+    # dtype in a mixed-precision design; narrower dtypes are padded), so the
+    # fit is checked in element counts, independent of the layer's dtype.
+    # Without a ``size_fn`` every level is sized this way.
+    return (
+        get_if_bank_size(blocking_accum_list, layer),
+        get_of_bank_size(blocking_accum_list),
+        get_fl_bank_size(blocking_accum_list),
     )
 
 
@@ -687,17 +678,25 @@ def get_block_size(point, layer, level, resource):
     Calculate the size of ifmap, ofmap, filter at current level
     """
 
-    blocking_accum_list = []
     partitioning_accum_list = []
+    for i in range(le.NUM):
+        partitioning_accum_list.append(
+            reduce(mul, point.loop_partitioning(i)[: level + 1], 1)
+        )  # FIXME inclusive mode also duplicates data
+
+    if level > 1 and layer.size_fn is not None:
+        # L2/L3 are byte pools; the layer's ``size_fn`` sizes them.
+        return _level_bytes(
+            point, layer, level, resource, partitioning_accum_list
+        )
+
+    blocking_accum_list = []
     partitioning_reshape = list(zip(*point.loop_partitionings))
     partitioning_list = partitioning_reshape[level]
     for i in range(le.NUM):
         blocking_accum_list.append(
             reduce(mul, point.loop_blocking(i)[: level + 1], 1)
         )
-        partitioning_accum_list.append(
-            reduce(mul, point.loop_partitioning(i)[: level + 1], 1)
-        )  # FIXME inclusive mode also duplicates data
 
     if_block_size = get_if_size(
         blocking_accum_list, partitioning_accum_list, partitioning_list, layer
@@ -709,20 +708,10 @@ def get_block_size(point, layer, level, resource):
         blocking_accum_list, partitioning_accum_list, partitioning_list
     )
 
-    if level <= 1 or layer.size_fn is None:
-        # L0/L1 are slot arrays (padded to a fixed width); fit is in element
-        # counts, independent of the layer's dtype.  L2/L3 (below) are byte
-        # pools -- unless there is no ``size_fn`` to convert them.
-        return (if_block_size, of_block_size, fl_block_size)
-
-    return _level_bytes(
-        point,
-        layer,
-        level,
-        resource,
-        (if_block_size, of_block_size, fl_block_size),
-        partitioning_accum_list,
-    )
+    # L0/L1 are slot arrays (padded to a fixed width); fit is in element
+    # counts, independent of the layer's dtype.  Without a ``size_fn`` every
+    # level is sized this way.
+    return (if_block_size, of_block_size, fl_block_size)
 
 
 def get_block_sizes(num_levels, point, layer, resource):

@@ -20,17 +20,17 @@ class Layer(object):
     hstd: stride size in height dimension.
 
     size_fn: how many *bytes* a tile of this layer occupies at a byte-pool level
-        (L2+).  The loop nest gives element counts; everything that turns those
-        into bytes -- element widths, microscaling scale tensors, fused post-op
-        operands, and how operands are packed into banks -- is the caller's
-        policy, so it lives here rather than in the cost model::
+        (L2+).  Everything that sizes a tile in bytes -- its element counts,
+        element widths, microscaling scale tensors, fused post-op operands,
+        and how operands are packed into banks -- is the caller's policy, so
+        it lives here rather than in the cost model::
 
-            size_fn(counts, point, level, partitioning_accum, bank_size,
-                    num_banks) -> (if_bytes, of_bytes, fl_bytes)
+            size_fn(point, level, partitioning_accum, bank_size, num_banks)
+                -> (if_bytes, of_bytes, fl_bytes)
 
-        ``counts`` are the (input, output, weight) element counts at the level;
-        ``point`` is the mapping (so the fn can derive its own output-dim
-        extents and see whether the output is still a partial sum);
+        ``point`` is the mapping (so the fn can derive the tile's element
+        counts and extents and see whether the output is still a partial
+        sum);
         ``partitioning_accum`` is the level's accumulated spatial partitioning,
         or None for a per-bank (one PE) size; ``bank_size`` is None when the
         level has no banking.

@@ -29,6 +29,7 @@ from typing import Optional
 import torch
 from torch._higher_order_ops.while_loop import while_loop
 
+import interstellar
 from voyager_compiler.codegen.node_info import (
     gemm_produces_csr,
     is_nop,
@@ -73,6 +74,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     stamp_csr_fill,
     voyager,
 )
+from voyager_compiler.codegen.transform.tiling.runtime_model import Role
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import set_node_value, ShapeProp
 
@@ -315,12 +317,6 @@ class _SparseGemm(torch.nn.Module):
                 if len(qnode.args) > 9:
                     self.epi_q_args = self.epi_q_args[:8]
                 self.epi_q_kwargs["max_pct"] = ("lit", out_geom.op_max_pct)
-        # The CSR-store epilogue runs bare in the loop body after the
-        # commit — its DMAs, waits and stream bookkeeping cannot live in a
-        # commit subgraph — which requires a single-slot scratch
-        # (``_reduction_fused_kernel``'s bare-tail path).
-        if out_geom is not None and async_pipeline:
-            plan.anchor.meta.setdefault("tiling", {})["scratch_slots"] = 1
         self.async_pipeline = async_pipeline
         # A chained finalize's store is lagged ``_STORE_LAG`` steps, and the
         # next finalize of the same K slice -- the same batch and column
@@ -450,6 +446,9 @@ class _SparseGemm(torch.nn.Module):
             # to the tail with the group's own operands.
             base = num_operands + (2 if self.geom is not None else 0)
             fused_idx += [base + n for n in range(6)]
+        # The CSR-store epilogue runs bare in the loop body after the
+        # commit — its DMAs, waits and stream bookkeeping cannot live in a
+        # commit subgraph — which requires a single-slot scratch.
         return _gemm_scratch_and_kernel(
             gemm_kernel,
             tail,
@@ -465,6 +464,9 @@ class _SparseGemm(torch.nn.Module):
             split=self.tail_split if tail is plan.fused_gm else None,
             single_k_tail_fusible=not self.stage_tile,
             split_k_tail_fusible=self.chain_epilogue or self.chain_fused_tail,
+            single_scratch_slot=(
+                self.out_geom is not None and self.async_pipeline
+            ),
         )
 
     def _gather_rolled(self, idx, slots, slot=None, row=None, post_count=1):
@@ -1124,7 +1126,7 @@ def build_sparse_gemm(
         node: The sparse ``linear_mx`` / ``matmul_mx``, bare or fused.
         num_slots: Software-pipeline depth for the dense operands.
         accumulate_fp32: Accumulate the K reduction in fp32.
-        tiler: The interstellar ``TilerContext``.
+        tiler: The ``Tiler``.
         async_pipeline: Dispatch each step's compute as a ``voyager.commit``
             (the :class:`AsyncPipelinedKernel` nest), overlapping the CSR
             gather and the dense loads with the previous tile's compute;
@@ -1192,12 +1194,21 @@ def build_sparse_gemm(
         gm = export_model(pattern, plan.inputs)
     gm = _finalize_exported_gm(gm)
 
-    roles = plan.anchor.meta.get("tiling", {}).get("bank_groups")
-    if roles is not None:
+    # The hand-made allocs join the groups of the roles they serve, which
+    # only an interstellar mapping places: under a GEMV's result the whole
+    # nest stays loose.
+    result = plan.anchor.meta.get("tile_result")
+    groups = None
+    if (
+        result is not None
+        and isinstance(result.tiling, interstellar.MappingPoint)
+    ):
+        groups = result.placement.groups
+    if groups is not None:
 
         def group_of(role):
             return next(
-                (i for i, role_set in enumerate(roles) if role in role_set),
+                (i for i, group in enumerate(groups) if role in group),
                 None,
             )
 
@@ -1206,11 +1217,11 @@ def build_sparse_gemm(
         hand_groups = []
         if geom is not None:
             # gather_data, gather_indices, base_table
-            hand_groups += [group_of("input")] * 3
+            hand_groups += [group_of(Role.INPUT)] * 3
         if out_geom is not None:
             # slice_nnz, stream_pos, out_base_table and the five
             # store-staging tiles
-            hand_groups += [group_of("output")] * 8
+            hand_groups += [group_of(Role.OUTPUT)] * 8
         _stamp_bank_groups(
             gm,
             hand_groups

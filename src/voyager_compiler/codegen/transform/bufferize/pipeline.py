@@ -60,17 +60,17 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     outline_dps_ops,
     voyager,
 )
-from voyager_compiler.codegen.transform.tiling.search import (
-    BANK_GROUP_RESERVED,
+from voyager_compiler.codegen.transform.tiling.grid_search import (
     pool_op_tiling,
     vector_op_tiling,
 )
-from voyager_compiler.codegen.transform.tiling.tiler import (
+from voyager_compiler.codegen.transform.tiling.lowering import resolve
+from voyager_compiler.codegen.transform.tiling.matrix_search import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
-    _fused_operand_nodes,
     get_tiling,
 )
+from voyager_compiler.codegen.transform.tiling.runtime_model import Role
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.ops.layout import (
     NCHW_TO_NHWC,
@@ -351,11 +351,12 @@ class _BufferedRef:
     # --- input phases (kind == _IN) -----------------------------------------
 
     def reuse_count(self):
-        """Steps that consecutively read the same block: the innermost tiled grid
-        dim's own repeat (``r`` consecutive steps re-read one block when the
-        operand repeats over it, e.g. a GQA head) times the grid extents inner to
-        it (1 when it advances every step).  A reused block's load posts this many
-        times so a per-step ``commit`` consume balances a once-per-block load.
+        """Steps that consecutively read the same block: the innermost tiled
+        grid dim's own repeat (``r`` consecutive steps re-read one block when
+        the operand repeats over it, e.g. a GQA head) times the grid extents
+        inner to it (1 when it advances every step).  A reused block's load
+        posts this many times so a per-step ``commit`` consume balances a
+        once-per-block load.
         """
         tiled = list(spec_tiled_dims(self.spec, self.grid))
         if not tiled:
@@ -1974,17 +1975,14 @@ def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
 def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
     """The searched bank group of each SRAM slot alloc, in allocation order.
 
-    The partition comes from ``node.meta["bank_groups"]`` (the GEMV / vector /
-    pool search: member lists of operand FX nodes, with ``node`` itself for
-    the output and ``BANK_GROUP_RESERVED`` for the reduction scratch) or,
-    failing that, from the anchor's ``meta["tiling"]["bank_groups"]``
-    (interstellar: role sets).  A role names one of the anchor's own args /
-    kwargs — the operands ``make_size_fn`` defined the roles from — so it
-    resolves right back to them, the weight and scales through the same
-    ``weight_transforms`` peel the builders key their specs by.  A member or
-    role with no spec — a whole-loaded codebook, an operand the search did
-    not model — is skipped: its buffer stays loose and the planner packs it
-    byte-wise.
+    The groups are the placement of the search that tiled ``node``: its own
+    ``meta["tile_result"]`` (the GEMV / vector / pool search), else its
+    anchor's (interstellar).  ``Role.OUTPUT`` tags the outputs and
+    ``Role.SCRATCH`` the scratch; any other member tags the spec of the
+    input node it names (``resolve``), the node the builders key that spec
+    by.  A member with no spec — a whole-loaded codebook, an operand the
+    kernel does not hold — is skipped: its buffer stays loose and the
+    planner packs it byte-wise, while its group keeps its index.
 
     Args:
         node: The node being built (the fused ``call_module``, or the op).
@@ -2005,67 +2003,28 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
     assigned = [None] * len(ordered)
     scratch_group = None
 
+    anchor = get_anchor_node(node)
+    result = node.meta.get("tile_result")
+    if result is None:
+        result = anchor.meta.get("tile_result")
+    if result is None or result.placement.groups is None:
+        return assigned + [None] * len(scratch_specs)
+
     node_specs = {n: spec for n, spec in zip(node.all_input_nodes, in_specs)}
 
     def tag(spec, group):
         if spec is not None and id(spec) in index_of:
             assigned[index_of[id(spec)]] = group
 
-    groups = node.meta.get("bank_groups")
-    if groups is None:
-        anchor = get_anchor_node(node)
-        roles = (
-            anchor.meta.get("tiling", {}).get("bank_groups")
-            if anchor is not None
-            else None
-        )
-        if roles is None:
-            return assigned + [None] * len(scratch_specs)
-
-        bound = bound_operands(node, node.meta.get("submodule"))
-        src = lambda n: bound.get(n, n)
-        fused = _fused_operand_nodes(node, anchor)
-
-        def operand(role):
-            """The member a role names: one of the anchor's own operands,
-            the output (``node``), or the scratch marker."""
-            if role == "scratch":
-                return BANK_GROUP_RESERVED
-            if role == "output":
-                return node
-            if role == "input":
-                return src(activation_transforms(anchor.args[0])[0])
-            if role == "weight":
-                return src(weight_transforms(anchor.args[1])[0])
-            if role == "bias":
-                bias = get_arg_value(anchor, 2, "bias")
-                return src(bias) if isinstance(bias, torch.fx.Node) else None
-            if role in ("input_scale", "weight_scale"):
-                scale = anchor.kwargs.get(role)
-                if not isinstance(scale, torch.fx.Node):
-                    return None
-                return src(weight_transforms(scale)[0])
-            if role == "csr":
-                ptr = anchor.kwargs.get("A_indptr")
-                return src(ptr) if isinstance(ptr, torch.fx.Node) else None
-            if isinstance(role, tuple) and role[1] < len(fused):
-                return src(fused[role[1]])  # ("fused", i)
-            return None
-
-        groups = [
-            [m for m in map(operand, role_set) if m is not None]
-            for role_set in roles
-        ]
-
-    for group, members in enumerate(groups):
+    for group, members in enumerate(result.placement.groups):
         for member in members:
-            if member == BANK_GROUP_RESERVED:
+            if member is Role.SCRATCH:
                 scratch_group = group
-            elif member is node:
+            elif member is Role.OUTPUT:
                 for spec in out_specs:
                     tag(spec, group)
             else:
-                tag(node_specs.get(member), group)
+                tag(node_specs.get(resolve(member, node, anchor)), group)
     return assigned + [scratch_group] * len(scratch_specs)
 
 
@@ -2091,6 +2050,7 @@ def _gemm_scratch_and_kernel(
     split=_CLASSIFY,
     single_k_tail_fusible=True,
     split_k_tail_fusible=False,
+    single_scratch_slot=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -2105,7 +2065,8 @@ def _gemm_scratch_and_kernel(
             mutates these in place.
         out_specs: The group's outputs.
         fused_idx: Operand indices the fused tail consumes after the op.
-        anchor: The op node, carrying the tiler's ``scratch_slots`` meta.
+        anchor: The op node, carrying its search's ``meta["tile_result"]``,
+            whose placement gives the scratch its slots.
         accumulate_fp32: Accumulate the reduction in fp32 rather than the
             output dtype.
         async_pipeline: The async kernel variants, or the sync ones.
@@ -2120,6 +2081,9 @@ def _gemm_scratch_and_kernel(
             through scratch.
         split_k_tail_fusible: The tail chains into a split reduction's
             finalize pass.
+        single_scratch_slot: Hold the scratch to one slot, whatever the
+            search placed, for a tail that runs bare after the commit
+            (``_reduction_fused_kernel``'s bare-tail path).
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -2203,11 +2167,13 @@ def _gemm_scratch_and_kernel(
             acc_dtype = out_dtype
         # Only a tail that reads scratch after the streamed pass gains a
         # second slot; a chained-whole tail never races and keeps one.  The
-        # count is the tiler's per-node call (the scratch ladder winner,
-        # stamped with the tiling).
+        # count is the search's placement (the scratch ladder winner) unless
+        # the caller holds the scratch to one slot.
         sync = not split_k_tail_fusible or split is not None
-        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
-        slots = scratch_slots if sync else 1
+        tile_result = anchor.meta.get("tile_result")
+        slots = 1
+        if sync and not single_scratch_slot and tile_result is not None:
+            slots = tile_result.placement.scratch_slots
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(
             gemm_kernel,
@@ -2226,13 +2192,13 @@ def _gemm_scratch_and_kernel(
 
 
 def _stamp_anchor_meta(gm, anchor) -> None:
-    """Copy the anchor's interstellar results -- the mapping and calculator the
-    reporting model prices a tile with, and the mapping / architecture the
-    proto emitter turns into a ``Tiling`` -- onto the nest just built, at every
-    nesting level (loop body, cond branch); the anchor itself is erased on
-    splice.
+    """Copy the anchor's search result (``meta["tile_result"]``) -- the
+    mapping the proto emitter turns into a ``Tiling`` and whose cost the
+    reporting model charges a tile -- onto the kernels of the nest just
+    built, at every nesting level (loop body, cond branch); the anchor
+    itself is erased on splice.
     """
-    if (tiling := anchor.meta.get("tiling")) is None:
+    if (result := anchor.meta.get("tile_result")) is None:
         return
     for m in gm.modules():
         if not isinstance(m, torch.fx.GraphModule):
@@ -2244,7 +2210,7 @@ def _stamp_anchor_meta(gm, anchor) -> None:
                 isinstance(sub, torch.fx.GraphModule)
                 and any(x.target is anchor.target for x in sub.graph.nodes)
             ):
-                n.meta.update(tiling)
+                n.meta["tile_result"] = result
 
 
 def build_conv2d(
@@ -2738,8 +2704,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     # A packed KV cache reaches the GEMM through a ``dequantize``, which decodes
     # the weight *tile* in the kernel -- so the cache is fetched, and paid for,
     # packed.  Its scale / zero point block along one of the weight's own axes,
-    # so they dice with it, that axis divided by the block; the codebook, indexed
-    # by value rather than by position, loads whole.
+    # so they dice with it, that axis divided by the block; the codebook,
+    # indexed by value rather than by position, loads whole.
     dq_nodes = {}
     if weight_dequant is not None:
         dq_axes = {
@@ -2981,7 +2947,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     the reservation *is* the declaration.  Returns the gm, or ``None``.
     """
     anchor = get_anchor_node(node)
-    tiling = vector_op_tiling(node, tiler.config)
+    tiling = vector_op_tiling(node, tiler)
 
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
@@ -3129,7 +3095,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
 
-    tiling = pool_op_tiling(node, tiler.config)
+    tiling = pool_op_tiling(node, tiler)
     if node.op != "call_module" and tiling is None:
         return None
 

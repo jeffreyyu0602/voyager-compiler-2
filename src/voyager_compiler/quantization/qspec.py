@@ -99,11 +99,13 @@ def int_range(dtype: str) -> Optional[Tuple[int, int]]:
 
 class FloatFormat(NamedTuple):
     """A minifloat: ``bits`` wide, ``ebits`` exponent and ``mbits`` mantissa
-    bits, and ``max_norm`` its largest finite magnitude."""
+    bits, ``ieee`` when its top exponent is kept for inf and NaN, and
+    ``max_norm`` its largest finite magnitude."""
 
     bits: int
     ebits: int
     mbits: int
+    ieee: bool
     max_norm: float
 
     @property
@@ -113,13 +115,14 @@ class FloatFormat(NamedTuple):
 
 
 def float_format(dtype: str) -> Optional[FloatFormat]:
-    """Parse a minifloat dtype, ``fp<B>_e<X>m<Y>``.
+    """Parse a minifloat dtype, ``fp<B>_e<X>m<Y>`` or ``fp<B>_e<X>m<Y>_ieee``.
 
     ``B = X + Y + 1`` is signed; ``B = X + Y`` is unsigned, as a scale is.
-    A format with more than four exponent bits keeps its top exponent for
-    inf and NaN; a narrower one spends it on finite values, and
-    ``fp8_e4m3`` (torch's ``float8_e4m3fn``) gives up only its all-ones
-    mantissa there, to NaN.
+    A format with more than four exponent bits, or the ``_ieee`` suffix,
+    keeps its top exponent for inf and NaN; a narrower one spends it on
+    finite values, and ``fp8_e4m3`` (torch's ``float8_e4m3fn``) gives up
+    only its all-ones mantissa there, to NaN.  So ``fp8_e4m3`` reaches 448
+    and ``fp8_e4m3_ieee`` 240.
 
     Args:
         dtype: A dtype name.
@@ -130,21 +133,22 @@ def float_format(dtype: str) -> Optional[FloatFormat]:
     Raises:
         ValueError: ``B`` is neither ``X + Y`` nor ``X + Y + 1``.
     """
-    match = re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype, re.IGNORECASE)
+    match = re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)(_ieee)?", dtype, re.IGNORECASE)
     if match is None:
         return None
-    bits, ebits, mbits = map(int, match.groups())
+    bits, ebits, mbits = map(int, match.group(1, 2, 3))
     if bits not in (ebits + mbits, ebits + mbits + 1):
         raise ValueError(
             f"{dtype}: {bits} bits is neither {ebits} exponent plus {mbits} "
             "mantissa bits nor that plus a sign bit"
         )
-    emax = 2 ** (ebits - 1) - 1 if ebits > 4 else 2 ** (ebits - 1)
+    ieee = ebits > 4 or match.group(4) is not None
+    emax = 2 ** (ebits - 1) - 1 if ieee else 2 ** (ebits - 1)
     if dtype.lower() == "fp8_e4m3":
         max_norm = 2**emax * 1.75
     else:
         max_norm = 2**emax * (2 - 2.0**-mbits)
-    return FloatFormat(bits, ebits, mbits, max_norm)
+    return FloatFormat(bits, ebits, mbits, ieee, max_norm)
 
 
 def posit_format(dtype: str) -> Optional[Tuple[int, int]]:

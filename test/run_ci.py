@@ -73,7 +73,7 @@ SCHEME_ARGS = {
     ),
 }
 
-# The interstellar tiler sizes its blocking against a scratchpad and a bank
+# The matrix search sizes its blocking against a scratchpad and a bank
 # count, and has no answer when they are unset.  Only MXNF4 names its own, so
 # every other scheme is given these -- the same pair MXNF4 asks for.
 DEFAULT_TILER_ARGS = {"--scratchpad_size": "2097152", "--num_banks": "16"}

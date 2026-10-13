@@ -72,7 +72,7 @@ because eager execution cannot reveal the omission.
 
 ### Worked Example: `OP_PASSES`
 
-[`OP_PASSES`](../codegen/transform/tiling/cost.py) previously listed only the
+[`OP_PASSES`](../backend/voyager/vector.py) previously listed only the
 ATen targets. At the start of standard bufferization, tile search inspected an
 unpadded reduction's incoming ATen target and charged `softmax` for three passes
 and `layer_norm` for four. The builder subsequently traced the reduction under
@@ -140,11 +140,11 @@ The handling labels below mean:
 
 | Site | Operator(s) | Handling | Reason |
 | --- | --- | --- | --- |
-| [`OP_PASSES`](../codegen/transform/tiling/cost.py) | `softmax`, `layer_norm` | **Explicit** | Keyed by `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
+| [`OP_PASSES`](../backend/voyager/vector.py) | `softmax`, `layer_norm` | **Explicit** | Keyed by `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
 | [`op_utilization`](../codegen/reporting/cost.py) | `softmax`, `layer_norm` | **Indirect** | Delegates its vector branch to `vector_op_utilization`, which reads `OP_PASSES`. |
 | [`_fuse_dequantize_recursive`](../codegen/transform/operator_fusion.py) endpoints | `softmax`, `layer_norm` | **Explicit** | Matches `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
 | [`OP_PARAM_ARG_INDEX`](../codegen/subgraph.py) | `layer_norm` | **Explicit** | Every op in `LAYER_NORM_OPS` takes `weight` as argument 2. |
-| [`_vector_op_tiling_limits`](../codegen/transform/tiling/search.py) constraint branch | `softmax`, `layer_norm` | **Explicit** | Matches `SOFTMAX_OPS` (`last_dim = dim`) and `LAYER_NORM_OPS` (`last_dim = -len(normalized_shape)`). |
+| [`_vector_op_tiling_limits`](../codegen/transform/tiling/grid_search.py) constraint branch | `softmax`, `layer_norm` | **Explicit** | Matches `SOFTMAX_OPS` (`last_dim = dim`) and `LAYER_NORM_OPS` (`last_dim = -len(normalized_shape)`). |
 | [`_REDUCTION_SCRATCH`](../codegen/node_info.py) | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | Includes the `layer_norm` self-entry; a `softmax` twin does not normally reach this table. |
 | [`_REDUCTION_POINTWISE_OPS`](../codegen/transform/bufferize/bufferization.py) | `softmax`, `layer_norm` | **Explicit** | Includes `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
 | [`pad_vector_op_dimensions`](../codegen/transform/padding.py) dispatch | `softmax`, `layer_norm` | `layer_norm`: **ATen-only by design**; `softmax`: **Phase-safe** | Matching the `layer_norm` twin would pad an already-padded operator again; a `softmax` twin does not yet exist. |

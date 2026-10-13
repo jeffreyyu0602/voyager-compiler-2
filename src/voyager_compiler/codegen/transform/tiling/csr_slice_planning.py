@@ -29,19 +29,13 @@ from voyager_compiler.codegen.node_info import (
     csr_quantize_node,
     gemm_produces_csr,
     get_anchor_node,
-    is_fully_connected,
     is_gemm_op,
 )
-from voyager_compiler.codegen.transform.tiling.search import gemv_op_tiling
-from voyager_compiler.codegen.transform.tiling.tiler import (
-    _finish_search,
-    _prepare_search,
-    _run_search,
-    _search_in_pool,
+from voyager_compiler.codegen.transform.tiling.matrix_search import (
     get_tiling,
-    SEARCH_TIMED_OUT,
-    TileConstraint,
+    search_tilings,
 )
+from voyager_compiler.codegen.transform.tiling.tiler import TileConstraint
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -101,61 +95,36 @@ def _search_costs(searches, tiler):
     """Modeled runtime of every ``(node, constraint)`` search, in cycles.
 
     An anchor tiled outright (``l2_tiling``) prices at zero under the
-    constraints its tiles satisfy and needs no tiler; a GEMV is priced by
-    its own analytic search, inline; the interstellar searches go through
-    the fork pool together.  A search that fits nothing prices at infinity.
-
-    Identical layers share a cache key and are searched once; a search the
-    pool's deadline cut off is run again here, serially.
+    constraints its tiles satisfy and needs no tiler; the rest are searched
+    together (``search_tilings``), which caches each mapping for the
+    builders.  A search that fits nothing prices at infinity, and an
+    unranked one, which prices nothing, at zero.
 
     Returns:
-        ``(costs, prepared)`` -- the runtime per ``(node, constraint)``, and
-        for each interstellar one its ``(key, search, found)`` triple, which
-        ``_finish_search`` turns into the cache entry of a winner.
+        The runtime per ``(node, constraint)``; a node no search maps is
+        left out, which ``op_cost`` prices at zero.
     """
-    costs, prepared = {}, {}
-    pending = {}  # key -> (search, [(node, constraint), ...])
+    costs, pending = {}, []
     for node, constraint in searches:
-        anchor = get_anchor_node(node)
-        extent = _explicit_extent(anchor)
+        extent = _explicit_extent(get_anchor_node(node))
         if extent is not None:
             costs[node, constraint] = (
                 0.0 if constraint.allows(extent) else math.inf
             )
-            continue
-        if tiler is None:
+        elif tiler is None:
             costs[node, constraint] = math.inf
-            continue
-        if is_fully_connected(anchor):
-            try:
-                gemv_op_tiling(node, tiler.config, constraint)
-                costs[node, constraint] = node.meta["tiling_runtime"]
-            except RuntimeError:
-                costs[node, constraint] = math.inf
-            continue
-        prepared_search = _prepare_search(node, tiler, constraint)
-        if prepared_search is None or prepared_search[1] is None:
-            costs[node, constraint] = 0.0  # interstellar skips it
-            continue
-        key, search = prepared_search
-        pending.setdefault(key, (search, []))[1].append((node, constraint))
-    keys = list(pending)
-    results = _search_in_pool([pending[key][0] for key in keys])
-    for key, found in zip(keys, results):
-        search, users = pending[key]
-        if found is SEARCH_TIMED_OUT:
-            try:
-                found = _run_search(search)
-            except RuntimeError:
-                found = None
-        for node, constraint in users:
-            costs[node, constraint] = (
-                found[0] if found is not None else math.inf
-            )
-            prepared[node, constraint] = (key, search, found)
+        else:
+            pending.append((node, constraint))
+    for pair, result in search_tilings(pending, tiler).items():
+        if result is None:
+            costs[pair] = math.inf
+        elif result.cost is None:
+            costs[pair] = 0.0
+        else:
+            costs[pair] = result.cost.latency
     for (node, constraint), cost in costs.items():
         logger.debug("[csr] %s under %s: %.0f", node.name, constraint, cost)
-    return costs, prepared
+    return costs
 
 
 def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
@@ -163,7 +132,7 @@ def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
 
     Args:
         nodes: The graph's nodes, before bufferization.
-        tiler: The ``TilerContext``; receives the winners' constraints and
+        tiler: The ``Tiler``; receives the winners' constraints and
             their finished searches.  ``None`` when every coupled op is
             tiled outright.
         min_slice: Narrowest slice a consumer is handed (see
@@ -205,7 +174,7 @@ def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
         for constraint in constraints_of(node)
     ]
     start = time.perf_counter()
-    costs, prepared = _search_costs(searches, tiler)
+    costs = _search_costs(searches, tiler)
     logger.info(
         "[csr] %d constrained searches over %d coupled ops in %.1fs",
         len(searches),
@@ -248,11 +217,12 @@ def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
                 f"{root.name}: no CSR slice width in "
                 f"{candidates[root]} fits every op coupled to it"
             )
-        _commit(root, None, None, best, prepared, tiler, consumers_of)
+        _commit(root, None, None, best, tiler, consumers_of)
 
 
-def _commit(node, s_in, rows, best, prepared, tiler, consumers_of):
-    """Register the winning constraint of ``node`` and its subtree.
+def _commit(node, s_in, rows, best, tiler, consumers_of):
+    """Register the winning constraint of ``node`` and its subtree, whose
+    searches ``_search_costs`` already cached.
 
     ``rows`` is the row block of the CSR ``node`` is handed (``None`` for a
     root, or below a row-swept producer, which sizes its blocks to its
@@ -264,10 +234,6 @@ def _commit(node, s_in, rows, best, prepared, tiler, consumers_of):
     anchor = get_anchor_node(node)
     if is_gemm_op(anchor) and tiler is not None:
         tiler.constraints[anchor] = constraint
-        if (node, constraint) in prepared:
-            key, search, found = prepared[node, constraint]
-            if key not in tiler.cache:
-                tiler.cache[key] = _finish_search(search, found)
         if rows is not None:
             _align_rows(node, rows, tiler)
     if s_out is not None:
@@ -282,7 +248,7 @@ def _commit(node, s_in, rows, best, prepared, tiler, consumers_of):
         if gemm_produces_csr(node) and tiler is not None:
             block = _row_tile(node, tiler)
         for child in consumers_of[node]:
-            _commit(child, s_out, block, best, prepared, tiler, consumers_of)
+            _commit(child, s_out, block, best, tiler, consumers_of)
 
 
 def _row_tile(node, tiler):
@@ -311,18 +277,15 @@ def _align_rows(consumer, rows, tiler):
         TileConstraint(multiple=((le.OX, rows),))
     )
     tiler.constraints[anchor] = constraint
-    prepared = _prepare_search(consumer, tiler, constraint)
-    if prepared is None or prepared[1] is None:
-        return  # a GEMV or an explicit tiling: ``get_tiling`` applies it
-    key, search = prepared
-    try:
-        found = _run_search(search)
-    except RuntimeError as e:
+    pair = (consumer, constraint)
+    found = search_tilings([pair], tiler)
+    if pair not in found:
+        return  # an explicit tiling: ``get_tiling`` applies it
+    if found[pair] is None:
         raise RuntimeError(
             f"{consumer.name}: no tiling with a row tile of whole "
             f"{rows}-row CSR blocks fits on chip"
-        ) from e
-    tiler.cache[key] = _finish_search(search, found)
+        )
     logger.info(
         "[csr] %s: row tile realigned to %d-row blocks", consumer.name, rows
     )

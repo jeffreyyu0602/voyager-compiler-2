@@ -59,7 +59,7 @@ from voyager_compiler.codegen.transform.bufferize import (
 )
 from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
-    build_interstellar_tiler,
+    build_tiler,
 )
 from voyager_compiler.export_utils import (
     export_model,
@@ -364,7 +364,7 @@ def compile(
         if runtime_tolerance is None
         else runtime_tolerance
     )
-    tiler = build_interstellar_tiler(
+    tiler = build_tiler(
         config, runtime_tolerance=tolerance, accumulate_fp32=accumulate_fp32
     )
     bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)

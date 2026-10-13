@@ -38,7 +38,7 @@ from voyager_compiler.codegen.transform.rewrites import (
 from voyager_compiler.codegen.transform.scalarize import (
     scalarize_index_arithmetic,
 )
-from voyager_compiler.codegen.transform.tiling.search import (
+from voyager_compiler.codegen.transform.tiling.grid_search import (
     gemv_op_tiling,
     pool_op_tiling,
     vector_op_tiling,

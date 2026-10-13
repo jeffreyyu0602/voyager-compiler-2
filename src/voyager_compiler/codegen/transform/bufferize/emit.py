@@ -247,17 +247,25 @@ def _trip_str(node) -> str:
 _TILING_NUM_LEVELS = 3
 
 
-def _build_tiling(node) -> Tiling:
-    """The interstellar mapping of a tiled matrix op (stamped on the node by its
-    builder), as a ``Tiling``.  ``LoopIndex`` is numbered like the interstellar
-    loop ids, so they map across directly.  A level's loops are written in
-    order rank; a loop blocked at a level that gives it no rank could not be
-    placed and would be dropped, so that mapping is rejected.
+def _build_tiling(node) -> Optional[Tiling]:
+    """The interstellar mapping of a tiled matrix op (its ``TileResult``,
+    stamped on the node by its builder), as a ``Tiling``; ``None`` when no
+    mapping tiled the node -- a GEMV's, vector op's or pool's result is a
+    grid.  ``LoopIndex`` is numbered like the interstellar loop ids, so they
+    map across directly.  A level's loops are written in order rank; a loop
+    blocked at a level that gives it no rank could not be placed and would
+    be dropped, so that mapping is rejected.
 
     Raises:
         ValueError: A level blocks a loop it assigns no order to.
     """
-    mapping, access_list = node.meta["interstellar_tiling"]
+    result = node.meta.get("tile_result")
+    if (
+        result is None
+        or not isinstance(result.tiling, interstellar.MappingPoint)
+    ):
+        return None
+    mapping, access_list = result.tiling, result.access_list
     tiling = Tiling(name=node.name)
 
     for level in range(1, _TILING_NUM_LEVELS):  # skip level 0 (the PE)
@@ -724,7 +732,8 @@ class _Emitter:
 
     def _bind_insert(self, node, gm, env) -> None:
         """Resolve one destination-passing store: which op(s) actually produce
-        the value, and where it lands."""
+        the value, and where it lands.  A value has one destination, so a
+        second store of it is an error."""
         src, dst = node.args[0], node.args[1]
         destination = self._ref(dst, env)
 
@@ -742,7 +751,15 @@ class _Emitter:
             )
 
         for producer, index in producers:
-            self.dest.setdefault(producer, {})[index] = destination
+            stores = self.dest.setdefault(producer, {})
+            if index in stores:
+                raise ValueError(
+                    f"'{node.name}' stores '{producer.name}', which another "
+                    f"voyager.insert already stores: a value has one "
+                    f"destination, so a second store must copy it, "
+                    f"voyager.insert(src.clone(), dst)"
+                )
+            stores[index] = destination
 
     def _producers(self, node, gm, env, index=None):
         """The op(s) whose result this store writes, as ``[(node, index)]`` — or
@@ -976,8 +993,8 @@ class _Emitter:
         op = Operation(name=node.name)
         op.prim.CopyFrom(self._call(node, env))
         self._set_outputs(op, node, env)
-        if "interstellar_tiling" in node.meta:
-            op.tiling.CopyFrom(_build_tiling(node))
+        if (tiling := _build_tiling(node)) is not None:
+            op.tiling.CopyFrom(tiling)
         ops.append(op)
 
     def _fused(self, node, named, env) -> Operation:
@@ -1002,8 +1019,8 @@ class _Emitter:
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
         self._set_outputs(op, node, env)
-        if "interstellar_tiling" in node.meta:
-            op.tiling.CopyFrom(_build_tiling(node))
+        if (tiling := _build_tiling(node)) is not None:
+            op.tiling.CopyFrom(tiling)
         return op
 
     def _loop(self, node, named, env) -> Operation:

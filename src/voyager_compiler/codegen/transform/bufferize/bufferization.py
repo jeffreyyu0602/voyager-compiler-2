@@ -84,8 +84,12 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _subgraph,
 )
-from voyager_compiler.codegen.transform.tiling.sparse import plan_csr_slices
-from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
+from voyager_compiler.codegen.transform.tiling.csr_slice_planning import (
+    plan_csr_slices,
+)
+from voyager_compiler.codegen.transform.tiling.matrix_search import (
+    prefetch_tilings,
+)
 from voyager_compiler.shape_prop import set_node_value
 
 logger = logging.getLogger(__name__)
@@ -881,7 +885,7 @@ def bufferize_graph(
         model: The FX GraphModule to rewrite in place.
         pipelined: Emit software-pipelined (double-buffered) loop nests,
           reusing the tiler's decision that two L2 tiles fit.
-        tiler: Interstellar ``TilerContext`` supplying per-node tile factors.
+        tiler: The ``Tiler`` supplying per-node tile factors.
         single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
           post-op operands (SRAM saved vs. prefetch); off => double-buffered.
         flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
@@ -893,7 +897,7 @@ def bufferize_graph(
     """
     graph = model.graph
     num_slots = 2 if pipelined else 1
-    accumulate_fp32 = tiler is not None and tiler.accumulate_fp32
+    accumulate_fp32 = tiler is not None and tiler.model.accumulate_fp32
     build_cache = {}
     group_ids = itertools.count()
 
@@ -1176,7 +1180,8 @@ def _dedup_regions(gm: GraphModule) -> None:
     registers under each tensor operand's root buffer, and a write to that
     buffer — ``insert`` / ``async_copy``, or a region taking it as an
     operand — evicts those entries.  Views and loop-counter arithmetic read
-    no bytes and merge across writes.
+    no bytes and merge across writes.  Two nodes each stored by an ``insert``
+    never merge: a value has one destination, so each store keeps its own op.
     """
     seen, merged = {}, set()
     # root buffer -> keys in ``seen`` whose value came from its bytes
@@ -1185,6 +1190,12 @@ def _dedup_regions(gm: GraphModule) -> None:
     def evict(buffer):
         for key in readers.pop(buffer, ()):
             seen.pop(key, None)
+
+    def stored(node):
+        return any(
+            user.target is _VOYAGER_INSERT and user.args[0] is node
+            for user in node.users
+        )
 
     for node in list(gm.graph.nodes):
         if node.op == "call_function" and node.target in (
@@ -1211,6 +1222,8 @@ def _dedup_regions(gm: GraphModule) -> None:
                     root = _buffer_root(arg)
                     if _produces_tensor(root):
                         readers.setdefault(root, set()).add(key)
+            continue
+        if stored(orig) and stored(node):
             continue
         node.replace_all_uses_with(orig)
         gm.graph.erase_node(node)
@@ -1252,8 +1265,8 @@ def _build_for_untiled(node: Node, tiler):
 
     Args:
         node: The op to bufferize whole.
-        tiler: Interstellar ``TilerContext``; its ``config`` describes the
-            hardware, as it does for the tiled builders.
+        tiler: The ``Tiler``; its ``config`` describes the hardware, as it
+            does for the tiled builders.
 
     Returns:
         ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to

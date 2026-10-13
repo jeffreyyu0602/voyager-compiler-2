@@ -81,8 +81,11 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     stamp_csr_fill,
     voyager,
 )
-from voyager_compiler.codegen.transform.tiling.search import vector_op_tiling
-from voyager_compiler.codegen.transform.tiling.tiler import get_tiling
+from voyager_compiler.codegen.transform.tiling.grid_search import (
+    vector_op_tiling,
+)
+from voyager_compiler.codegen.transform.tiling.matrix_search import get_tiling
+from voyager_compiler.codegen.transform.tiling.runtime_model import Role
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import ShapeProp
 
@@ -729,8 +732,8 @@ def build_quantize_mx_outlier(
     Args:
         node: The producer: a bare ``quantize_mx_outlier`` call, or a fused
             ``call_module`` whose submodule ends in one.
-        tiler: The interstellar ``TilerContext``; supplies both the consumer's
-            k tile and the row-block search.
+        tiler: The ``Tiler``; supplies both the consumer's k tile and the
+            row-block search.
         num_slots: Software-pipeline depth for the sweep's inputs.
 
     Returns:
@@ -777,7 +780,7 @@ def build_quantize_mx_outlier(
     # starts from the whole activation and lets the consumers' row tile cap
     # it.  The search runs either way: it stamps the operands' bank groups.
     config = tiler.config
-    tiling = vector_op_tiling(node, config)
+    tiling = vector_op_tiling(node, tiler)
     lanes = config.vector_lanes
     ones = [1] * len(batch)
     act_bytes = act.element_size()
@@ -915,14 +918,14 @@ def build_quantize_mx_outlier(
         gm = export_model(producer, inputs)
     gm = _finalize_exported_gm(gm)
     # This nest's per-block staging tiles are the outputs the search already
-    # sized -- ``_build_vector_op_shape_map`` tiles every one of the five --
-    # so they take the bank it charged for them, with the stream bookkeeping
+    # sized -- ``vector_operand_shapes`` tiles every one of the five -- so
+    # they take the bank it charged for them, with the stream bookkeeping
     # riding along.  The fused prefix's row-block intermediate is uncharged
     # and stays loose.  Order tracks ``_OutlierProducer.forward``.
-    groups = node.meta.get("bank_groups")
+    groups = node.meta["tile_result"].placement.groups
     if groups is not None:
         out_group = next(
-            (i for i, members in enumerate(groups) if node in members), None
+            (i for i, group in enumerate(groups) if Role.OUTPUT in group), None
         )
         hand_groups = [None] if prefix_gm is not None else []
         # slice_nnz, stream_pos, base_table, then the five staging tiles

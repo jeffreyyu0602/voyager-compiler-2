@@ -14,6 +14,15 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+import interstellar
+
+# Reporting estimates with Voyager's formulas for now; they are to be made
+# backend-general.
+from voyager_compiler.backend.voyager.vector import (
+    gemv_lanes,
+    pool_taps,
+    vector_op_utilization,
+)
 from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
@@ -24,11 +33,6 @@ from voyager_compiler.codegen.node_info import (
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
-from voyager_compiler.codegen.transform.tiling.cost import (
-    gemv_lanes,
-    pool_taps,
-    vector_op_utilization,
-)
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 
@@ -108,26 +112,29 @@ def op_utilization(
 ) -> float:
     """The utilization to charge ``node``.
 
-    A matrix op the interstellar tiler mapped carries its RuntimeCalculator,
-    mapping and bank partition (stamped on it by the builder); the calculator
-    prices one tiled execution, so its utilization is the ideal-to-actual
-    ratio.
+    A matrix op interstellar mapped carries the search's result
+    (``meta["tile_result"]``, stamped on it by the builder), whose
+    ``cost.compute`` prices one tiled execution of its mapping, so its
+    utilization is the ideal-to-actual ratio.
 
-    Everything else runs on the vector unit; ``vector_op_utilization`` (shared
-    with the vector L2-tiling cost model) charges it, at
-    ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
-    case, which it sizes by the streamed weight and its bank switches over
-    the anchor's shape, the tile once bufferized, and a pool, whose fetch it
-    walks for bank switches over the anchor's input tile.  ``ideal_cycles``
-    is one tile's, so it also folds in the per-launch overhead the tiling
-    model charges, and the two cannot disagree on what a tile costs.
+    Everything else runs on the vector unit, charged by
+    ``vector_op_utilization`` (shared with the vector L2-tiling cost model)
+    at ``cost.bytes_per_cycle`` SRAM bandwidth -- including the
+    fully-connected case, which it sizes by the streamed weight and its bank
+    switches over the anchor's shape, the tile once bufferized, and a pool,
+    whose fetch it walks for bank switches over the anchor's input tile.
+    ``ideal_cycles`` is one tile's, so it also folds in the per-launch
+    overhead the tiling model charges, and the two cannot disagree on what a
+    tile costs.
     """
-    tiling = node.meta.get("interstellar_tiling")
-    if "mma" in units and tiling is not None and ideal_cycles > 0:
-        per_tile = node.meta["runtime_calculator"].matrix_cycles(
-            tiling[0], node.meta.get("bank_groups")
-        )
-        return min(1.0, ideal_cycles / per_tile)
+    result = node.meta.get("tile_result")
+    if (
+        "mma" in units
+        and result is not None
+        and isinstance(result.tiling, interstellar.MappingPoint)
+        and ideal_cycles > 0
+    ):
+        return min(1.0, ideal_cycles / result.cost.compute)
     anchor = get_anchor_node(node) or node
     tile = None
     if is_fully_connected(anchor):

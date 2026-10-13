@@ -170,6 +170,20 @@ class AcceleratorConfig:
             return None
         return self.num_banks - self.scratchpad_offset // self.bank_size
 
+    def runtime_model(self, accumulate_fp32):
+        """The runtime model the tile search fits and prices this
+        accelerator's tilings with: a ``VoyagerModel``.
+
+        Args:
+            accumulate_fp32: A GEMM split along its reduction accumulates in
+                float32.
+        """
+        # Imported here to keep the config a leaf that loads nothing of the
+        # compiler: cli_args reads its defaults before the compiler loads.
+        from voyager_compiler.backend.voyager import VoyagerModel
+
+        return VoyagerModel(self, accumulate_fp32)
+
     @classmethod
     def from_args(cls, args) -> "AcceleratorConfig":
         """Build the config from parsed CLI args (``add_compile_args``)."""

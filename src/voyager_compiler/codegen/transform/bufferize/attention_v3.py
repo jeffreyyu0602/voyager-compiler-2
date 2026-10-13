@@ -74,7 +74,7 @@ last step and consumed at the next sweep's boundary (or the epilogue),
 which under a single KV block is the same iteration as the next fetch.
 
 A head narrower than the PE array is padded on chip to the width the
-products need (``attention_head_pad``): Q, K, V and their block scales are
+products need (``pad_head``): Q, K, V and their block scales are
 held at the padded head and the products run at it, DRAM keeping the real
 head.  The pad is zeros.  A column-padded tile (Q, V, their scales, the
 residual's Q and V) is zero-filled by its own DMA (``async_copy``'s
@@ -116,9 +116,9 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling import (
-    attention_head_pad,
     attention_kv_last,
     attention_op_tiling,
+    pad_head,
 )
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import ShapeProp
@@ -1130,7 +1130,7 @@ def _stamp_probs_dtypes(gm, dtypes):
 
 
 def _stamp_product_tilings(gm, products, keys):
-    """Copy the products' mapping metadata (``attention_op_tiling``) onto
+    """Copy each product's search result (``attention_op_tiling``) onto
     every kernel of ``gm`` that runs one -- the bare product op or the
     fused ``call_module`` around it, at every nesting level -- the way the
     GEMM builder stamps its nest, so the emitter and the reporting model
@@ -1160,7 +1160,7 @@ def _stamp_product_tilings(gm, products, keys):
                 anchor.value.shape[-1],
             )
         ]
-        n.meta.update(products[which])
+        n.meta["tile_result"] = products[which]
 
 
 def build_attention_fa3(
@@ -1184,10 +1184,11 @@ def build_attention_fa3(
     output dtype, at the cost of a separate probabilities buffer at V's
     dtype when the two differ.  The block counts
     ``(num_q_blocks, num_kv_blocks)`` come from ``node.meta['l2_tiling']``
-    when set, else ``attention_op_tiling`` chooses them under
-    ``tiler.config``, which also sets the head the tiles are padded to
-    (``attention_head_pad``); a node tiled by a padding tiler is built
-    with that tiler, so the kernel's products match the ones it mapped.
+    when set, else ``attention_op_tiling`` chooses them for the op
+    ``tiler``'s model prepares (``RuntimeModel.prepare_attention``), whose
+    space also sets the head the tiles are padded to (``pad_head``); a node
+    tiled by a padding tiler is built with that tiler, so the kernel's
+    products match the ones it mapped.
     The kernel adds its mask: an explicit ``attn_mask`` must be additive,
     and under ``is_causal`` the kernel's own table is int1 codes plus a
     scale (``bool_mask``) or the additive fill at the accumulation dtype.
@@ -1230,7 +1231,11 @@ def build_attention_fa3(
     if scale is None:
         scale = 1.0 / math.sqrt(d)
     acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
-    head_pad = attention_head_pad(d, tiler.config) if tiler is not None else d
+    op = None
+    head_pad = d
+    if tiler is not None:
+        op = tiler.model.prepare_attention(node, acc_dtype, bool_mask)
+        head_pad = pad_head(d, op.space)
 
     # GQA folds the head group into the query rows so K/V load once per KV head
     # and reuse across the group (see ``plan_gqa_fold``); ``forward`` applies
@@ -1250,11 +1255,10 @@ def build_attention_fa3(
             return None
         tiling = attention_op_tiling(
             node,
+            op,
             tiler,
             sq_eff=plan.sq_eff,
             kv_batch=kbatch,
-            acc_dtype=acc_dtype,
-            bool_mask=bool_mask,
         )
     num_q_blocks, num_kv_blocks = tiling
     tq, tkv = plan.sq_eff // num_q_blocks, Skv // num_kv_blocks
@@ -1345,8 +1349,8 @@ def build_attention_fa3(
         for n in gm.graph.nodes:
             if n.op == "get_attr" and str(n.target).endswith("causal_mask"):
                 n.meta["dtype"] = "int1"
-    products = node.meta.get("product_tilings")
-    if products is not None:
+    result = node.meta.get("tile_result")
+    if result is not None:
         mx = block_size is not None
         keys = {
             (mx, head_pad, tkv): "scores",
@@ -1357,5 +1361,5 @@ def build_attention_fa3(
             length = residual.value.shape[-2]
             keys.setdefault((False, head_pad, length), "residual_scores")
             keys.setdefault((False, length, head_pad), "residual_context")
-        _stamp_product_tilings(gm, products, keys)
+        _stamp_product_tilings(gm, result.tiling.products, keys)
     return gm
