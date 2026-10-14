@@ -20,7 +20,7 @@ import torch
 import interstellar
 from voyager_compiler.codegen.node_info import (
     DYNAMIC_QUANTIZE_OPS,
-    LAYER_NORM_OPS,
+    NORM_OPS,
     SOFTMAX_OPS,
     get_anchor_node,
     get_arg_value,
@@ -278,7 +278,7 @@ def _vector_op_tiling_limits(node, vector_unit_width):
     dequantize = node.target == torch.ops.quantized_ops.dequantize.default
     if node.target in SOFTMAX_OPS:
         last_dim = get_arg_value(node, 1, "dim", -1)
-    elif node.target in LAYER_NORM_OPS:
+    elif node.target in NORM_OPS:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1

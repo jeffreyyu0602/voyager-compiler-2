@@ -46,7 +46,7 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen import (
-    replace_rmsnorm_with_layer_norm,
+    match_and_fuse_rms_norm,
 )
 
 from .utils import get_compile_args, get_transform_args
@@ -364,7 +364,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     example_input = torch.randn(
         1, seq, layernorm.weight.shape[-1], dtype=model.dtype
     )
-    replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
+    match_and_fuse_rms_norm(gm, layernorm, (example_input,))
 
     quantizer.set_module_name_object_type_order(
         _ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
@@ -385,7 +385,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
         )
         qconfig = QuantizationConfig(fp8_qspec, None, None, None)
         quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-        quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
+        quantizer.set_object_type(torch.ops.aten.rms_norm.default, qconfig)
 
     # The HF export builds the causal mask in-graph: a ``where`` over the
     # boolean mask that the attention scores' ``add`` reads.  In prefill the

@@ -41,6 +41,7 @@ has_side_effect(torch.ops.voyager.insert.default)
 has_side_effect(torch.ops.voyager.async_copy.default)
 has_side_effect(torch.ops.voyager.async_wait.default)
 has_side_effect(torch.ops.higher_order.commit)
+has_side_effect(torch.ops.higher_order.with_scratch)
 
 __all__ = [
     "bufferize_graph",

@@ -44,8 +44,8 @@ from voyager_compiler import (
     split_kv_cache,
 )
 from voyager_compiler.codegen import (
+    match_and_fuse_rms_norm,
     remove_fp32_casts,
-    replace_rmsnorm_with_layer_norm,
 )
 from voyager_compiler.quantization import load_codebooks
 from voyager_compiler.quantization.codebook_optimizer import _quantized_operands
@@ -229,7 +229,7 @@ def generate_answer(
 
 
 # The scheme that quantizes nothing; the other names in QUANTIZATION_CONFIGS
-# turn on the compiler's graph rewrites.  The softmax and layer norm stay
+# turn on the compiler's graph rewrites.  The softmax and RMS norm stay
 # unquantized: the fp8 spec the compiler path puts on the softmax input sees
 # the causal mask's ``finfo.min`` and scales every real score to zero.
 BF16_CONFIG = "bf16"
@@ -324,14 +324,14 @@ def build_quantizer(qconfig, decode, kivi):
 
 def rewrite_for_compiler(gm, model, seq):
     """Apply the graph rewrites the compiler's Llama path makes before
-    quantizing: RMSNorm as the layer-norm op, the softmax in bf16."""
+    quantizing: RMSNorm fused into one rms_norm op, the softmax in bf16."""
     # get_decoder() is the text decoder, wherever the model nests it.
     layernorm = model.get_decoder().layers[0].input_layernorm
     hidden = layernorm.weight.shape[-1]
     example = torch.randn(
         1, seq, hidden, dtype=model.dtype, device=model.device
     )
-    replace_rmsnorm_with_layer_norm(gm, layernorm, (example,))
+    match_and_fuse_rms_norm(gm, layernorm, (example,))
     remove_fp32_casts(gm)
 
 
@@ -661,7 +661,7 @@ def build_generator(
     that returns the KV cache, and a single-token decode graph over a
     static KV cache, quantized the way ``test_codegen.py``'s
     ``llama_prefill`` / ``llama_decode_kivi`` paths quantize them, except
-    that the softmax and layer norm stay unquantized.  Both stay prepared:
+    that the softmax and RMS norm stay unquantized.  Both stay prepared:
     every weight is fake-quantized once (``freeze_weights``), and what the
     decode graph reads from a split cache's main half once per chunk
     (``freeze_cache_reads``).

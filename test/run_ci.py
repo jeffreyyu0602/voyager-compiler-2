@@ -10,18 +10,22 @@ mismatch (or compile failure) is reported.
 
 Usage (from the repo root, with the conda env active)::
 
-    python test/run_ci.py <output_dir>
+    python test/run_ci.py <output_dir> [--jobs N] [--threads T]
 
-Exits non-zero if any command fails to compile or any ``model.txt`` differs
-from the previous run, so it can gate a pre-push hook.
+``--jobs`` runs that many commands at once; ``--threads`` caps each one's CPU
+threads, so ``N * T`` bounds the cores the run takes.  Exits non-zero if any
+command fails to compile or any ``model.txt`` differs from the previous run,
+so it can gate a pre-push hook.
 """
 
 import argparse
 import difflib
+import os
 import re
 import shlex
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,27 +53,28 @@ DIFF_EXCERPT_LINES = 60
 SCHEME_ARGS = {
     "E4M3": (
         "--activation fp8_e4m3 --weight fp8_e4m3 --bf16 "
-        "--layout_policy systolic"
+        "--tensor_layout nhwc --gemm_weight_layout ck"
     ),
     "P8_1": (
         "--activation posit8_1 --weight posit8_1 --bf16 "
-        "--layout_policy systolic"
+        "--tensor_layout nhwc --gemm_weight_layout ck"
     ),
     "INT8": (
         "--activation int8,qs=per_tensor_symmetric "
         "--weight int8,qs=per_tensor_symmetric --bias int24 --bf16 "
-        "--calibration_steps 3 --layout_policy systolic"
+        "--calibration_steps 3 --tensor_layout nhwc --gemm_weight_layout ck"
     ),
     "MXINT8": (
         "--activation int8,qs=microscaling,bs=16,pot=1 "
         "--weight int8,qs=microscaling,bs=16,pot=1 "
-        "--bf16 --layout_policy systolic"
+        "--bf16 --tensor_layout nhwc --gemm_weight_layout ck"
     ),
     "MXNF4": (
         "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
         "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
-        "--residual fp8_e4m3 --quantize_fc --layout_policy systolic "
-        "--scratchpad_size 2097152 --num_banks 16 --conv2d_im2col"
+        "--residual fp8_e4m3 --quantize_fc --tensor_layout nhwc "
+        "--gemm_weight_layout ck --scratchpad_size 2097152 --num_banks 16 "
+        "--conv2d_im2col"
     ),
 }
 
@@ -219,8 +224,9 @@ def _build(command, run_dir):
     return label, dest, argv
 
 
-def _run_one(label, dest, argv):
-    """Run one command; capture combined output to ``dest/run.log``.
+def _run_one(label, dest, argv, env):
+    """Run one command in ``env``; capture combined output to
+    ``dest/run.log``.
 
     Returns a status string: ``ok`` / ``error`` (nonzero exit) /
     ``no_output`` (exited 0 but no model.txt) / ``numeric_drift`` (the
@@ -235,7 +241,11 @@ def _run_one(label, dest, argv):
         log.write("$ " + " ".join(shlex.quote(a) for a in argv) + "\n\n")
         log.flush()
         proc = subprocess.run(
-            argv, cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT
+            argv,
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
         )
 
     if proc.returncode != 0:
@@ -311,6 +321,18 @@ def main():
         action="store_true",
         help="List command labels and exit.",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Commands to run at once.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="CPU threads each command may use (OMP / MKL / OpenBLAS); "
+        "unset leaves each command its default.",
+    )
     args = parser.parse_args()
 
     commands = COMMANDS
@@ -346,17 +368,33 @@ def main():
         print(f"comparing model.txt against previous run: {prev_run.name}")
     else:
         print("no previous run found; this run is the baseline")
-    print(f"running {len(commands)} commands\n")
+    print(f"running {len(commands)} commands, {args.jobs} at a time\n")
 
-    results = []  # (label, status, verdict, diff_excerpt)
-    for idx, command in enumerate(commands, 1):
+    env = dict(os.environ)
+    if args.threads is not None:
+        for var in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+        ):
+            env[var] = str(args.threads)
+
+    def run(command):
         label, dest, argv = _build(command, run_dir)
-        print(f"[{idx}/{len(commands)}] {label} ... ", end="", flush=True)
-        status = _run_one(label, dest, argv)
+        status = _run_one(label, dest, argv, env)
         verdict, excerpt = _compare(label, status, run_dir, prev_run)
-        results.append((label, status, verdict, excerpt))
-        suffix = "" if status == "ok" else f" ({status})"
-        print(f"{verdict}{suffix}")
+        return label, status, verdict, excerpt
+
+    # (label, status, verdict, diff_excerpt), in command order.
+    results = [None] * len(commands)
+    with ThreadPoolExecutor(args.jobs) as pool:
+        futures = {pool.submit(run, c): i for i, c in enumerate(commands)}
+        for done, future in enumerate(as_completed(futures), 1):
+            label, status, verdict, excerpt = future.result()
+            results[futures[future]] = (label, status, verdict, excerpt)
+            suffix = "" if status == "ok" else f" ({status})"
+            print(f"[{done}/{len(commands)}] {label} ... {verdict}{suffix}")
+            sys.stdout.flush()
 
     report = _build_report(results, run_dir, prev_run)
     (run_dir / "report.txt").write_text(report)

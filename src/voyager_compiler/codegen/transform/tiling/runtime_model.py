@@ -20,7 +20,7 @@ from enum import Enum
 
 class Role(Enum):
     """A buffer of a tiled op, by the part it plays: an operand of a GEMM /
-    conv anchor, the op's output, or the reduction scratch."""
+    conv anchor, the op's output, or the scratch its kernel keeps."""
 
     INPUT = "input"
     CSR = "csr"
@@ -257,6 +257,21 @@ class RuntimeModel(ABC):
             NotImplementedError: The backend does not run fused attention.
         """
         raise NotImplementedError(f"{type(self).__name__}: fused attention")
+
+    def kernel_scratch(self, node, out_tile):
+        """The on-chip regions a backend's kernel keeps beside an op's tiles
+        that no FX node names, which the builders declare and the fit
+        charges.  None by default: a kernel that keeps its intermediates in
+        its own temporaries needs no region in the IR.
+
+        Args:
+            node: The op being bufferized or tiled, bare or fused.
+            out_tile: One tile of ``node``'s output, or one per output.
+
+        Returns:
+            ``[(name, shape, dtype), ...]``, one per region.
+        """
+        return []
 
 
 def pad_head(head_dim, space):

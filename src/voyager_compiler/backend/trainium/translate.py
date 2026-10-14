@@ -133,8 +133,15 @@ DEQUANTIZE = "quantized_ops::dequantize"
 SINES = {"aten::sin": 0.0, "aten::cos": 0.5 * math.pi}
 RELAYOUTS = ("aten::transpose", "aten::view", "aten::reshape")
 GEMMS = ("quantized_ops::linear", "aten::matmul")
+MAX_POOL2D = "aten::max_pool2d"
 LINEAR_MX = "quantized_ops::linear_mx"
 QUANTIZE_MX = "quantized_ops::quantize_mx"
+# The row-wise ops, each lowered by a ``Kernel`` method over whole rows.
+ROWWISE = {
+    "aten::layer_norm": "_layer_norm",
+    "aten::rms_norm": "_rms_norm",
+    "aten::softmax": "_softmax",
+}
 
 # MX arrays as ``nc_matmul_mx`` reads them: a 32-bit word packs 4
 # consecutive contraction elements, so the partitions hold a chunk of 512,
@@ -522,6 +529,9 @@ class Kernel:
         boxes: Every box the kernel touches, by name.
         reads: The HBM boxes it reads, its arguments, in order.
         writes: The HBM boxes it writes, its results, in order.
+        windows: Each pool input box -> ``(kH, sH, dH, out_rows, out_h)``:
+            its kernel height, stride and dilation along H, and the rows and
+            height of the pool's output tile.
         lines: The body, statement by statement.
     """
 
@@ -550,6 +560,7 @@ class Kernel:
         # to an even number (a stationary operand's width must be even).
         self.mx_tiles = {}
         self.reads, self.writes = [], []
+        self.windows = {}
         self.uses = {}
         self.lines = []
         self.pools = {}
@@ -656,7 +667,8 @@ class Kernel:
 
     def _lay_out(self):
         """Every SBUF box's layout: rows on the partitions, a one-row box
-        only ever read as an elementwise operand replicated."""
+        only ever read as an elementwise operand replicated, and a pool
+        input as its windows (``windows``)."""
         for box in self.boxes.values():
             if box.level != SCRATCHPAD or box.name in self.mx_tiles:
                 continue
@@ -671,6 +683,10 @@ class Kernel:
             parts = PARTITIONS if replicated else min(box.rows, PARTITIONS)
             blocks = math.ceil(box.rows / PARTITIONS)
             self.layouts[box.name] = Layout(parts, blocks, box.cols, replicated)
+        # A pool input holds output row p's kH input rows on partition p.
+        for name, (kh, _, _, out_rows, _) in self.windows.items():
+            cols = kh * self.boxes[name].cols
+            self.layouts[name] = Layout(out_rows, 1, cols, False)
 
     def _view(self, ref):
         """``View`` of a ``TensorBoxRef``."""
@@ -762,7 +778,7 @@ class Kernel:
         """``voyager::async_copy``: the block of the HBM view at ``indices``
         to or from an SBUF slot."""
         src, dst = self._view(kw["src"]), self._view(kw["dst"])
-        if kw.get("pad") or kw.get("count"):
+        if any(kw.get("pad") or ()) or kw.get("count"):
             raise NotImplementedError("padded or partial transfer")
         load = src.box.level == DRAM
         hbm, sbuf = (src, dst) if load else (dst, src)
@@ -790,6 +806,8 @@ class Kernel:
             self._mx_transfer(hbm, hbm_linear, sbuf, load)
         elif kw.get("transposed"):
             self._transposed_load(hbm, hbm_linear, sizes, sbuf)
+        elif sbuf.box.name in self.windows:
+            self._window_load(hbm, hbm_linear, sizes, sbuf)
         else:
             self._transfer(hbm, hbm_linear, sbuf, load)
 
@@ -850,6 +868,22 @@ class Kernel:
             linear = np.arange(a * cols, b * cols).reshape(b - a, cols)
             s, h = offsets(linear)
             self._dma(sbuf_var, layout.free, s, hbm_var, h, load)
+
+    def _window_load(self, hbm, hbm_linear, sizes, sbuf):
+        """Load a pool's halo block (``sizes``, the HBM elements
+        ``hbm_linear``) as its windows: partition ``r``, output row ``oh``
+        of leading index ``lead``, holds halo rows ``lead * ih + oh * sH + k
+        * dH`` for ``k < kH`` side by side, ``iw`` columns each."""
+        kh, sh, dh, out_rows, out_h = self.windows[sbuf.box.name]
+        ih, iw = sizes[-2], sizes[-1]
+        lead, oh = np.divmod(np.arange(out_rows), out_h)
+        row = lead[:, None] * ih + oh[:, None] * sh + np.arange(kh) * dh
+        linear = (row[:, :, None] * iw + np.arange(iw)).reshape(out_rows, -1)
+        free = kh * iw
+        s = np.arange(out_rows)[:, None] * free + np.arange(free)
+        h = self.flat(hbm, hbm_linear[linear])
+        sbuf_var = self.var(sbuf.box, sbuf.slot)
+        self._dma(sbuf_var, free, s, self.var(hbm.box), h, True)
 
     def _try_dma(self, sbuf_var, free, s, hbm_var, h, load, dtype=None):
         """One ``dma_copy`` of offsets ``s`` (SBUF) and ``h`` (HBM) if a
@@ -931,6 +965,17 @@ class Kernel:
             prims = [op.prim]
         else:
             prims = list(op.fused.op_list)
+        # A GEMM's prims are the prologue computing its activation, then the
+        # GEMM and its tail.
+        g = next(
+            (
+                i
+                for i, p in enumerate(prims)
+                if p.target in GEMMS or p.target == LINEAR_MX
+            ),
+            0,
+        )
+        prologue, prims = prims[:g], prims[g:]
         anchor = prims[0]
         if prims[-1].target == QUANTIZE_MX:
             # Its results are the scales, then the codes.
@@ -941,23 +986,34 @@ class Kernel:
         else:
             dst = self._view(op.outputs[0].destination)
             self._use(dst.box, "dst")
+        if anchor.target == MAX_POOL2D:
+            self._max_pool(prims, dst)
+            return
         gemm = anchor.target in GEMMS or anchor.target == LINEAR_MX
         gemm_operands = []
         if anchor.target == LINEAR_MX:
+            if prologue:
+                raise NotImplementedError(f"{anchor.name}: an MX prologue")
             for key, (scales, k_major) in MX_OPERANDS.items():
                 view = self._view(anchor.kwargs[key].tensor_box)
                 self._mx_tile(view, scales, k_major)
                 gemm_operands.append(view)
         elif gemm:
+            # After a prologue the GEMM's input is the prologue's result,
+            # which no box holds: ``None`` stands for it.
             gemm_operands = [
-                self._view(anchor.kwargs[k].tensor_box)
+                (
+                    None
+                    if prologue and k == "input"
+                    else self._view(anchor.kwargs[k].tensor_box)
+                )
                 for k in ("input", "weight", "other")
                 if k in anchor.kwargs
             ]
-        for view in gemm_operands:
+        for view in filter(None, gemm_operands):
             self._use(view.box, "gemm")
         if self.analyze:
-            for prim in prims[1:] if gemm else prims:
+            for prim in prologue + (prims[1:] if gemm else prims):
                 for arg in prim.kwargs.values():
                     if arg.WhichOneof("arg_type") != "tensor_box":
                         continue
@@ -971,27 +1027,44 @@ class Kernel:
         if anchor.target == LINEAR_MX:
             self._gemm_mx(prims, *gemm_operands, dst)
         elif gemm:
-            self._gemm(prims, *gemm_operands, dst)
-        elif anchor.target == "quantized_ops::layer_norm":
-            self._rowwise(prims, dst, self._layer_norm)
-        elif anchor.target == "quantized_ops::softmax":
-            self._rowwise(prims, dst, self._softmax)
+            self._gemm(prologue, prims, *gemm_operands, dst)
+        elif any(p.target in ROWWISE for p in prims):
+            self._rowwise(prims, dst)
         else:
             self._elementwise(prims, dst)
 
-    def _gemm(self, prims, act, weight, dst):
-        """A GEMM step and the ops fused after it: per batch element and
+    def _gemm(self, prologue, prims, act, weight, dst):
+        """A GEMM step and the ops fused around it: per batch element and
         128-row chunk, the activation transposed block by block, then per
-        512-column slice its matmuls into PSUM and the eviction."""
-        *batch_a, m, k = act.shape
+        512-column slice its matmuls into PSUM and the eviction through the
+        tail.
+
+        A ``prologue`` (``act`` is then ``None``) first computes the chunk's
+        activation rows into a temporary, each op in place there: a
+        pointwise op in column runs, a row op over whole rows.  A tail
+        ending in a row op evicts the chunk's slices through the ops before
+        it into ``dst``, then runs the row op there in place."""
+        gemm, tail = prims[0], prims[1:]
+        if prologue:
+            ref = gemm.kwargs["input"].tensor_box
+            act_shape, dtype = tuple(ref.output_shape), ref.box.dtype
+        else:
+            act_shape, dtype = act.shape, act.box.dtype
+            act_var = self.var(act.box, act.slot)
+        *batch_a, m, k = act_shape
         *batch_w, k_w, n = weight.shape
         if k != k_w:
             raise NotImplementedError("a GEMM weight not [K, N]")
+        row_op = next(
+            (i for i, p in enumerate(tail) if p.target in ROWWISE), len(tail)
+        )
+        if tail[row_op + 1 :]:
+            raise NotImplementedError(
+                f"{tail[row_op + 1].name}: an op after a GEMM tail's row op"
+            )
         batch = tuple(np.broadcast_shapes(tuple(batch_a), tuple(batch_w)))
         out_shape = batch + (m, n)
-        dtype = act.box.dtype
         depth = _runs(k, PARTITIONS)
-        act_var = self.var(act.box, act.slot)
         weight_var = self.var(weight.box, weight.slot)
         for e in range(math.prod(batch)):
             e_coords = [int(c) for c in np.unravel_index(e, batch)]
@@ -999,16 +1072,45 @@ class Kernel:
             ew = _batch_index(e_coords, batch_w)
             for i, i_end in _runs(m, PARTITIONS):
                 r = i_end - i
+                act_row = ea * m + i
+                if prologue:
+                    pa = self.pool("pa", (PARTITIONS, k), dtype, 2)
+                for prim in prologue:
+                    if prim.target in ROWWISE:
+                        x = prim.kwargs["input"].tensor_box
+                        if x.box.HasField("memory"):
+                            view = self._view(x)
+                            data = lambda lo, hi: self._rows_ap(
+                                view, act_row, r, lo, hi
+                            )
+                        else:
+                            data = lambda lo, hi: f"{pa}[0:{r}, {lo}:{hi}]"
+                        getattr(self, ROWWISE[prim.target])(
+                            prim, data, r, f"{pa}[0:{r}, 0:{k}]"
+                        )
+                        continue
+                    for lo, hi in _runs(k, CHUNK_FREE):
+                        cols = np.arange(lo, hi)[None, :]
+                        linear = (act_row + np.arange(r))[:, None] * k + cols
+                        coords = np.stack(np.unravel_index(linear, act_shape))
+                        flat = np.arange(r)[:, None] * k + cols
+                        out = Chunk(pa, k, act_shape, coords, flat, dtype)
+                        values = {p.name: out for p in prologue}
+                        self._apply(prim, out, values, out)
                 act_t = self.pool(
                     "at", (PARTITIONS, len(depth) * PARTITIONS), dtype, 2
                 )
                 for c, (lo, hi) in enumerate(depth):
-                    rows = (ea * m + i + np.arange(r))[:, None]
-                    linear = rows * k + lo + np.arange(hi - lo)[None, :]
-                    aps = fit([(self.free(act.box), self.flat(act, linear))], r)
-                    transposed = self._transpose(
-                        _ap(act_var, aps[0]), r, hi - lo, dtype
-                    )
+                    if prologue:
+                        block = f"{pa}[0:{r}, {lo}:{hi}]"
+                    else:
+                        rows = (act_row + np.arange(r))[:, None]
+                        linear = rows * k + lo + np.arange(hi - lo)[None, :]
+                        aps = fit(
+                            [(self.free(act.box), self.flat(act, linear))], r
+                        )
+                        block = _ap(act_var, aps[0])
+                    transposed = self._transpose(block, r, hi - lo, dtype)
                     at = c * PARTITIONS
                     self.emit(
                         f"nisa.tensor_copy(dst={act_t}[0:{hi - lo}, "
@@ -1042,7 +1144,15 @@ class Kernel:
                         )
                     )
                     chunk = Chunk(acc, MOVING_FREE, out_shape, grid)
-                    self._chain(prims[1:], {prims[0].name: chunk}, dst)
+                    self._chain(tail[:row_op], {gemm.name: chunk}, dst)
+                if row_op < len(tail):
+                    out_row = e * m + i
+                    getattr(self, ROWWISE[tail[row_op].target])(
+                        tail[row_op],
+                        lambda lo, hi: self._rows_ap(dst, out_row, r, lo, hi),
+                        r,
+                        self._rows_ap(dst, out_row, r, 0, n),
+                    )
 
     def _gemm_mx(self, prims, act, act_scale, weight, weight_scale, dst):
         """An MX GEMM step and the ops fused after it: per 128-row chunk and
@@ -1589,34 +1699,48 @@ class Kernel:
             raise NotImplementedError("rows no pattern walks")
         return _ap(self.var(view.box, view.slot), aps[0])
 
-    def _rowwise(self, prims, dst, rows_op):
-        """A row-wise op (a layer norm, a softmax) and the ops fused after
-        it, 128 rows at a time: ``rows_op(prim, x, start, r, out)`` writes
-        the op's rows ``start .. start + r`` of input ``x`` to ``out`` --
-        ``dst`` itself, or a temporary the ops after it then read."""
-        anchor = prims[0]
-        x = self._view(anchor.kwargs["input"].tensor_box)
-        rows, cols = _rows_cols(x.shape)
+    def _rowwise(self, prims, dst):
+        """A row-wise op (a layer norm, an RMS norm, a softmax) and the ops
+        fused before or after it, 128 rows at a time.  The ops before it
+        write each block's rows to ``dst``, where the op then runs in place;
+        the op writes ``dst`` itself, or a temporary the ops after it
+        read."""
+        index = next(i for i, p in enumerate(prims) if p.target in ROWWISE)
+        pre, prim, post = prims[:index], prims[index], prims[index + 1 :]
+        if pre and post:
+            raise NotImplementedError(f"{prim.name}: ops before and after")
+        rows_op = getattr(self, ROWWISE[prim.target])
+        x = prim.kwargs["input"].tensor_box
+        shape = tuple(x.output_shape)
+        source = dst if pre else self._view(x)
+        rows, cols = _rows_cols(shape)
         for start, stop in _runs(rows, PARTITIONS):
             r = stop - start
-            if len(prims) == 1:
-                rows_op(
-                    anchor, x, start, r, self._rows_ap(dst, start, r, 0, cols)
-                )
+            if pre:
+                for lo, hi in _runs(cols, CHUNK_FREE):
+                    linear = np.arange(start, stop)[:, None] * cols
+                    linear = linear + np.arange(lo, hi)[None, :]
+                    coords = np.stack(np.unravel_index(linear, shape))
+                    self._chain(pre, {}, dst, Chunk(None, None, shape, coords))
+            data = lambda lo, hi: self._rows_ap(source, start, r, lo, hi)
+            if not post:
+                rows_op(prim, data, r, self._rows_ap(dst, start, r, 0, cols))
                 continue
             temp = self.pool("rw", (PARTITIONS, cols), "float32", 2)
-            rows_op(anchor, x, start, r, f"{temp}[0:{r}, 0:{cols}]")
+            rows_op(prim, data, r, f"{temp}[0:{r}, 0:{cols}]")
             linear = (start + np.arange(r))[:, None] * cols + np.arange(cols)
-            coords = np.stack(np.unravel_index(linear, x.shape))
-            result = Chunk(temp, cols, x.shape, coords)
-            self._chain(prims[1:], {anchor.name: result}, dst)
+            coords = np.stack(np.unravel_index(linear, shape))
+            result = Chunk(temp, cols, shape, coords)
+            self._chain(post, {prim.name: result}, dst)
 
-    def _layer_norm(self, prim, x, start, r, out):
-        """Layer norm of rows ``start .. start + r`` over the last dim: the
-        moments (``bn_stats`` / ``bn_aggr``), then normalize, scale and
-        shift."""
+    def _layer_norm(self, prim, rows, r, out):
+        """Layer norm over the last dim of the ``r`` rows ``rows(lo, hi)``
+        reads (columns ``lo .. hi``): the moments (``bn_stats`` /
+        ``bn_aggr``), then normalize, scale and shift in ``out``.  With both
+        affine operands that is two ``scalar_tensor_tensor`` passes,
+        ``(x - mean) * weight`` and then ``* rstd + bias``."""
         kw = self._kwargs(prim)
-        cols = x.shape[-1]
+        cols = prim.kwargs["input"].tensor_box.output_shape[-1]
         if list(kw["normalized_shape"]) != [cols]:
             raise NotImplementedError("a layer norm over more than one dim")
         affine = [
@@ -1625,12 +1749,12 @@ class Kernel:
             if kw.get(key) is not None
         ]
         pieces = _runs(cols, STATS_FREE)
-        data = self._rows_ap(x, start, r, 0, cols)
+        data = rows(0, cols)
         stats = self.pool("st", (PARTITIONS, 6 * len(pieces)), "float32", 2)
         for q, (lo, hi) in enumerate(pieces):
             self.emit(
                 f"nisa.bn_stats(dst={stats}[0:{r}, {6 * q}:{6 * q + 6}], "
-                f"data={self._rows_ap(x, start, r, lo, hi)})"
+                f"data={rows(lo, hi)})"
             )
         moments = self.pool("mv", (PARTITIONS, 2), "float32", 2)
         self.emit(
@@ -1647,31 +1771,87 @@ class Kernel:
             f"nisa.activation(dst={rstd}[0:{r}, 0:1], op=nl.rsqrt, "
             f"data={rstd}[0:{r}, 0:1])"
         )
-        norm = out
-        if affine:
-            temp = self.pool("t", (PARTITIONS, cols), "float32", 2)
-            norm = f"{temp}[0:{r}, 0:{cols}]"
-        self.emit(
-            f"nisa.tensor_scalar(dst={norm}, data={data}, "
-            f"op0=nl.subtract, operand0={moments}[0:{r}, 0:1], "
-            f"op1=nl.multiply, operand1={rstd}[0:{r}, 0:1])"
-        )
-        for index, (view, op) in enumerate(affine):
-            into = out if index == len(affine) - 1 else norm
+        mean = f"{moments}[0:{r}, 0:1]"
+        inv = f"{rstd}[0:{r}, 0:1]"
+        if len(affine) == 2:
+            weight, bias = (
+                self._rows_ap(view, 0, r, 0, cols) for view, _ in affine
+            )
             self.emit(
-                f"nisa.tensor_tensor(dst={into}, data1={norm}, "
+                f"nisa.scalar_tensor_tensor(dst={out}, data={data}, "
+                f"op0=nl.subtract, operand0={mean}, op1=nl.multiply, "
+                f"operand1={weight})"
+            )
+            self.emit(
+                f"nisa.scalar_tensor_tensor(dst={out}, data={out}, "
+                f"op0=nl.multiply, operand0={inv}, op1=nl.add, "
+                f"operand1={bias})"
+            )
+            return
+        self.emit(
+            f"nisa.tensor_scalar(dst={out}, data={data}, "
+            f"op0=nl.subtract, operand0={mean}, "
+            f"op1=nl.multiply, operand1={inv})"
+        )
+        for view, op in affine:
+            self.emit(
+                f"nisa.tensor_tensor(dst={out}, data1={out}, "
                 f"data2={self._rows_ap(view, 0, r, 0, cols)}, op={op})"
             )
 
-    def _softmax(self, prim, x, start, r, out):
-        """Softmax of rows ``start .. start + r`` over the last dim: the row
-        maximum, the exponentials summed on the way, the scaling by the
-        sum's reciprocal."""
+    def _rms_norm(self, prim, rows, r, out):
+        """RMS norm over the last dim of the ``r`` rows ``rows(lo, hi)``
+        reads (columns ``lo .. hi``): the moments (``bn_stats`` /
+        ``bn_aggr``), the mean square as ``mean ** 2 + variance`` plus eps,
+        its rsqrt, then one pass scaling by that and the weight into
+        ``out``."""
         kw = self._kwargs(prim)
-        cols = x.shape[-1]
-        if kw["dim"] % len(x.shape) != len(x.shape) - 1:
+        cols = prim.kwargs["input"].tensor_box.output_shape[-1]
+        if list(kw["normalized_shape"]) != [cols]:
+            raise NotImplementedError("an RMS norm over more than one dim")
+        weight = self._view(prim.kwargs["weight"].tensor_box)
+        pieces = _runs(cols, STATS_FREE)
+        stats = self.pool("st", (PARTITIONS, 6 * len(pieces)), "float32", 2)
+        for q, (lo, hi) in enumerate(pieces):
+            self.emit(
+                f"nisa.bn_stats(dst={stats}[0:{r}, {6 * q}:{6 * q + 6}], "
+                f"data={rows(lo, hi)})"
+            )
+        moments = self.pool("mv", (PARTITIONS, 2), "float32", 2)
+        self.emit(
+            f"nisa.bn_aggr(dst={moments}[0:{r}, 0:2], "
+            f"data={stats}[0:{r}, 0:{6 * len(pieces)}])"
+        )
+        mean = f"{moments}[0:{r}, 0:1]"
+        rstd = f"{self.pool('rs', (PARTITIONS, 1), 'float32', 2)}[0:{r}, 0:1]"
+        self.emit(
+            f"nisa.scalar_tensor_tensor(dst={rstd}, data={mean}, "
+            f"op0=nl.multiply, operand0={mean}, op1=nl.add, "
+            f"operand1={moments}[0:{r}, 1:2])"
+        )
+        self.emit(
+            f"nisa.tensor_scalar(dst={rstd}, data={rstd}, op0=nl.add, "
+            f"operand0={float(kw['eps'])!r})"
+        )
+        self.emit(f"nisa.activation(dst={rstd}, op=nl.rsqrt, data={rstd})")
+        self.emit(
+            f"nisa.scalar_tensor_tensor(dst={out}, "
+            f"data={rows(0, cols)}, op0=nl.multiply, "
+            f"operand0={rstd}, op1=nl.multiply, "
+            f"operand1={self._rows_ap(weight, 0, r, 0, cols)})"
+        )
+
+    def _softmax(self, prim, rows, r, out):
+        """Softmax over the last dim of the ``r`` rows ``rows(lo, hi)`` reads
+        (columns ``lo .. hi``) into ``out``: the row maximum, the
+        exponentials summed on the way, the scaling by the sum's
+        reciprocal."""
+        kw = self._kwargs(prim)
+        shape = prim.kwargs["input"].tensor_box.output_shape
+        cols = shape[-1]
+        if kw["dim"] % len(shape) != len(shape) - 1:
             raise NotImplementedError("a softmax over a dim but the last")
-        data = self._rows_ap(x, start, r, 0, cols)
+        data = rows(0, cols)
         top = self.pool("mx", (PARTITIONS, 1), "float32", 2)
         total = self.pool("sm", (PARTITIONS, 1), "float32", 2)
         exps = self.pool("t", (PARTITIONS, cols), "float32", 2)
@@ -1697,6 +1877,58 @@ class Kernel:
             f"nisa.tensor_scalar(dst={out}, data={exps}[0:{r}, 0:{cols}], "
             f"op0=nl.multiply, operand0={total}[0:{r}, 0:1])"
         )
+
+    def _max_pool(self, prims, dst):
+        """A 2-D max pool of its input's windows (``_window_load``) into
+        ``dst``: the ``kH`` rows of each window maxed into a temporary, then
+        its ``kW`` columns, ``sW`` apart, into ``dst``."""
+        if len(prims) > 1:
+            raise NotImplementedError("ops fused after a pool")
+        prim = prims[0]
+        kwargs = self._kwargs(prim)
+        if any(kwargs["padding"]) or kwargs["ceil_mode"]:
+            raise NotImplementedError(f"{prim.name}: a padded pool")
+        x = self._view(prim.kwargs["input"].tensor_box)
+        kh, kw = kwargs["kernel_size"]
+        sh, sw = kwargs["stride"]
+        dh, dw = kwargs["dilation"]
+        out_rows, out_h = dst.box.rows, dst.box.shape[-2]
+        if self.analyze:
+            self.windows[x.box.name] = (kh, sh, dh, out_rows, out_h)
+            return
+        cols, iw = dst.box.cols, x.box.cols
+        src = self.var(x.box, x.slot)
+        temp = self.pool("pv", (PARTITIONS, iw), x.box.dtype, 2)
+        vertical = f"{temp}[0:{out_rows}, 0:{iw}]"
+
+        def strip(k):
+            return f"{src}[0:{out_rows}, {k * iw}:{(k + 1) * iw}]"
+
+        def tap(k):
+            return (
+                f"{temp}.ap(pattern=[[{iw}, {out_rows}], [{sw}, {cols}]], "
+                f"offset={k * dw})"
+            )
+
+        self.emit(
+            f"nisa.tensor_tensor(dst={vertical}, data1={strip(0)}, "
+            f"data2={strip(1)}, op=nl.maximum)"
+        )
+        for k in range(2, kh):
+            self.emit(
+                f"nisa.tensor_tensor(dst={vertical}, data1={vertical}, "
+                f"data2={strip(k)}, op=nl.maximum)"
+            )
+        out = self._rows_ap(dst, 0, out_rows, 0, cols)
+        self.emit(
+            f"nisa.tensor_tensor(dst={out}, data1={tap(0)}, "
+            f"data2={tap(1)}, op=nl.maximum)"
+        )
+        for k in range(2, kw):
+            self.emit(
+                f"nisa.tensor_tensor(dst={out}, data1={out}, "
+                f"data2={tap(k)}, op=nl.maximum)"
+            )
 
     # Source.
 

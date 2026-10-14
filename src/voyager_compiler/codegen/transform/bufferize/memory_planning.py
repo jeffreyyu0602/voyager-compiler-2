@@ -98,7 +98,11 @@ _ZERO = voyager.zeros.default
 _FILL = voyager.fill.default
 _WHILE = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
-_COMMIT = torch.ops.higher_order.commit
+# The regions over ``(subgraph, *operands)``.
+_SUBGRAPH_REGIONS = (
+    torch.ops.higher_order.commit,
+    torch.ops.higher_order.with_scratch,
+)
 
 # Position of ``num_slots`` in each allocation primitive's schema:
 _SLOTS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
@@ -379,10 +383,11 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
 
 def _walk(gm: GraphModule):
     """Yield every node in execution order, descending at its position into a
-    ``while_loop`` body, both branches of a ``cond``, and a fused
-    ``call_module``.  ``_buffer_identity`` must know every region this descends
-    into: a node it reaches but the union-find does not merge would look like a
-    buffer of its own."""
+    ``while_loop`` body, both branches of a ``cond``, a ``commit`` or
+    ``with_scratch`` region, and a fused ``call_module``.
+    ``_buffer_identity`` must know every region this descends into: a node it
+    reaches but the union-find does not merge would look like a buffer of its
+    own."""
     for n in gm.graph.nodes:
         yield n
         if n.op == "call_function" and n.target is _WHILE:
@@ -394,7 +399,7 @@ def _walk(gm: GraphModule):
                 sub = _subgraph(gm, branch.target)
                 if sub is not None:
                     yield from _walk(sub)
-        elif n.op == "call_function" and n.target is _COMMIT:
+        elif n.op == "call_function" and n.target in _SUBGRAPH_REGIONS:
             sub = _subgraph(gm, n.args[0].target)
             if sub is not None:
                 yield from _walk(sub)
@@ -421,7 +426,10 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
         ``getitem`` handle of a loop result;
       * a **region** binds its operands to its placeholders — a ``while_loop``
         (which also returns each carried buffer, written in place), a ``cond``
-        (whose two branches share one operand list), a fused ``call_module``.
+        (whose two branches share one operand list), a ``commit`` or
+        ``with_scratch`` region, a fused ``call_module``.  A ``with_scratch``
+        names its scratch regions directly (they are no placeholder's), so a
+        region is live up to the op it sits beside.
 
     Every one of those points from a *new* name to an *older* one, and ``_walk``
     is program order, so the source is always resolved by the time a name needs
@@ -479,7 +487,7 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
                     for ph, o in zip(phs, operands):
                         bind(ph, o)
                     walk(sub)
-            elif n.op == "call_function" and n.target is _COMMIT:
+            elif n.op == "call_function" and n.target in _SUBGRAPH_REGIONS:
                 sub = _subgraph(gm, n.args[0].target)
                 if sub is None:
                     continue

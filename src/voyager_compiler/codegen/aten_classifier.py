@@ -669,7 +669,6 @@ _QUANTIZED_COMPUTE_OPS = (
     "conv2d",
     "conv2d_mx",
     "dequantize",
-    "layer_norm",
     "linear",
     "linear_mx",
     "matmul",
@@ -680,12 +679,15 @@ _QUANTIZED_COMPUTE_OPS = (
     "quantize_mx",
     "quantize_mx_outlier",
     "sdpa_mx",
-    "softmax",
     "spmm_csr",
     "vmap",
 )
 
 _QUANTIZED_ELEMENTWISE_OPS = ("dequantize", "quantize", "vmap")
+
+# Hand-maintained.  ATen compute ops the corpus never exports, because
+# models write them out by hand, but that a compiler rewrite emits.
+_HAND_ATEN_COMPUTE_OPS = (torch.ops.aten.rms_norm.default,)
 
 
 def _quantized(names):
@@ -702,8 +704,10 @@ def _quantized(names):
 # so both unions are built on first predicate call rather than at import time.
 @functools.cache
 def _compute_ops() -> frozenset:
-    return frozenset(_GENERATED_COMPUTE_OPS) | _quantized(
-        _QUANTIZED_COMPUTE_OPS
+    return (
+        frozenset(_GENERATED_COMPUTE_OPS)
+        | frozenset(_HAND_ATEN_COMPUTE_OPS)
+        | _quantized(_QUANTIZED_COMPUTE_OPS)
     )
 
 

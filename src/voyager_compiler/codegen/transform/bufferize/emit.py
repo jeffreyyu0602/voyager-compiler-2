@@ -54,6 +54,7 @@ from torch.fx.operator_schemas import normalize_function
 import interstellar
 from voyager_compiler.codegen.node_info import (
     QMAP_PARAMS,
+    get_anchor_node,
     is_nop,
     quant_param_arg_nodes,
     require_allocation,
@@ -94,6 +95,7 @@ logger = logging.getLogger(__name__)
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
 COMMIT = torch.ops.higher_order.commit
+WITH_SCRATCH = torch.ops.higher_order.with_scratch
 _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
@@ -689,7 +691,7 @@ class _Emitter:
                         self.bind(
                             branch, self._child_env(branch, operands, env)
                         )
-                elif node.target is COMMIT:
+                elif node.target in (COMMIT, WITH_SCRATCH):
                     sub = named[str(node.args[0].target)]
                     self.bind(sub, self._child_env(sub, node.args[1:], env))
                 elif node.target is _INSERT:
@@ -767,7 +769,8 @@ class _Emitter:
         compute destination).
 
         A ``cond`` result has one producer *per branch*: both branches write the
-        same destination, so both carry it.
+        same destination, so both carry it.  A ``with_scratch`` result is its
+        region's op's.
         """
         if not isinstance(node, Node):
             return None
@@ -797,6 +800,11 @@ class _Emitter:
                     producers += found
                 return producers
             return self._producers(source, gm, env, slot)
+        if node.target is WITH_SCRATCH:
+            # The op inside the region produces what the region returns.
+            sub = getattr(gm, str(node.args[0].target))
+            result = _outputs_of(sub)[0 if index is None else index]
+            return self._producers(result, sub, self.envs[sub])
         return [(node, index)]
 
     # --- emit ------------------------------------------------------------
@@ -978,6 +986,9 @@ class _Emitter:
         if node.target is COMMIT:
             ops.append(self._async(node, named, env))
             return
+        if node.target is WITH_SCRATCH:
+            self._with_scratch(node, named, env, ops)
+            return
         if node.target is _INSERT:
             return  # a destination-passing store is not an instruction
         if (
@@ -1117,6 +1128,23 @@ class _Emitter:
         if (post := node.kwargs.get("post")) is not None:
             async_op.post.CopyFrom(self._ref(post, env))
         return op
+
+    def _with_scratch(self, node, named, env, ops) -> None:
+        """A ``with_scratch`` region is its op's one instruction, emitted as
+        the op would be unwrapped, plus each scratch region as a keyword of
+        the op -- of the anchor, in a fused group -- under the region's
+        name."""
+        sub = named[str(node.args[0].target)]
+        first = len(ops)
+        self.emit_region(sub, ops)
+        (op,) = ops[first:]
+        prim = op.prim
+        if op.WhichOneof("op_type") == "fused":
+            group = next(n for n in sub.graph.nodes if n.op == "call_module")
+            anchor = _target_name(get_anchor_node(group).target)
+            prim = next(p for p in op.fused.op_list if p.target == anchor)
+        for key, region in node.kwargs["scratch"].items():
+            prim.kwargs[key].CopyFrom(self._argument(region, env))
 
     def _yielded_scalars(self, node, branch) -> List[int]:
         """The branch result slots the enclosing region actually reads *as
@@ -1582,21 +1610,23 @@ def _print_cond(
     lines.append(f"{pad}}}")
 
 
-def _print_commit(
+def _print_region(
     node, gm, named, lines: List[str], indent: int, pad: str
 ) -> None:
-    """Print a ``voyager.commit`` in region form — the committed body descended
-    into like a ``cond`` branch, its operands bound to the body placeholders and
-    the ``dependencies`` / ``post`` semaphores shown on the header:
+    """Print a ``voyager.commit`` or ``with_scratch`` in region form — the
+    body descended into like a ``cond`` branch, its operands bound to the body
+    placeholders and the ``dependencies`` / ``post`` semaphores, or the
+    scratch regions, shown on the header:
 
         commit = commit deps=[..] post=.. (b_arg0 = src0, ...) {
           <body>
           return <results>
         }
+        with_scratch = with_scratch scratch={max=.., sum=..} (...) { ... }
 
     A region that only writes buffers still has to return something (an empty
     list), which nothing downstream reads — so the ``return`` is printed only
-    when the enclosing graph reads the commit's result.
+    when the enclosing graph reads the region's result.
     """
     subgraph, operands = node.args[0], list(node.args[1:])
     mod = named.get(str(subgraph.target)) or getattr(
@@ -1610,15 +1640,23 @@ def _print_commit(
     binds = ", ".join(
         f"{ph.name}{_type_str(ph)} = {src}" for ph, src in zip(phs, operands)
     )
-    tags = f"deps={_fmt_arg(node.kwargs.get('dependencies', ()))}"
-    post = node.kwargs.get("post", None)
-    if post is not None:
-        tags += f" post={_fmt_arg(post)}"
+    if node.target is COMMIT:
+        keyword = "commit"
+        tags = f"deps={_fmt_arg(node.kwargs.get('dependencies', ()))}"
+        post = node.kwargs.get("post", None)
+        if post is not None:
+            tags += f" post={_fmt_arg(post)}"
+    else:
+        keyword = "with_scratch"
+        regions = ", ".join(
+            f"{k}={_fmt_arg(v)}" for k, v in node.kwargs["scratch"].items()
+        )
+        tags = f"scratch={{{regions}}}"
     read = any(
         user.target is not operator.getitem or user.users for user in node.users
     )
     lines.append(
-        f"{pad}{node.name}{_type_str(node)} = commit {tags} ({binds}) {{"
+        f"{pad}{node.name}{_type_str(node)} = {keyword} {tags} ({binds}) {{"
     )
     if isinstance(mod, GraphModule):
         _print_graph(
@@ -1672,8 +1710,8 @@ def _print_graph(
             _print_cond(node, gm, named, lines, indent, pad)
             continue
 
-        if node.op == "call_function" and node.target is COMMIT:
-            _print_commit(node, gm, named, lines, indent, pad)
+        if node.op == "call_function" and node.target in (COMMIT, WITH_SCRATCH):
+            _print_region(node, gm, named, lines, indent, pad)
             continue
 
         if node.op == "call_module":

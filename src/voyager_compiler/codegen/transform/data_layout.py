@@ -28,7 +28,6 @@ from voyager_compiler.export_utils import (
     derived_producer,
 )
 from voyager_compiler.ops.layout import (
-    DEFAULT_GEMM_WEIGHT_LAYOUT,
     GEMM_WEIGHT_LAYOUTS,
     NCHW_TO_NHWC,
     NHWC_OP_VARIANTS,
@@ -603,11 +602,11 @@ def _insert_transpose_op(
     fold_transpose_into_constant(model, path, transposed_nodes)
 
 
-def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
+def _node_layout(node: Node, gemm_layout: str, gemv_layout: str) -> str:
     """The target layout of ``node``'s class: matrix-vector
-    (fully-connected / batch-1) nodes follow ``mv_layout``, matrix-matrix
-    nodes ``mm_layout``."""
-    return mv_layout if is_fully_connected(node) else mm_layout
+    (fully-connected / batch-1) nodes follow ``gemv_layout``, matrix-matrix
+    nodes ``gemm_layout``."""
+    return gemv_layout if is_fully_connected(node) else gemm_layout
 
 
 def _process_linear_node(model: GraphModule, node: Node) -> None:
@@ -663,12 +662,12 @@ def _process_matmul_node(
 
 def normalize_gemm_weight_layout(
     model: GraphModule,
-    mm_layout: str = DEFAULT_GEMM_WEIGHT_LAYOUT,
-    mv_layout: str = DEFAULT_GEMM_WEIGHT_LAYOUT,
+    gemm_layout: str,
+    gemv_layout: str,
 ) -> GraphModule:
     """Normalize every GEMM right-operand (weight) to one layout per
-    operation class: matrix-matrix nodes to ``mm_layout``, matrix-vector
-    (fully-connected / batch-1) nodes to ``mv_layout``; each is ``"kc"``
+    operation class: matrix-matrix nodes to ``gemm_layout``, matrix-vector
+    (fully-connected / batch-1) nodes to ``gemv_layout``; each is ``"kc"``
     ([out, contraction]) or ``"ck"`` ([contraction, out]).
 
     ``aten.linear`` is KC-native and ``aten.matmul`` CK-native, so
@@ -678,8 +677,8 @@ def normalize_gemm_weight_layout(
     retargeted iff its storage was flipped, so eager execution stays
     correct in every configuration with no global patching.
     """
-    assert mm_layout in GEMM_WEIGHT_LAYOUTS, mm_layout
-    assert mv_layout in GEMM_WEIGHT_LAYOUTS, mv_layout
+    assert gemm_layout in GEMM_WEIGHT_LAYOUTS, gemm_layout
+    assert gemv_layout in GEMM_WEIGHT_LAYOUTS, gemv_layout
 
     transposed_nodes = {}
 
@@ -687,10 +686,10 @@ def normalize_gemm_weight_layout(
         # A node is flipped exactly when its class's target layout differs
         # from the op's native one (linear: KC, matmul: CK).
         if is_linear(node):
-            if _node_layout(node, mm_layout, mv_layout) == "ck":
+            if _node_layout(node, gemm_layout, gemv_layout) == "ck":
                 _process_linear_node(model, node)
         elif is_matmul(node):
-            if _node_layout(node, mm_layout, mv_layout) == "kc":
+            if _node_layout(node, gemm_layout, gemv_layout) == "kc":
                 _process_matmul_node(model, node, transposed_nodes)
 
     deduplicate_nodes(model)

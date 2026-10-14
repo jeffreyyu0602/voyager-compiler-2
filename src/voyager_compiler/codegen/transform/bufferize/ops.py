@@ -21,6 +21,8 @@ Primitives
                                      wait on every semaphore in ``deps``, run
                                      ``subgraph(*operands)``, then signal
                                      ``post``.
+``with_scratch(subgraph, ...)``      an op beside the on-chip regions its
+                                     kernel keeps (a higher-order op).
 """
 
 from contextlib import contextmanager
@@ -527,3 +529,49 @@ def commit(subgraph, operands, dependencies=(), post=None):
     ``commit_hop`` HOP, which survives tracing as a single ``call_function``
     node over the traced subgraph ``GraphModule``."""
     return commit_hop(subgraph, *operands, dependencies=dependencies, post=post)
+
+
+# ---------------------------------------------------------------------------
+# with_scratch — an op's computation beside the on-chip regions its backend
+# kernel keeps that no FX node names (a higher-order op, like ``commit``).
+#
+# ``subgraph(*operands)`` is the op, bare or a fused group; ``scratch`` maps
+# each region's name to its buffer.  Nothing reads or writes the regions in
+# FX, so eager and ShapeProp run the subgraph alone; the node naming them is
+# what tells memory planning to keep them live across the op and the emitter
+# to hand them to it.
+# ---------------------------------------------------------------------------
+class ScratchOp(BaseHOP):
+    def __init__(self) -> None:
+        super().__init__("with_scratch")
+
+    def __call__(self, subgraph, *operands, scratch):
+        if not isinstance(
+            subgraph, (torch.fx.GraphModule, FunctionWithNoFreeVars)
+        ):
+            subgraph = FunctionWithNoFreeVars(subgraph)
+        return super().__call__(subgraph, *operands, scratch=scratch)
+
+
+scratch_hop = ScratchOp()
+
+
+def with_scratch(subgraph, operands, scratch):
+    """Run ``subgraph(*operands)`` beside the regions ``scratch`` names.
+
+    With no region it is the plain call, so an op whose backend keeps none
+    traces exactly as it would unwrapped.  Otherwise it traces to one
+    ``scratch_hop`` node over the traced subgraph; in a fused group the
+    regions belong to its anchor.
+
+    Args:
+        subgraph: The op's computation, a callable or ``GraphModule``.
+        operands: Its tensor operands, an explicit list.
+        scratch: ``{name: buffer}``, one entry per region.
+
+    Returns:
+        ``subgraph(*operands)``.
+    """
+    if not scratch:
+        return subgraph(*operands)
+    return scratch_hop(subgraph, *operands, scratch=scratch)

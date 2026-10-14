@@ -86,8 +86,8 @@ from voyager_compiler import (
     export_model,
     gen_compute_graph,
     get_default_quantizer,
+    match_and_fuse_rms_norm,
     prepare_pt2e,
-    replace_rmsnorm_with_layer_norm,
     split_kv_cache,
     transform,
 )
@@ -200,7 +200,7 @@ FUSION_PIPELINE = [
         OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
-        OpMatcher("layer_norm", "softmax"),
+        OpMatcher("layer_norm", "rms_norm", "softmax"),
         OpMatcher(*QUANT_OPS),
     ],
 ]
@@ -841,7 +841,7 @@ def _frontend(cfg: SweepConfig):
     example_input = torch.randn(
         1, seq, layernorm.weight.shape[-1], dtype=model.dtype
     )
-    replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
+    match_and_fuse_rms_norm(gm, layernorm, (example_input,))
 
     # KV-cache precision is applied by annotating the cache reads (KIVI); it
     # only exists in decode.  Prefill has no persistent cache, so kv_bits is
@@ -863,7 +863,8 @@ def _frontend(cfg: SweepConfig):
         patterns=FUSION_PIPELINE,
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
-        layout_policy="systolic",
+        tensor_layout="nhwc",
+        gemm_weight_layout="ck",
         keep_fp32=False,
     )
 

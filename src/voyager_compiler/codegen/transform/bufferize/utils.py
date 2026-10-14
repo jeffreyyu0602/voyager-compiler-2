@@ -32,6 +32,7 @@ voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
+_WITH_SCRATCH = torch.ops.higher_order.with_scratch
 # Stamped on a CSR block's ``async_copy`` -- sized at the block's budget but
 # moving ``count`` entries at run time -- as the budget's mean occupancy over
 # the example input, so the reporting model prices the bytes actually moved.
@@ -123,7 +124,7 @@ def _collect_codebook_nodes(gm: GraphModule) -> set:
                 operands = list(n.args[3]) if len(n.args) > 3 else []
                 _thread(operands, _subgraph(gm, n.args[1].target))
                 _thread(operands, _subgraph(gm, n.args[2].target))
-            elif n.target is _COMMIT:
+            elif n.target in (_COMMIT, _WITH_SCRATCH):
                 _thread(list(n.args[1:]), _subgraph(gm, n.args[0].target))
         elif n.op == "call_module":
             _thread(list(n.args), _subgraph(gm, n.target))
@@ -434,9 +435,10 @@ def outline_dps_ops(gm: GraphModule) -> None:
     # ``accumulate`` branch only *returns* ``gemm + scratch`` with no insert of
     # its own, yet its ``gemm``->``add`` must still fuse into one op.  A returned
     # buffer (a carried alloc, a sub-loop getitem) is not on the datapath and is
-    # skipped.  A multi-output node (quantize_mx) is stored by several inserts
-    # that all peel to the same seed, so it stays a single outlined op, its
-    # getitem users left outside.
+    # skipped.  A multi-output node (quantize_mx) is stored by several inserts,
+    # or returned by a with_scratch region through its getitems, that all peel
+    # to the same seed, so it stays a single outlined op, its getitem users
+    # left outside.
     seeds = []
 
     def _add_seed(src):
@@ -450,7 +452,7 @@ def outline_dps_ops(gm: GraphModule) -> None:
             _add_seed(n.args[0])
         elif n.op == "output":
             for o in n.all_input_nodes:
-                _add_seed(o)
+                _add_seed(o.args[0] if o.target is operator.getitem else o)
 
     consumed = set()
     for seed in seeds:
@@ -505,6 +507,31 @@ def _strip_assert_scalars(gm: torch.fx.GraphModule) -> None:
     gm.recompile()
 
 
+def _unpack_scratch_results(gm: torch.fx.GraphModule) -> None:
+    """Make each ``with_scratch`` returning one value return it bare rather
+    than as the one-element tuple export traces, recursing into every
+    subgraph, so the op it wraps is stored straight from the region with no
+    ``getitem`` between."""
+    for n in list(gm.graph.nodes):
+        if n.op == "get_attr":
+            sub = getattr(gm, str(n.target), None)
+            if isinstance(sub, torch.fx.GraphModule):
+                _unpack_scratch_results(sub)
+        if n.target is not _WITH_SCRATCH:
+            continue
+        sub = getattr(gm, str(n.args[0].target))
+        output = next(x for x in sub.graph.nodes if x.op == "output")
+        if len(output.args[0]) != 1:
+            continue
+        output.args = (output.args[0][0],)
+        sub.recompile()
+        n.meta["val"] = n.meta["val"][0]
+        for user in list(n.users):
+            user.replace_all_uses_with(n)
+            gm.graph.erase_node(user)
+    gm.recompile()
+
+
 def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Erase the unused tile-size int placeholders left by exporting with the tile
@@ -533,6 +560,7 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     # Drop export's deferred ``_assert_scalar`` range-checks on the guarded-wait
     # conds' int outputs (no-ops for codegen; the impure-aware DCE keeps them).
     _strip_assert_scalars(gm)
+    _unpack_scratch_results(gm)
     return gm
 
 

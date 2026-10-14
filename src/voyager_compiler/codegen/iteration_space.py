@@ -19,6 +19,8 @@ from torch import fx
 
 from voyager_compiler.codegen.node_info import (
     AXES_ARG_INDEX_MAP,
+    NORM_OPS,
+    SOFTMAX_OPS,
     ancestors,
     get_anchor_node,
     is_aliasing_op,
@@ -252,6 +254,19 @@ _RELAYOUT_OPS = {
     "reshape": torch.ops.aten.reshape.default,
 }
 
+# The ops whose data input (args[0]) alone carries an address map: each keeps
+# that input's elements in place, and its other operands -- a
+# (de)quantization's per-block scale / zero_point, a norm's weight and bias --
+# are indexed by block or by the normalized dim, not by iteration position.
+_DATA_INPUT_OPS = (
+    NORM_OPS
+    | SOFTMAX_OPS
+    | {
+        torch.ops.quantized_ops.dequantize.default,
+        torch.ops.quantized_ops.quantize.default,
+    }
+)
+
 
 def _blocking_axes(node: fx.Node) -> Optional[Sequence[int]]:
     """The axes ``node`` blocks its quantization along, or ``None`` if it
@@ -388,7 +403,7 @@ class IterationSpaceNormalizer:
         output = self._describe_output(output_node)
 
         anchor = get_anchor_node(call_node)
-        # Keep only a *strong* anchor (gemm/conv/layernorm/softmax); a pointwise
+        # Keep only a *strong* anchor (gemm/conv/norm/softmax); a pointwise
         # "anchor" means the group is anchorless (iteration == output shape).
         if anchor is None or is_elementwise_op(anchor):
             anchor = None
@@ -566,14 +581,7 @@ class IterationSpaceNormalizer:
                 env[node] = (
                     env.get(source) if isinstance(source, fx.Node) else None
                 )
-            elif node.target in {
-                torch.ops.quantized_ops.dequantize.default,
-                torch.ops.quantized_ops.quantize.default,
-            }:
-                # Microscaling (de)quantization is not a true elementwise
-                # op: its scale/zero_point are per-block parameters indexed
-                # by block, not by iteration position, so they carry no
-                # address map. Only the data input (args[0]) does.
+            elif node.target in _DATA_INPUT_OPS:
                 source = node.args[0] if node.args else None
                 env[node] = (
                     env.get(source) if isinstance(source, fx.Node) else None

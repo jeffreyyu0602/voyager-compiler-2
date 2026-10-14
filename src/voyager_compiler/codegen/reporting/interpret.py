@@ -65,6 +65,7 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
     COMMIT,
     COND,
     WHILE_LOOP,
+    WITH_SCRATCH,
     _loop_extents,
     _norm_extent,
 )
@@ -376,6 +377,8 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             env[node] = _run_cond(node, gm, env, ctx, path)
         elif t is COMMIT:
             env[node] = _run_commit(node, gm, env, ctx, path)
+        elif t is WITH_SCRATCH:
+            env[node] = _run_region(node, gm, env, ctx, path)
         elif t is _ASYNC_COPY:
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
@@ -769,6 +772,18 @@ def _run_cond(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
     ctx.depth += 1
     try:
         return _walk(branch_gm, env, ctx, path)
+    finally:
+        ctx.depth -= 1
+
+
+def _run_region(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
+    """A ``with_scratch`` region: its op runs in place, the region's
+    operands bound to its placeholders."""
+    sub = getattr(gm, str(node.args[0].target))
+    _bind(_placeholders(sub), list(node.args[1:]), env, ctx)
+    ctx.depth += 1
+    try:
+        return _walk(sub, env, ctx, path)
     finally:
         ctx.depth -= 1
 

@@ -25,7 +25,7 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     DYNAMIC_QUANTIZE_OPS,
-    LAYER_NORM_OPS,
+    NORM_OPS,
     SOFTMAX_OPS,
     bound_operands,
     csr_quantize_node,
@@ -41,8 +41,6 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
-    reduction_op,
-    reduction_scratch,
 )
 from voyager_compiler.codegen.subgraph import replace_node_with_graph_module
 from voyager_compiler.codegen.transform.bufferize.attention import (
@@ -54,6 +52,7 @@ from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     oracle_disabled,
+    with_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _single_pass_kernel,
@@ -108,6 +107,7 @@ _VOYAGER_ASYNC = (
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
+_WITH_SCRATCH = torch.ops.higher_order.with_scratch
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
 _SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
 
@@ -178,10 +178,13 @@ def _is_compute(node: Node) -> bool:
 def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
     """For ``node`` returned as ``gm``'s output, the parent-graph ``getitem``
     handles of the loop / cond ``parent_hop`` at the matching output slot(s) —
-    used to thread the store check across the body boundary."""
+    used to thread the store check across the body boundary.  A region
+    returning one value (a ``with_scratch``) has the HOP itself as its
+    handle."""
     out = next(x for x in gm.graph.nodes if x.op == "output")
     outs = out.args[0]
-    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+    if not isinstance(outs, (list, tuple)):
+        return [parent_hop] if outs is node else []
     handles = []
     for index, output in enumerate(outs):
         if output is not node:
@@ -339,7 +342,7 @@ def _annotate_and_validate(
         elif node.target is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
             _walk_region(gm, node, operands, node.args[1:3], codebooks, ctx)
-        elif node.target is _COMMIT:
+        elif node.target in (_COMMIT, _WITH_SCRATCH):
             _walk_region(
                 gm, node, list(node.args[1:]), (node.args[0],), codebooks, ctx
             )
@@ -447,16 +450,20 @@ def _thread_hop(
                 _set_dtype(u, _dtype_of(outs[u.args[1]]))
 
 
-def _thread_call_module(gm: GraphModule, node: Node, rules) -> None:
-    """Recurse into a fused ``call_module`` (operands → placeholders), propagate,
-    and set the node's own dtype from the submodule's output(s)."""
-    sub = _subgraph(gm, node.target)
+def _thread_region(
+    gm: GraphModule, node: Node, target, operands, rules
+) -> None:
+    """Recurse into the region ``node`` calls, its ``target`` submodule (a
+    fused ``call_module``, a ``with_scratch`` subgraph): seed its placeholders
+    from ``operands``, propagate, and set the node's own dtype from the
+    region's output(s)."""
+    sub = _subgraph(gm, target)
     if sub is None:
         return
     phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
     seed = {
         ph: _dtype_of(a)
-        for a, ph in zip(node.args, phs)
+        for a, ph in zip(operands, phs)
         if _dtype_of(a) is not None
     }
     propagate_logical_dtypes(sub, seed, rules)
@@ -483,9 +490,9 @@ def propagate_logical_dtypes(
     …).  ``ph_dtypes`` seeds this graph's placeholders from the operands bound to
     them.  Then, in def-before-use order: a compute op takes its rule dtype, a
     pass-through (copy / select / getitem / NOP) inherits its input's dtype, and a
-    ``while_loop`` / ``cond`` / fused ``call_module`` recurses inline.  Inputs
-    always precede their uses, so a single pass settles the whole graph — no
-    fixpoint or backward flow.
+    region (a ``while_loop``, ``cond``, ``commit``, ``with_scratch``, fused
+    ``call_module``) recurses inline.  Inputs always precede their uses, so a
+    single pass settles the whole graph — no fixpoint or backward flow.
     """
     for ph, d in (ph_dtypes or {}).items():
         _set_dtype(ph, d)
@@ -493,7 +500,7 @@ def propagate_logical_dtypes(
     rules = compute_dtypes or {}
     for node in gm.graph.nodes:
         if node.op == "call_module":
-            _thread_call_module(gm, node, rules)
+            _thread_region(gm, node, node.target, node.args, rules)
             continue
         if node.op != "call_function":
             continue
@@ -510,6 +517,8 @@ def propagate_logical_dtypes(
             )
         elif t is _COMMIT:
             _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
+        elif t is _WITH_SCRATCH:
+            _thread_region(gm, node, node.args[0].target, node.args[1:], rules)
         elif rules.get(t) is not None:
             # A compute op: its output dtype comes from the original graph's rule.
             _set_dtype(node, rules[t])
@@ -815,6 +824,12 @@ def rename_nest_nodes(model: GraphModule) -> None:
         elif n.op == "call_function" and n.target is _COMMIT:
             if (body := _subgraph(gm, n.args[0].target)) is not None:
                 rename_graph(body, scope, anchor_target)
+        elif n.op == "call_function" and n.target is _WITH_SCRATCH:
+            if (body := _subgraph(gm, n.args[0].target)) is not None:
+                # Its placeholders are the operands, as a fused group's are.
+                phs = [p for p in body.graph.nodes if p.op == "placeholder"]
+                bound = dict(zip(phs, n.args[1:]))
+                rename_graph(body, scope, anchor_target, bound)
 
     def rename_graph(
         gm: GraphModule,
@@ -1152,6 +1167,7 @@ _DEDUP_SKIP = frozenset(
         _WHILE_LOOP,
         _COND,
         _COMMIT,
+        _WITH_SCRATCH,
     }
 )
 
@@ -1170,10 +1186,11 @@ def _buffer_root(node: Node) -> Node:
 
 def _dedup_regions(gm: GraphModule) -> None:
     """CSE identical *pure* nodes in ``gm`` and every nested region (while_loop
-    / cond / commit bodies, fused submodules), skipping ``_DEDUP_SKIP``.  A
-    D==0 prefetch loads into the same slot the read consumes, so the fetch and
-    read ``subview``s (slot + semaphore) are identical -- this folds them, and
-    any other repeated index math, to one node per region.
+    / cond / commit / with_scratch bodies, fused submodules), skipping
+    ``_DEDUP_SKIP``.  A D==0 prefetch loads into the same slot the read
+    consumes, so the fetch and read ``subview``s (slot + semaphore) are
+    identical -- this folds them, and any other repeated index math, to one
+    node per region.
 
     Merging is valid only within a write-free interval of the bytes read: a
     non-view node (a scalar read, a ``clone``, arithmetic on a tile)
@@ -1205,7 +1222,7 @@ def _dedup_regions(gm: GraphModule) -> None:
             evict(_buffer_root(node.args[1]))
         elif node.op == "call_module" or (
             node.op == "call_function"
-            and node.target in (_WHILE_LOOP, _COND, _COMMIT)
+            and node.target in (_WHILE_LOOP, _COND, _COMMIT, _WITH_SCRATCH)
         ):
             for arg in node.all_input_nodes:
                 root = _buffer_root(arg)
@@ -1239,7 +1256,7 @@ def _dedup_regions(gm: GraphModule) -> None:
 
 _REDUCTION_POINTWISE_OPS = (
     DYNAMIC_QUANTIZE_OPS
-    | LAYER_NORM_OPS
+    | NORM_OPS
     | SOFTMAX_OPS
     | {torch.ops.quantized_ops.quantize.default}
 )
@@ -1307,12 +1324,10 @@ def _build_for_untiled(node: Node, tiler):
 
     arg_tmpl = [_resolve(a) for a in node.args]
     kw_tmpl = {k: _resolve(v) for k, v in node.kwargs.items()}
-    # A batched reduction is traced against the twin that names its scratch,
-    # which takes the same operands plus one keyword per region.
-    op = reduction_op(node) or node.target
-    scratch = reduction_scratch(node, node.shape, tiler.config.vector_lanes)
+    target = node.target
+    # The regions the backend keeps beside the op, handed to it by name.
+    scratch = tiler.model.kernel_scratch(node, node.shape)
     scratch_names = [name for name, _, _ in scratch]
-    n_scratch = len(scratch_names)
 
     def _fill(t, tiles):
         if isinstance(t, list):
@@ -1320,12 +1335,16 @@ def _build_for_untiled(node: Node, tiler):
         value, is_index = t
         return tiles[value] if is_index else value
 
-    def compute(*tiles):
-        end = len(tiles) - n_scratch
+    def op(*tiles):
         args = [_fill(t, tiles) for t in arg_tmpl]
         kwargs = {k: _fill(t, tiles) for k, t in kw_tmpl.items()}
-        kwargs.update(zip(scratch_names, tiles[end:]))
-        return op(*args, **kwargs)
+        return target(*args, **kwargs)
+
+    def compute(*tiles):
+        end = len(tiles) - len(scratch)
+        return with_scratch(
+            op, tiles[:end], dict(zip(scratch_names, tiles[end:]))
+        )
 
     grid = (1,)
     in_specs = []

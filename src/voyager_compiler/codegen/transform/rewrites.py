@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "deduplicate_nodes",
     "replace_interpolate",
-    "replace_rmsnorm_with_layer_norm",
+    "match_and_fuse_rms_norm",
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
     "inline_autocast_modules",
@@ -142,16 +142,28 @@ def replace_interpolate():
     torch.nn.functional.interpolate = torch.ops.custom.interpolate
 
 
-def replace_rmsnorm_with_layer_norm(
+def match_and_fuse_rms_norm(
     model: GraphModule,
-    layer_norm: torch.nn.Module,
+    rms_norm: torch.nn.Module,
     example_input,
     convert_scalars_to_attrs=False,
 ):
-    """Replace LLaMA RMSNorm with ATen layer_norm"""
+    """Fuse each decomposed RMSNorm in ``model`` into one ``aten.rms_norm``.
+
+    The pattern is ``rms_norm`` traced to ATen; literals must match, so a
+    match carries the module's eps, which the fused op takes.
+
+    Args:
+        model: The graph to rewrite.
+        rms_norm: An RMSNorm module of the model (e.g. ``LlamaRMSNorm``),
+            with a ``weight`` and a ``variance_epsilon``.
+        example_input: Inputs to trace ``rms_norm`` with.
+        convert_scalars_to_attrs: Turn the pattern's scalars into attributes
+            before matching.
+    """
     original_graph = model.graph
 
-    pattern = get_aten_graph_module(layer_norm, example_input)
+    pattern = get_aten_graph_module(rms_norm, example_input)
     if convert_scalars_to_attrs:
         _convert_scalars_to_attrs(pattern)
     pattern_graph = pattern.graph
@@ -175,11 +187,16 @@ def replace_rmsnorm_with_layer_norm(
         output_node = match.returning_nodes[0]
         input_shape = input_node.meta["val"].shape
         new_weight_node = match.nodes_map[weight_node]
-        layer_norm_inputs = [input_node, [input_shape[-1]], new_weight_node]
+        rms_norm_inputs = (
+            input_node,
+            [input_shape[-1]],
+            new_weight_node,
+            rms_norm.variance_epsilon,
+        )
 
         with original_graph.inserting_before(output_node):
             new_node = original_graph.call_function(
-                torch.ops.aten.layer_norm.default, tuple(layer_norm_inputs), {}
+                torch.ops.aten.rms_norm.default, rms_norm_inputs
             )
 
         output_node.replace_all_uses_with(new_node)

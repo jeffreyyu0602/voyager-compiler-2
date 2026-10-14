@@ -561,67 +561,6 @@ def pad_matrix_op_dimensions(
     return model
 
 
-def _pad_layer_norm(
-    model: GraphModule,
-    node: Node,
-    vector_lanes: int,
-) -> GraphModule:
-    input = node.args[0]
-    normalize_shape = node.args[1]
-    weight = node.args[2]
-    bias = node.args[3] if len(node.args) > 3 else None
-
-    orig_k = input.shape[-1]
-    pad_k = (-orig_k) % vector_lanes
-    if pad_k == 0:
-        return model
-
-    logger.info(f"Padding layer_norm {node} last dimension with {pad_k}")
-
-    def pad_param(attr_node: Node):
-        if attr_node.op == "get_attr":
-            param = fetch_attr(model, attr_node.target)
-            new_param = F.pad(param, [0, pad_k])
-            with model.graph.inserting_after(attr_node):
-                new_attr = create_getattr_from_value(
-                    model, model.graph, f"{attr_node.target}_padded", new_param
-                )
-        else:
-            with model.graph.inserting_after(attr_node):
-                new_attr = model.graph.call_function(
-                    torch.ops.aten.pad.default,
-                    (attr_node, [0, pad_k]),
-                )
-        propagate_shape(new_attr, model)
-        return new_attr
-
-    new_weight = pad_param(weight)
-    new_bias = pad_param(bias) if bias is not None else None
-
-    with model.graph.inserting_before(node):
-        new_input = model.graph.call_function(
-            torch.ops.aten.pad.default,
-            (input, [0, pad_k]),
-        )
-        layer_norm = model.graph.call_function(
-            torch.ops.quantized_ops.layer_norm.default,
-            (new_input, normalize_shape, new_weight, new_bias) + node.args[4:],
-        )
-        slice_node = model.graph.call_function(
-            torch.ops.aten.slice.Tensor,
-            (layer_norm, -1, 0, orig_k),
-        )
-
-    propagate_shape(new_input)
-    new_input.meta["dtype"] = input.meta.get("dtype")
-
-    propagate_shape(layer_norm)
-
-    propagate_shape(slice_node)
-    node.replace_all_uses_with(slice_node)
-    model.graph.erase_node(node)
-
-
 def _pad_quantize_mx(model, node, vector_lanes, fold_cache):
     input = node.args[0]
     axes = get_arg_value(node, 2, "axes")
@@ -719,9 +658,9 @@ def pad_vector_op_dimensions(
 ) -> GraphModule:
     """Pad vector ops so their last dim fills whole lane groups.
 
-    Each layer norm, softmax and dynamic quantize pads its last dim to a
-    multiple of ``vector_lanes``, and each pad that undoes a slice above it
-    is dropped with the slice.
+    Each softmax and dynamic quantize pads its last dim to a multiple of
+    ``vector_lanes``, and each pad that undoes a slice above it is dropped
+    with the slice.
 
     Args:
         model: The graph to transform.
@@ -732,9 +671,7 @@ def pad_vector_op_dimensions(
         ``model``.
     """
     for node in list(model.graph.nodes):
-        if node.target == torch.ops.aten.layer_norm.default:
-            _pad_layer_norm(model, node, vector_lanes)
-        elif node.target == torch.ops.aten.softmax.int:
+        if node.target == torch.ops.aten.softmax.int:
             _pad_softmax(model, node, vector_lanes)
         elif node.target in (
             torch.ops.quantized_ops.quantize_mx.default,

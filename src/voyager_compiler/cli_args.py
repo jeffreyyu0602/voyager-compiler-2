@@ -15,9 +15,9 @@ from voyager_compiler.hardware_config import (
 )
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
-    DEFAULT_LAYOUT_POLICY,
+    DEFAULT_TENSOR_LAYOUT,
     GEMM_WEIGHT_LAYOUTS,
-    LAYOUT_POLICIES,
+    TENSOR_LAYOUTS,
 )
 from voyager_compiler.utils import SLURM_ARGS
 
@@ -358,11 +358,20 @@ def add_compile_args(parser=None):
 
     # -- data layout + hardware unrolling -----------------------------------
     parser.add_argument(
-        "--layout_policy",
-        choices=LAYOUT_POLICIES,
-        default=DEFAULT_LAYOUT_POLICY,
-        help="Operand layouts (activation / conv weight / matmul weight): "
-        "pytorch = NCHW/OIHW/KC, systolic = NHWC/HWIO/CK.",
+        "--tensor_layout",
+        choices=TENSOR_LAYOUTS,
+        default=DEFAULT_TENSOR_LAYOUT,
+        help="Memory order of the 4-D feature maps of conv2d, the 2-D pools "
+        "and the ops connected to them: nchw (channels first, OIHW conv "
+        "weights) or nhwc (channels last, HWIO conv weights). GEMM operands "
+        "are not affected.",
+    )
+    parser.add_argument(
+        "--gemm_weight_layout",
+        choices=GEMM_WEIGHT_LAYOUTS,
+        default=DEFAULT_GEMM_WEIGHT_LAYOUT,
+        help="Matrix-matrix GEMM weight layout: kc is [out, contraction], "
+        "ck is [contraction, out].",
     )
     parser.add_argument(
         "--gemv_weight_layout",

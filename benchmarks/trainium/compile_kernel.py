@@ -18,6 +18,20 @@ docs), all FP32 there:
   64]``, ``k`` ``[16, 64, 4096]``.
 - ``gemm128``, ``gemm256``, ``gemm512``: ``a @ b`` of two inputs, ``M x N x
   K`` 128 x 128 x 128, 256 x 256 x 256 and 512 x 256 x 512.
+- ``maxpool``: a 3 x 3 max pool, stride 1 and no padding, over ``[1, 1,
+  4096, 4096]``.
+- ``add_rmsnorm_matmul``: ``rms_norm(x + res) @ W``, ``x`` and ``res``
+  ``[4096, 1024]``, ``W`` ``[1024, 2048]``.
+- ``matmul_add_rmsnorm``: ``rms_norm(x @ W + res)``, ``x`` and ``res``
+  ``[4096, 2048]``, ``W`` ``[2048, 2048]``.
+
+In the two RMS norm chains the norm's eps is 1e-5, ``x`` and ``res`` are
+inputs, and the norm's weight and ``W`` are parameters.  Each compiles to
+one kernel: the add and the norm fuse into the GEMM as its prologue, or
+after it as its tail.
+
+``rmsnorm``, an RMSNorm (eps 1e-5) over ``[4096, 8192]``, is not codex's:
+it is the ``layernorm`` kernel's shape for the norm Llama uses.
 """
 
 import argparse
@@ -31,9 +45,14 @@ import torch.nn.functional as F
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
 )
-from test_codegen import VECTOR_PIPELINE  # noqa: E402
+from test_codegen import MXU_OPS, VECTOR_PIPELINE, _can_fuse  # noqa: E402
 
-from voyager_compiler import compile, export_model, transform  # noqa: E402
+from voyager_compiler import (  # noqa: E402
+    OpMatcher,
+    compile,
+    export_model,
+    transform,
+)
 from voyager_compiler.backend.trainium import (  # noqa: E402
     LAYOUT,
     TRN2,
@@ -48,6 +67,22 @@ from voyager_compiler.backend.trainium import (  # noqa: E402
 TARGETS = {"trn2": TRN2, "trn3": TRN3}
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
+# Voyager's fusion patterns, plus an add then an RMS norm: alone, ahead of a
+# GEMM as its prologue, or after one as its tail.
+PATTERNS = VECTOR_PIPELINE + [
+    [OpMatcher("add"), OpMatcher("rms_norm")],
+    [
+        OpMatcher("add"),
+        OpMatcher("rms_norm"),
+        OpMatcher(*MXU_OPS, predicate=_can_fuse),
+    ],
+    [
+        OpMatcher(*MXU_OPS, predicate=_can_fuse),
+        OpMatcher("add"),
+        OpMatcher("rms_norm"),
+    ],
+]
+
 
 class LayerNorm(torch.nn.Module):
     def __init__(self, features=8192):
@@ -56,6 +91,17 @@ class LayerNorm(torch.nn.Module):
         with torch.no_grad():
             self.norm.weight.normal_(1.0, 0.1)
             self.norm.bias.normal_(0.0, 0.1)
+
+    def forward(self, x):
+        return self.norm(x)
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, features=8192):
+        super().__init__()
+        self.norm = torch.nn.RMSNorm(features, eps=1e-5)
+        with torch.no_grad():
+            self.norm.weight.normal_(1.0, 0.1)
 
     def forward(self, x):
         return self.norm(x)
@@ -82,14 +128,51 @@ class Matmul(torch.nn.Module):
         return a @ b
 
 
+class MaxPool(torch.nn.Module):
+    def forward(self, x):
+        return F.max_pool2d(x, 3, 1)
+
+
+class AddRmsNormMatmul(torch.nn.Module):
+    def __init__(self, features=1024, out_features=2048):
+        super().__init__()
+        self.norm = torch.nn.RMSNorm(features, eps=1e-5)
+        self.weight = torch.nn.Parameter(
+            torch.randn(features, out_features) / features**0.5
+        )
+        with torch.no_grad():
+            self.norm.weight.normal_(1.0, 0.1)
+
+    def forward(self, x, res):
+        return self.norm(x + res) @ self.weight
+
+
+class MatmulAddRmsNorm(torch.nn.Module):
+    def __init__(self, in_features=2048, features=2048):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(in_features, features) / in_features**0.5
+        )
+        self.norm = torch.nn.RMSNorm(features, eps=1e-5)
+        with torch.no_grad():
+            self.norm.weight.normal_(1.0, 0.1)
+
+    def forward(self, x, res):
+        return self.norm(x @ self.weight + res)
+
+
 # Each kernel and its inputs' shapes.
 KERNELS = {
     "layernorm": (LayerNorm, [(4096, 8192)]),
+    "rmsnorm": (RMSNorm, [(4096, 8192)]),
     "swiglu": (SwiGLU, [(4096, 1024)]),
     "bmm_softmax": (BmmSoftmax, [(16, 4096, 64), (16, 64, 4096)]),
     "gemm128": (Matmul, [(128, 128), (128, 128)]),
     "gemm256": (Matmul, [(256, 256), (256, 256)]),
     "gemm512": (Matmul, [(512, 512), (512, 256)]),
+    "maxpool": (MaxPool, [(1, 1, 4096, 4096)]),
+    "add_rmsnorm_matmul": (AddRmsNormMatmul, [(4096, 1024), (4096, 1024)]),
+    "matmul_add_rmsnorm": (MatmulAddRmsNorm, [(4096, 2048), (4096, 2048)]),
 }
 
 
@@ -110,9 +193,7 @@ def main():
     example_args = tuple(torch.randn(s, dtype=dtype) for s in shapes)
 
     gm = export_model(model, example_args)
-    transform(
-        gm, example_args, patterns=VECTOR_PIPELINE, config=config, **LAYOUT
-    )
+    transform(gm, example_args, patterns=PATTERNS, config=config, **LAYOUT)
     nodes = kernel_nodes(gm)
     ir = compile(
         gm,

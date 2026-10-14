@@ -10,16 +10,15 @@ time, not at import.
 
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
-    DEFAULT_LAYOUT_POLICY,
+    DEFAULT_TENSOR_LAYOUT,
     GEMM_OP_VARIANTS,
     GEMM_WEIGHT_LAYOUTS,
     HWIO_TO_OIHW,
-    LAYOUT_POLICIES,
     NCHW_TO_NHWC,
     NHWC_OP_VARIANTS,
     NHWC_TO_NCHW,
     OIHW_TO_HWIO,
-    POLICY_GEMM_WEIGHT_LAYOUT,
+    TENSOR_LAYOUTS,
     project,
     unproject,
 )
@@ -40,16 +39,15 @@ from voyager_compiler.ops.quantized import (
 
 __all__ = [
     "DEFAULT_GEMM_WEIGHT_LAYOUT",
-    "DEFAULT_LAYOUT_POLICY",
+    "DEFAULT_TENSOR_LAYOUT",
     "GEMM_OP_VARIANTS",
     "GEMM_WEIGHT_LAYOUTS",
     "HWIO_TO_OIHW",
-    "LAYOUT_POLICIES",
     "NCHW_TO_NHWC",
     "NHWC_OP_VARIANTS",
     "NHWC_TO_NCHW",
     "OIHW_TO_HWIO",
-    "POLICY_GEMM_WEIGHT_LAYOUT",
+    "TENSOR_LAYOUTS",
     "calculate_mx_qparam",
     "compiled_on_gpu",
     "dequantize",

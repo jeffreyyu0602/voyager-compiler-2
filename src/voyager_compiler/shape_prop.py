@@ -108,7 +108,7 @@ def written_buffers(graph) -> set:
         if node.op != "call_function":
             continue
         target = node.target
-        if target in _HOPS or target is _commit_op():
+        if target in _HOPS or target in _region_ops():
             operands = node.all_input_nodes
         elif (
             isinstance(target, torch._ops.OpOverload)
@@ -212,10 +212,14 @@ def propagate_shape(node: Node, model: GraphModule = None):
     set_node_value(node, result)
 
 
-def _commit_op():
-    """The ``voyager`` ``commit`` HOP, resolved lazily — it is registered by
-    ``ops.py``, which imports after this low-level module."""
-    return getattr(torch.ops.higher_order, "commit", None)
+def _region_ops():
+    """The ``voyager`` HOPs over ``(subgraph, *operands)`` -- ``commit`` and
+    ``with_scratch`` -- resolved lazily: they are registered by ``ops.py``,
+    which imports after this low-level module."""
+    return tuple(
+        getattr(torch.ops.higher_order, name, None)
+        for name in ("commit", "with_scratch")
+    )
 
 
 class ShapeProp:
@@ -310,11 +314,12 @@ class ShapeProp:
                 taken = self._subprop(true_g.target, ins)
                 other = self._subprop(false_g.target, ins)
                 result = taken if load_arg(pred) else other
-            elif self._recurse and node.target is _commit_op():
-                # ``commit(subgraph, *operands, ...)``: stamp the region (and
-                # run its kernel, mutating the destination buffer) with operand
-                # values.  The dependency / post semaphores are side effects the
-                # oracle-disabled ShapeProp ignores.
+            elif self._recurse and node.target in _region_ops():
+                # ``commit`` / ``with_scratch(subgraph, *operands, ...)``: stamp
+                # the region (and run its kernel, mutating the destination
+                # buffer) with operand values.  A commit's semaphores are side
+                # effects the oracle-disabled ShapeProp ignores, and the scratch
+                # regions nothing reads.
                 sub_g, *operands = node.args
                 result = self._subprop(sub_g.target, load_arg(list(operands)))
             elif node.op == "call_function":

@@ -32,7 +32,7 @@ kernel.
 
 | Stage | Trainium |
 |---|---|
-| Export, PT2E quantization, `transform()` passes | shared as is; `LAYOUT` picks Voyager's K-major weight layout (`systolic`, `ck`) |
+| Export, PT2E quantization, `transform()` passes | shared as is; `LAYOUT` stores every GEMM weight contraction-major (`ck`, [in, out]) and keeps feature maps NCHW |
 | Tile search (interstellar for GEMMs, the shared grid search for vector ops and GEMVs) | shared; it asks the target's runtime model (`tiling/runtime_model.py`) to prepare each op, then whether each candidate fits and what it costs |
 | Runtime model | custom: `TrainiumModel` in `model.py`, preparing a `TrainiumGemm`, `TrainiumGemv` or `TrainiumVector` per op from the graph facts in `tiling/lowering.py` |
 | Bufferization, memory planning, `model.txt` | shared as is |
@@ -47,7 +47,12 @@ kernel.
   instructions by their data dependences.
 - **SBUF tiles** have their rows (all dims but the last, flattened) on the
   partitions and the last dim free. A one-row tile read as an elementwise
-  operand is replicated across the partitions when loaded.
+  operand is replicated across the partitions when loaded. `transform` runs
+  with `tensor_layout="nchw"`, so a pool's H lands on the partitions while
+  the GEMM weights stay `"ck"`.
+- **A 2-D max pool** loads each output row's kH input rows side by side
+  onto that row's partition, at most 128 rows per tile, and runs kH-1
+  vertical and kW-1 horizontal maxes on VectorE.
 - **Access patterns** come from the elements' offsets: each instruction's
   operands are mapped element by element and factored into one shared
   nesting (`fit`). Views and relayouts fused into a kernel need no special
@@ -55,8 +60,25 @@ kernel.
 - **A GEMM step** transposes its activation on TensorE, 128 x 128 at a
   time, multiplies it into PSUM one 512-column slice at a time, and evicts
   each slice through the ops fused after the GEMM.
+- **A GEMM prologue**, the ops fused ahead of a GEMM that compute its
+  activation (an add, then an RMS norm), runs on each 128-row chunk into
+  an SBUF temporary before the transposes, every op in place there: a
+  pointwise op in column runs, a row op over whole rows, so
+  `TrainiumModel` keeps the contraction whole. It reruns for every N
+  tile, which the model prices.
+- **A row-wise op** (layer norm, RMS norm, softmax) runs 128 rows at a
+  time, one row per partition. A norm takes its rows' moments with
+  `bn_stats` / `bn_aggr`; an RMS norm's mean square is `mean² + variance`,
+  and one pass then scales each row by its rstd and the weight. The ops
+  fused before it write its rows to the destination first, and it then
+  runs there in place. A GEMM tail ending in one evicts each 128-row
+  chunk's slices into the output tile, then runs it on the chunk's rows,
+  so `TrainiumModel` keeps an output tile's rows whole.
 - **A transposing load** (attention's Kᵀ) lands as stored, then is
   transposed on TensorE.
+- **A layer norm** normalizes, scales and shifts in its output tile and
+  keeps its statistics in the translator's temporaries, so the IR declares
+  no scratch region on Trainium.
 - **Immediates** (constants the IR names but does not hold, such as the
   attention scale) are written into the kernel as literals.
 - **DRAM-only ops** (embedding, slice, cat) run in the host program as
@@ -150,5 +172,6 @@ with references (without `--no-reference`).
 
 ## Not supported yet
 
-Kernels that write an HBM box they did not allocate, padded or partial
-transfers, MXFP4, convolution, pooling and fused attention.
+Kernels that write an HBM box they did not allocate, transfers with a
+non-zero pad, partial transfers, MXFP4, convolution, pooling other than an
+unpadded NCHW max_pool2d, and fused attention.

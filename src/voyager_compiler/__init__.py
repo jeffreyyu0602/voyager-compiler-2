@@ -33,6 +33,7 @@ from voyager_compiler.codegen import (
     fuse_quantize_dequantize_with_producer,
     gen_compute_graph,
     inline_autocast_modules,
+    match_and_fuse_rms_norm,
     normalize_conv2d_layout,
     normalize_gemm_weight_layout,
     pad_matrix_op_dimensions,
@@ -44,7 +45,6 @@ from voyager_compiler.codegen import (
     rename_nodes_with_param_names,
     replace_conv2d_with_im2col,
     replace_interpolate,
-    replace_rmsnorm_with_layer_norm,
     scalarize_index_arithmetic,
     split_kv_cache,
 )
@@ -76,8 +76,8 @@ from voyager_compiler.modeling import (
 )
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
-    DEFAULT_LAYOUT_POLICY,
-    POLICY_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_TENSOR_LAYOUT,
+    TENSOR_LAYOUTS,
 )
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
@@ -157,6 +157,7 @@ __all__ = [
     "get_node_name_to_scope",
     "gradient_program",
     "insert_align_device_nodes",
+    "match_and_fuse_rms_norm",
     "pad_vit_embeddings_output",
     "prepare_from_args",
     "prepare_pt2e",
@@ -170,7 +171,6 @@ __all__ = [
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
-    "replace_rmsnorm_with_layer_norm",
     "scalarize_index_arithmetic",
     "set_batch_norm_training",
     "set_training",
@@ -234,7 +234,8 @@ def transform(
     example_kwargs=None,
     patterns=None,
     config=None,
-    layout_policy=DEFAULT_LAYOUT_POLICY,
+    tensor_layout=DEFAULT_TENSOR_LAYOUT,
+    gemm_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
@@ -253,9 +254,16 @@ def transform(
             of ``OpMatcher`` from anchor to tail.
         config: The accelerator's ``AcceleratorConfig``; ``None`` models no
             hardware and skips padding.
-        layout_policy: The data-layout policy: ``"systolic"`` puts conv2d in
-            NHWC, and the policy picks the matrix-matrix GEMM weight layout.
-        gemv_weight_layout: The weight layout of a matrix-vector GEMM.
+        tensor_layout: The memory order of the 4-D feature maps that conv2d,
+            the 2-D pools and the ops connected to them read and write:
+            ``"nchw"`` (channels first, PyTorch's order) or ``"nhwc"``
+            (channels last, with HWIO conv weights). GEMM operands are not
+            affected; their weights follow ``gemm_weight_layout`` and
+            ``gemv_weight_layout``.
+        gemm_weight_layout: The weight layout of a matrix-matrix GEMM:
+            ``"kc"`` ([out, contraction]) or ``"ck"`` ([contraction, out]).
+        gemv_weight_layout: The weight layout of a matrix-vector GEMM (a
+            single activation row), ``"kc"`` or ``"ck"``.
         skip_op_fusion: Skip operator fusion.
         fuse_reshape: Let fusion fold a trailing reshape or permute into
             its producer's output.
@@ -287,14 +295,11 @@ def transform(
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, config.pe_array_size)
 
-    if layout_policy == "systolic":
+    assert tensor_layout in TENSOR_LAYOUTS, tensor_layout
+    if tensor_layout == "nhwc":
         normalize_conv2d_layout(model)
 
-    normalize_gemm_weight_layout(
-        model,
-        mm_layout=POLICY_GEMM_WEIGHT_LAYOUT[layout_policy],
-        mv_layout=gemv_weight_layout,
-    )
+    normalize_gemm_weight_layout(model, gemm_weight_layout, gemv_weight_layout)
 
     if config.pe_array_size is not None:
         pad_vector_op_dimensions(model, config.vector_lanes)

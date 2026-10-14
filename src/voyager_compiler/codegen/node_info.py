@@ -56,23 +56,22 @@ QUANTIZE_FAMILY_OPS = DYNAMIC_QUANTIZE_OPS | {
     torch.ops.quantized_ops.dequantize.default,
 }
 
-# The layer norms and the softmaxes, in every form a graph spells them: the
-# model's op, the one a training graph's decomposition leaves, and the
-# quantized twin the compiler retargets to.  A log-softmax reduces and stages
-# like a softmax.
+# The layer norms, RMS norms and softmaxes, in every form a graph spells
+# them: the model's op and the one a training graph's decomposition leaves.
+# A log-softmax reduces and stages like a softmax.
 LAYER_NORM_OPS = frozenset(
     {
         torch.ops.aten.layer_norm.default,
         torch.ops.aten.native_layer_norm.default,
-        torch.ops.quantized_ops.layer_norm.default,
     }
 )
+RMS_NORM_OPS = frozenset({torch.ops.aten.rms_norm.default})
+NORM_OPS = LAYER_NORM_OPS | RMS_NORM_OPS
 SOFTMAX_OPS = frozenset(
     {
         torch.ops.aten.softmax.int,
         torch.ops.aten._softmax.default,
         torch.ops.aten._log_softmax.default,
-        torch.ops.quantized_ops.softmax.default,
     }
 )
 
@@ -667,6 +666,28 @@ def activation_transforms(node: Node):
     return node, False
 
 
+def activation_prologue(node) -> list:
+    """The ops a fused GEMM ``node`` runs to compute its anchor's activation,
+    in submodule order; none for a bare node or one taking it as an operand.
+
+    Each op keeps the activation's shape, so every operand they read tiles
+    like the activation, right-aligned on its ``(M, K)`` tile, and a row op
+    among them (a norm, a softmax) needs ``K`` whole.
+    """
+    submod = node.meta.get("submodule")
+    if node.op != "call_module" or submod is None:
+        return []
+    act, _ = activation_transforms(get_anchor_node(node).args[0])
+    if act.op == "placeholder":
+        return []
+    upstream = ancestors(act) | {act}
+    return [
+        n
+        for n in submod.graph.nodes
+        if n in upstream and n.op == "call_function"
+    ]
+
+
 # --------------------------------------------------------------------------
 # Argument and dtype access
 # --------------------------------------------------------------------------
@@ -866,44 +887,6 @@ def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
     return int(_align_size(size))
 
 
-# The batched reductions whose backend kernel keeps intermediates on chip:
-# the ``quantized_ops`` twin that names them, the regions reduced to one
-# element per row, and the ones as big as the tile itself.  A softmax holds a
-# max and a sum, a layer_norm a mean and a variance plus the normalized tile.
-_REDUCTION_SCRATCH = {
-    aten.softmax.int: (
-        torch.ops.quantized_ops.softmax.default,
-        ("max", "sum"),
-        (),
-    ),
-    aten.layer_norm.default: (
-        torch.ops.quantized_ops.layer_norm.default,
-        ("mean", "variance"),
-        ("normalized",),
-    ),
-    torch.ops.quantized_ops.layer_norm.default: (
-        torch.ops.quantized_ops.layer_norm.default,
-        ("mean", "variance"),
-        ("normalized",),
-    ),
-}
-
-
-def reduction_op(node):
-    """The ``quantized_ops`` op that names ``node``'s scratch, or ``None`` if
-    ``node`` is not a batched reduction that keeps any."""
-    entry = _REDUCTION_SCRATCH.get(node.target)
-    return entry[0] if entry else None
-
-
-def _reduced_dims(node, ndim: int) -> set:
-    """The dims ``node`` reduces over, as non-negative indices."""
-    if node.target is aten.softmax.int:
-        return {get_arg_value(node, 1, "dim", -1) % ndim}
-    normalized_shape = get_arg_value(node, 1, "normalized_shape") or ()
-    return set(range(ndim - len(normalized_shape), ndim))
-
-
 def relayout_view_shape(relayout, shape):
     """The shape a relayout chain gives an input of ``shape``, or ``None``
     when the chain moves elements rather than only renaming dims.
@@ -992,62 +975,6 @@ def stream_breaking_quantize(gm):
     ):
         return None
     return quant, relayout, spine
-
-
-def reduction_scratch(node, out_tile, vector_lanes):
-    """The on-chip regions the backend keeps beside a batched reduction's own
-    tile: a softmax's max and sum, a layer_norm's mean and variance plus its
-    normalized output.
-
-    No FX node names them -- the graph goes straight from input tile to output
-    tile -- so they are reserved rather than computed.  ``node`` may be a bare
-    op or a fused ``call_module``, whose whole submodule is scanned: a group's
-    reduction is not always its anchor.  Fusion normalizes a group onto its
-    anchor's shape, and a reduction *is* a strong anchor, so one tile of the
-    output is the tile the reduction reduces.
-
-    Args:
-        node: The op being bufferized or tiled.
-        out_tile: One tile of ``node``'s output, or one per output -- a
-            multi-output op names its iteration space with the last (the
-            shape-preserving one; a microscaling scale or a CSR index is
-            derived from it).
-        vector_lanes: Lanes the vector unit reduces into.  A statistic is one
-            value per row, but the unit addresses a whole lane group at a
-            time, so it is held duplicated across the lanes and the reduced
-            dims collapse to ``vector_lanes`` rather than to 1.
-
-    Returns:
-        ``[(name, shape, dtype), ...]``, one per region, named as the op's
-        keyword takes it: the tile with its reduced dims collapsed to a lane
-        group for a statistic, the whole tile for layer_norm's normalized
-        output, each in the *physical* dtype of the op's input tensor (never
-        the logical dtype in ``meta``).
-    """
-    submod = node.meta.get("submodule") if node.op == "call_module" else None
-    ops = submod.graph.nodes if submod is not None else [node]
-    if not out_tile:  # no tile to reduce: a scalar, or a non-tensor result
-        return []
-    if isinstance(out_tile[0], (tuple, list)):
-        out_tile = out_tile[-1]
-    tile = tuple(out_tile)
-
-    scratch = []
-    for op in ops:
-        entry = _REDUCTION_SCRATCH.get(op.target)
-        if entry is None:
-            continue
-        _, rows, tiles = entry
-        reduced = _reduced_dims(op, len(tile))
-        innermost = max(reduced)
-        row = tuple(
-            (vector_lanes if i == innermost else 1) if i in reduced else s
-            for i, s in enumerate(tile)
-        )
-        dtype = get_arg_value(op, 0, "input").value.dtype
-        scratch += [(name, row, dtype) for name in rows]
-        scratch += [(name, tile, dtype) for name in tiles]
-    return scratch
 
 
 # --- outlier CSR producers and consumers -------------------------------------

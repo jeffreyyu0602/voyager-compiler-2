@@ -92,7 +92,7 @@ VECTOR_PIPELINE = [
         OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
-        OpMatcher("layer_norm", "softmax"),
+        OpMatcher("layer_norm", "rms_norm", "softmax"),
         OpMatcher(*QUANT_OPS),
     ],
 ]
@@ -198,7 +198,7 @@ def main():
         help=(
             "Named per-operand qconfig table for LLMs (from "
             "examples/language_modeling/quantization_configs.py); also puts "
-            "softmax and layer_norm outputs in fp8."
+            "softmax and rms_norm outputs in fp8."
         ),
     )
     parser.add_argument(

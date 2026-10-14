@@ -19,7 +19,7 @@ from voyager_compiler.codegen.iteration_space import (
     NormalizationError,
 )
 from voyager_compiler.codegen.node_info import (
-    LAYER_NORM_OPS,
+    NORM_OPS,
     is_gemm_op,
     is_nop,
     is_reshape_op,
@@ -176,7 +176,7 @@ OP_PARAM_ARG_INDEX = {
     torch.ops.quantized_ops.conv2d_mx.default: 1,
     torch.ops.quantized_ops.linear.default: 1,
     torch.ops.quantized_ops.linear_mx.default: 1,
-    **dict.fromkeys(LAYER_NORM_OPS, 2),
+    **dict.fromkeys(NORM_OPS, 2),
 }
 
 

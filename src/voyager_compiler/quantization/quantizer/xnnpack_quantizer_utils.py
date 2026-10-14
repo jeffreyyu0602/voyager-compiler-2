@@ -556,9 +556,9 @@ def _annotate_layer_norm(
     weight_qspec = quantization_config.weight
     bias_qspec = quantization_config.bias
     for node in gm.graph.nodes:
-        if (
-            node.op != "call_function"
-            or node.target != torch.ops.aten.layer_norm.default
+        if node.target not in (
+            torch.ops.aten.layer_norm.default,
+            torch.ops.aten.rms_norm.default,
         ):
             continue
 
@@ -574,14 +574,10 @@ def _annotate_layer_norm(
         assert isinstance(act_node, Node)
         input_qspec_map[act_node] = input_act_qspec
 
-        weight_node = node.args[2]
-        assert isinstance(weight_node, Node)
-        input_qspec_map[weight_node] = weight_qspec
-
-        bias_node = node.args[3] if len(node.args) > 3 else None
-        if bias_node:
-            assert isinstance(bias_node, Node)
-            input_qspec_map[bias_node] = bias_qspec
+        # A layer_norm's weight and bias; an rms_norm's weight and eps.
+        for param, qspec in zip(node.args[2:4], (weight_qspec, bias_qspec)):
+            if isinstance(param, Node):
+                input_qspec_map[param] = qspec
 
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,

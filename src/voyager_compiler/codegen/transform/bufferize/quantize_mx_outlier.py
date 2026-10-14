@@ -4,7 +4,7 @@ The op splits an activation into quantized inliers and a CSR of outliers, and
 the SpMM engine that consumes that CSR cannot offset column indices — a block's
 columns must already lie inside the weight tile that multiplies them. So the
 quantize has to run per ``(row block, K slice)``, which is a tiling the op's
-own anchor cannot give it: when the quantize is fused onto a ``layer_norm``,
+own anchor cannot give it: when the quantize is fused onto a norm,
 ``_vector_op_tiling_limits`` pins the tile to whole rows, and a full-K tile
 emits columns spanning ``0..K-1``.
 
@@ -13,9 +13,9 @@ whose grid carries both, running the op once per step. What a step holds on
 chip is the one thing the two kinds of producer decide differently. A bare
 quantize loads just the ``[rows, tk]`` slice it quantizes, so its row block
 is bounded by one double-buffered window and the staging tiles. A quantize
-fused onto a reduction (a ``layer_norm``) needs the whole row: its activation
-is loaded ``[rows, K]`` and advanced only with the row block, the prefix runs
-on the block's first slice step into a resident scratchpad intermediate, and
+fused onto a reduction (a norm) needs the whole row: its activation is
+loaded ``[rows, K]`` and advanced only with the row block, the prefix runs on
+the block's first slice step into a resident scratchpad intermediate, and
 every slice step windows that. Either way the activation is read from DRAM
 exactly once.
 
@@ -57,17 +57,16 @@ from voyager_compiler.codegen.node_info import (
     get_anchor_node,
     get_arg_value,
     quant_param_arg_nodes,
-    reduction_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     oracle_disabled,
+    with_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     PipelinedKernel,
     _bank_group_list,
     _DEFAULT_NUM_SLOTS,
-    _naming_scratch,
     _stamp_bank_groups,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
@@ -236,12 +235,11 @@ class _OutlierProducer(torch.nn.Module):
     ``_ScratchSpec``: they are loop-carried state living the whole sweep, not
     per-step scratch, and the table has a DRAM twin the consumers read.
 
-    A reduction fused ahead of the quantize (a ``layer_norm``, a ``softmax``)
+    A reduction fused ahead of the quantize (a norm, a ``softmax``)
     does take ``_ScratchSpec``s -- the regions its backend kernel keeps beside
     the row-block intermediate. The scheduler allocates them and appends them
-    to the kernel arguments, which is exactly where the prefix wants them: it
-    is traced against the twin that names them (``_naming_scratch``), whose
-    extra placeholders follow its own.
+    to the kernel arguments, and the prefix runs beside them under
+    ``scratch_names``.
     """
 
     def __init__(
@@ -255,6 +253,7 @@ class _OutlierProducer(torch.nn.Module):
         prefix_gm: Optional[torch.nn.Module],
         act_idx: int,
         kw_idx: dict,
+        scratch_names,
         scratch_specs=(),
         num_slots: int = _DEFAULT_NUM_SLOTS,
     ):
@@ -266,6 +265,7 @@ class _OutlierProducer(torch.nn.Module):
         self.prefix_gm = prefix_gm
         self.act_idx = act_idx
         self.kw_idx = kw_idx
+        self.scratch_names = scratch_names
         self.num_inputs = len(in_specs)
         self.inner = PipelinedKernel(
             self._kernel,
@@ -305,7 +305,7 @@ class _OutlierProducer(torch.nn.Module):
     def _kernel(self, idx, *slots):
         """One K slice of one row block.
 
-        The scheduler hands the loaded tiles first and the reduction scratch
+        The scheduler hands the loaded tiles first and the scratch regions
         after them; only the prefix sees the scratch.  A bare quantize is
         handed the slice itself.  A fused prefix is handed the whole row
         block, runs on the block's first slice step into the resident
@@ -318,9 +318,12 @@ class _OutlierProducer(torch.nn.Module):
             tile = tiles[self.act_idx]
         else:
             mid = self._bufs.row_block
+            named = dict(zip(self.scratch_names, scratch))
             effect_cond(
                 k == 0,
-                lambda: voyager.insert(self.prefix_gm(*tiles, *scratch), mid),
+                lambda: voyager.insert(
+                    with_scratch(self.prefix_gm, tiles, named), mid
+                ),
             )
             # A K slice of the resident intermediate is a window, not a
             # transfer: it is already on chip, which is the whole point of
@@ -772,23 +775,25 @@ def build_quantize_mx_outlier(
     # Everything that scales with the row block, per row, and the scratchpad
     # it may take.  A fused prefix keeps its whole-row intermediate, the tile
     # it is produced from and the staging tiles in one pipeline slot
-    # (``_NEST_ROW_BLOCK_COPIES``), plus its reduction's regions (a
-    # layer_norm's mean, variance and normalized tile), which a one-row tile
-    # prices before the block is known; its block starts from the vector-op
-    # search, which sized that ``[rows, K]`` tile.  A bare quantize keeps only
-    # the double-buffered ``[rows, tk]`` window and the staging tiles, so it
-    # starts from the whole activation and lets the consumers' row tile cap
-    # it.  The search runs either way: it stamps the operands' bank groups.
+    # (``_NEST_ROW_BLOCK_COPIES``), plus its reduction's regions (an
+    # rms_norm's mean square; a layer_norm's mean, variance and normalized
+    # tile), which a one-row tile prices before the block is known; its block
+    # starts from the vector-op search, which sized that ``[rows, K]`` tile.
+    # A bare quantize keeps only the double-buffered ``[rows, tk]`` window and
+    # the staging tiles, so it starts from the whole activation and lets the
+    # consumers' row tile cap it.  The search runs either way: it stamps the
+    # operands' bank groups.
     config = tiler.config
     tiling = vector_op_tiling(node, tiler)
-    lanes = config.vector_lanes
     ones = [1] * len(batch)
     act_bytes = act.element_size()
     vals = node.value
     if prefix_gm is not None:
         scratch_per_row = sum(
             math.prod(shape) * dtype.itemsize
-            for _, shape, dtype in reduction_scratch(node, ones + [1, K], lanes)
+            for _, shape, dtype in tiler.model.kernel_scratch(
+                node, ones + [1, K]
+            )
         )
         start = max(1, M // max(1, tiling[-2]))
         per_row = _NEST_ROW_BLOCK_COPIES * K * act_bytes + scratch_per_row
@@ -823,17 +828,14 @@ def build_quantize_mx_outlier(
     )
     threshold = get_arg_value(qnode, 8, "threshold")
 
-    # The reduction is traced against the twin that names its scratch, which
-    # takes the prefix's own operands plus one trailing placeholder per
-    # region.  Sized off the row-block intermediate, the tile it reduces.
+    # The regions the prefix runs beside, sized off the row-block
+    # intermediate, the tile it reduces.
     scratch = (
-        reduction_scratch(node, ones + [rows, K], lanes)
+        tiler.model.kernel_scratch(node, ones + [rows, K])
         if prefix_gm is not None
         else []
     )
     scratch_specs = [_ScratchSpec(tuple(shape), dt) for _, shape, dt in scratch]
-    if prefix_gm is not None:
-        prefix_gm = _naming_scratch(prefix_gm, [name for name, _, _ in scratch])
 
     # Operand roles: the activation is tiled, codebooks load whole.
     in_nodes = list(node.all_input_nodes)
@@ -909,6 +911,7 @@ def build_quantize_mx_outlier(
         prefix_gm=prefix_gm,
         act_idx=act_idx,
         kw_idx=kw_idx,
+        scratch_names=[name for name, _, _ in scratch],
         scratch_specs=scratch_specs,
         num_slots=num_slots,
     )

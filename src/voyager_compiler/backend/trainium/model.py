@@ -12,7 +12,11 @@ model prices it:
 - a vector op makes its passes over the tile 128 rows at a time, on ScalarE
   for a transcendental and on VectorE otherwise;
 - a DMA moves a tile in one ``dma_copy``: its issue, then its rows' bytes,
-  packet overhead included, at the core's DMA bandwidth.
+  packet overhead included, at the core's DMA bandwidth;
+- a 2-D max pool puts one output row on each partition: partition ``p``
+  holds the ``kH`` input rows output row ``p`` reads side by side on its free
+  axis, loaded as one strip, and VectorE takes ``kH - 1`` vertical then
+  ``kW - 1`` horizontal maxes.
 
 An MX (microscaling) tile is stored contraction-major: 4 consecutive
 contraction elements per 32-bit word, a 512-element chunk per 128
@@ -38,7 +42,11 @@ import torch
 import interstellar
 from voyager_compiler.codegen.node_info import (
     LAYER_NORM_OPS,
+    NORM_OPS,
+    RMS_NORM_OPS,
     SOFTMAX_OPS,
+    _pair,
+    activation_prologue,
     csr_quantize_node,
     get_anchor_node,
     get_arg_value,
@@ -47,7 +55,6 @@ from voyager_compiler.codegen.node_info import (
     is_fully_connected,
     is_gemm_op,
     is_pooling,
-    reduction_scratch,
     tail_targets,
 )
 
@@ -67,6 +74,7 @@ from voyager_compiler.codegen.transform.tiling.lowering import (
     operand_bytes,
     outlier_stats,
     output_dtype,
+    pool_operand_shapes,
     tail_extra_passes,
     tail_keeps_shape,
     vector_operand_shapes,
@@ -98,6 +106,7 @@ from voyager_compiler.codegen.transform.tiling.traversal import (
 le = interstellar.le
 
 QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+MAX_POOL2D = torch.ops.aten.max_pool2d.default
 
 # An MX word packs this many consecutive contraction elements
 # (``float8_e4m3fn_x4``), so one ``nc_matmul_mx`` contracts the partitions
@@ -137,10 +146,17 @@ SCALAR_OPS = frozenset(
 
 # The engines of the passes a softmax makes over its rows: the row maximum
 # (VectorE), the exponentials and their sum (ScalarE), the scaling by the
-# sum's reciprocal (VectorE).  A layer norm reduces its rows' moments,
-# normalizes them and applies its affine, all on VectorE.
+# sum's reciprocal (VectorE).  A layer norm makes three VectorE passes: its
+# rows' moments, then ``(x - mean) * weight`` and ``* rstd + bias``, or with
+# one affine operand the normalization and that operand.  A norm without an
+# affine makes two, so it is priced one pass high.  An RMS norm makes two:
+# its rows' moments, then ``x * rstd * weight``.
 SOFTMAX_PASSES = ("vector", "scalar", "vector")
 LAYER_NORM_PASSES = ("vector", "vector", "vector")
+RMS_NORM_PASSES = ("vector", "vector")
+
+# The ops that reduce each row of their input, so a tile holds whole rows.
+ROW_OPS = NORM_OPS | SOFTMAX_OPS
 
 
 def sbuf_bytes(rows, cols, bits, partitions):
@@ -157,6 +173,8 @@ def target_engines(target):
         return SOFTMAX_PASSES
     if target in LAYER_NORM_OPS:
         return LAYER_NORM_PASSES
+    if target in RMS_NORM_OPS:
+        return RMS_NORM_PASSES
     return ("scalar" if target in SCALAR_OPS else "vector",)
 
 
@@ -337,13 +355,16 @@ class TrainiumModel(RuntimeModel):
     def prepare(self, node):
         """The model of ``node``, bare or fused: a ``TrainiumGemm`` for a
         GEMM, a ``TrainiumGemv`` for a matrix-vector one, which the grid
-        search tiles, and a ``TrainiumVector`` for a vector op.
+        search tiles, a ``TrainiumPool`` for an NCHW 2-D max pool and a
+        ``TrainiumVector`` for a vector op.
 
         Raises:
-            NotImplementedError: ``node`` is a convolution or a pool, which
-                do not lower to Trainium.
+            NotImplementedError: ``node`` is a convolution or another pool,
+                which do not lower to Trainium.
         """
         anchor = get_anchor_node(node)
+        if anchor.target is MAX_POOL2D:
+            return TrainiumPool(node, self)
         if is_conv2d(anchor) or is_pooling(anchor):
             raise NotImplementedError(f"{anchor}: not lowered on Trainium")
         if not is_gemm_op(anchor):
@@ -459,6 +480,7 @@ class TrainiumModel(RuntimeModel):
         tail_quantizes_mx=False,
         num_k=1,
         mx=False,
+        prologue_engines=(),
     ):
         """One GEMM step's compute, ``[rows, depth] x [depth, cols]``: the
         busiest engine.
@@ -466,11 +488,13 @@ class TrainiumModel(RuntimeModel):
         TensorE transposes each 128 x 128 block of the activation -- and of
         a weight stored ``[cols, depth]`` -- and multiplies the activation
         into PSUM one moving slice at a time; VectorE copies the transposed
-        blocks out of PSUM and evicts the finished slices.  MX operands are
-        stored contraction-major, so they need no transposes, and each
-        ``nc_matmul_mx`` contracts 512.  The tail's passes run over an
-        output tile once its reduction ends, so each of its ``num_k`` steps
-        carries a share of them.
+        blocks out of PSUM and evicts the finished slices.  FP32 operands
+        multiply at ``fp32_matmul_rate`` of the 16-bit rate and transpose at
+        ``fp32_transpose_rate``.  MX operands are stored contraction-major,
+        so they need no transposes, and each ``nc_matmul_mx`` contracts 512.
+        The tail's passes run over an output tile once its reduction ends,
+        so each of its ``num_k`` steps carries a share of them; the
+        prologue's passes run over the activation tile on every step.
 
         Args:
             rows: Rows of the activation and output tiles.
@@ -484,6 +508,9 @@ class TrainiumModel(RuntimeModel):
             tail_quantizes_mx: The tail runs a ``quantize_mx``.
             num_k: Steps of the reduction.
             mx: The operands are MX.
+            prologue_engines: The engine of each pass the prologue's
+                arithmetic makes over an activation tile, in order
+                (``_tail_engines``).
         """
         config = self.config
         act_bits, weight_bits, out_bits = bits
@@ -492,15 +519,17 @@ class TrainiumModel(RuntimeModel):
         tensor_cycles = 0.0
         busy = Counter()
         if mx:
-            speedup = 1.0
+            rate = 1.0
             depth_chunks = math.ceil(depth / (config.partitions * MX_PACK))
             transposes = []
         else:
-            speedup = (
-                config.fp8_matmul_speedup
-                if max(act_bits, weight_bits) <= 8
-                else 1.0
-            )
+            width = max(act_bits, weight_bits)
+            if width <= 8:
+                rate = config.fp8_matmul_speedup
+            elif width <= 16:
+                rate = 1.0
+            else:
+                rate = config.fp32_matmul_rate
             depth_chunks = math.ceil(depth / config.partitions)
             transposes = [
                 (r, act_bits) for r in _chunks(rows, config.partitions)
@@ -510,13 +539,17 @@ class TrainiumModel(RuntimeModel):
                     (c, weight_bits) for c in _chunks(cols, config.partitions)
                 ]
         for extent, element_bits in transposes:
-            tensor_cycles += depth_chunks * (extent + overhead)
+            if element_bits > 16:
+                extent_cycles = extent / config.fp32_transpose_rate
+            else:
+                extent_cycles = extent
+            tensor_cycles += depth_chunks * (extent_cycles + overhead)
             busy["vector"] += depth_chunks * self._engine_ns(
                 "vector", extent, element_bits
             )
         for _ in _chunks(rows, config.pe_array_size[1]):
             tensor_cycles += depth_chunks * sum(
-                w / speedup + overhead for w in widths
+                w / rate + overhead for w in widths
             )
             busy["vector"] += sum(
                 self._engine_ns("vector", w, 32) for w in widths
@@ -528,6 +561,8 @@ class TrainiumModel(RuntimeModel):
             tail_busy.update(self.quantize_mx_busy(rows, cols))
         for engine, ns in tail_busy.items():
             busy[engine] += ns / num_k
+        prologue = [(e, 1.0, act_bits) for e in prologue_engines]
+        busy.update(self.passes_busy(prologue, rows, depth))
         return max(busy.values())
 
     def sweep_ns(self, dmas, steps, compute):
@@ -557,8 +592,8 @@ class TrainiumGemm(OpModel):
         key: What the search is cached under, the same facts on every
             backend: the layer (``layer_key``), its output dtype, its fused
             tail's operands and ops (by name), whether that tail takes passes
-            of its own and the scratch regions they may take, and its outlier
-            CSRs.
+            of its own and the scratch regions they may take, its outlier
+            CSRs, and its prologue's ops (by name) and operands.
         model: The ``TrainiumModel``, which prices each step.
         bits: ``(activation, weight, output)`` element widths.
         output_scale_bits: The output's block-scale width, 0 unless it is
@@ -576,6 +611,15 @@ class TrainiumGemm(OpModel):
         tail_engines: The engine of each pass the tail's arithmetic makes
             over an output tile, in order (``_tail_engines``).
         tail_quantizes_mx: The tail runs a ``quantize_mx``.
+        prologue_specs: ``(dims, bits)`` per operand the prologue computing
+            the activation reads (``activation_prologue``), on the
+            activation's loop dims; with any, they load in its place.
+        prologue_engines: The engine of each pass the prologue's arithmetic
+            makes over an activation tile, in order (``_tail_engines``).
+        whole_depth: The prologue runs a row op, so the contraction is never
+            split.
+        row_width: The output's last dim when the tail runs a row op, which
+            an output tile then spans whole; 0 otherwise.
     """
 
     space: MatrixSpace
@@ -592,6 +636,10 @@ class TrainiumGemm(OpModel):
     has_tail: bool
     tail_engines: tuple
     tail_quantizes_mx: bool
+    prologue_specs: tuple
+    prologue_engines: tuple
+    whole_depth: bool
+    row_width: int
 
     @classmethod
     def from_node(cls, node, model):
@@ -610,6 +658,28 @@ class TrainiumGemm(OpModel):
         has_tail = node.meta.get("submodule") is not None
         tail_ops = tail_targets(node)
         single_k, split_k = tail_extra_passes(node)
+        prologue = activation_prologue(node)
+        prologue_ops = tuple(n.target for n in prologue)
+        # A prologue operand tiles along the activation's loop dims it
+        # spans, right-aligned on them, its broadcast dims dropped.
+        act_dims = [le.ON] * (anchor.args[0].value.ndim - 2) + [le.OX, le.IC]
+        operands = dict.fromkeys(
+            p
+            for op in prologue
+            for p in op.all_input_nodes
+            if p.op == "placeholder" and p.value.numel() != 1
+        )
+        prologue_specs = tuple(
+            (
+                tuple(
+                    d
+                    for d, size in zip(act_dims[-len(p.shape) :], p.shape)
+                    if size > 1
+                ),
+                node_dtype_bits(p),
+            )
+            for p in operands
+        )
         key = layer_key(anchor) + (
             tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
             fused_specs,
@@ -622,6 +692,8 @@ class TrainiumGemm(OpModel):
             # one in a CSR-producing nest, else two.
             2 if split_k and csr_quantize_node(node) is None else 1,
             *outlier_stats(node),
+            tuple(str(target) for target in prologue_ops),
+            prologue_specs,
         )
         return cls(
             space=model.matrix_space,
@@ -644,6 +716,14 @@ class TrainiumGemm(OpModel):
             has_tail=has_tail,
             tail_engines=_tail_engines(tail_ops),
             tail_quantizes_mx=QUANTIZE_MX in tail_ops,
+            prologue_specs=prologue_specs,
+            prologue_engines=_tail_engines(prologue_ops),
+            whole_depth=any(t in ROW_OPS for t in prologue_ops),
+            row_width=(
+                anchor.value.shape[-1]
+                if any(t in ROW_OPS for t in tail_ops)
+                else 0
+            ),
         )
 
     @staticmethod
@@ -652,16 +732,25 @@ class TrainiumGemm(OpModel):
         rows = extent(le.OX) * extent(le.OY) * extent(le.ON)
         return rows, extent(le.IC), extent(le.OC)
 
+    @staticmethod
+    def _prologue_tile(dims, rows, depth):
+        """``(rows, cols)`` of a prologue operand's tile spanning ``dims``
+        beside a ``rows x depth`` activation tile."""
+        return (rows if le.OX in dims else 1, depth if le.IC in dims else 1)
+
     def fit(self, mapping):
         """``Placement()`` when the L2 tile fits SBUF, else ``None``.
 
         The tile's SBUF bytes are the activation's, the weight's with its
         bias and the output's with the fused tail's operands and a split
         reduction's float32 accumulator, each in its pipeline slots, and they
-        must fit the usable scratchpad.  MX operands and an MX output take
-        their codes and scales in the MX layout, and a tile the translator
-        cannot lower in it (``_whole_chunks``, ``_quantizable``) fits at no
-        size.
+        must fit the usable scratchpad; a prologue's operands take the
+        activation's place.  MX operands and an MX output take their codes
+        and scales in the MX layout.  A tile the translator cannot lower
+        fits at no size: one not in the MX layout's whole chunks
+        (``_whole_chunks``, ``_quantizable``), one splitting the contraction
+        under a prologue row op, or one splitting the output's rows under a
+        tail row op.
         """
         model = self.model
         config = model.config
@@ -677,8 +766,13 @@ class TrainiumGemm(OpModel):
         rows, depth, cols = self._tile(partial(total_extent, mapping, level=2))
         mx_in = self.block_size > 1
         mx_out = self.output_scale_bits > 0
+        split_k = mapping.loop_blockings[le.IC][3] > 1
         if (mx_in and not _whole_chunks(depth, p)) or (
             mx_out and not _quantizable(cols, p)
+        ):
+            return None
+        if (self.whole_depth and split_k) or (
+            self.row_width and cols != self.row_width
         ):
             return None
         if mx_in:
@@ -697,7 +791,14 @@ class TrainiumGemm(OpModel):
             out += model._mx_sbuf(cols, rows, True)
         else:
             out = sbuf_bytes(rows, cols, out_bits, p)
-        act *= slots(INPUT_DIMS, self.batch)
+        if self.prologue_specs:
+            act = sum(
+                slots(dims, self.batch)
+                * sbuf_bytes(*self._prologue_tile(dims, rows, depth), bits, p)
+                for dims, bits in self.prologue_specs
+            )
+        else:
+            act *= slots(INPUT_DIMS, self.batch)
         weight += sbuf_bytes(1, cols, self.bias_bits, p)
         weight *= slots(WEIGHT_DIMS, self.weight_batch)
         out *= slots(OUTPUT_DIMS, self.batch)
@@ -707,7 +808,6 @@ class TrainiumGemm(OpModel):
             out += slots(dims, self.batch) * sbuf_bytes(
                 tail_rows, tail_cols, bits, p
             )
-        split_k = mapping.loop_blockings[le.IC][3] > 1
         if split_k and (self.has_tail or model.accumulate_fp32):
             out += sbuf_bytes(rows, cols, 32, p)
         if act + out + weight > config.usable_scratchpad_size:
@@ -717,7 +817,8 @@ class TrainiumGemm(OpModel):
     def cost(self, mapping, placement):
         """The whole GEMM in TensorE cycles -- its L3 sweep, each step's
         compute overlapping the DMAs of the operands that change -- and, as
-        ``compute``, one step of the GEMM alone, its tail left out.
+        ``compute``, one step of the GEMM alone, its prologue and tail left
+        out.
         ``placement`` is the contract's."""
         model = self.model
         frequency = model.config.frequency
@@ -736,6 +837,7 @@ class TrainiumGemm(OpModel):
             self.tail_quantizes_mx,
             num_k,
             mx_in,
+            self.prologue_engines,
         )
         if mx_in:
             act_ns = model._mx_dma_ns(depth, rows, False)
@@ -755,12 +857,31 @@ class TrainiumGemm(OpModel):
             out_ns += model._mx_dma_ns(cols, rows, True)
         else:
             out_ns = model._dma_ns(rows, cols, out_bits)
+        if self.prologue_specs:
+            act_dmas = [
+                (
+                    model._dma_ns(
+                        *self._prologue_tile(dims, rows, depth), bits
+                    ),
+                    batch_loads(
+                        mapping,
+                        dims,
+                        self.batch,
+                        self.batch if le.ON in dims else 1,
+                    ),
+                )
+                for dims, bits in self.prologue_specs
+            ]
+        else:
+            act_dmas = [
+                (
+                    act_ns,
+                    batch_loads(mapping, INPUT_DIMS, self.batch, self.batch),
+                )
+            ]
         dmas = [
             (out_ns, steps // num_k),
-            (
-                act_ns,
-                batch_loads(mapping, INPUT_DIMS, self.batch, self.batch),
-            ),
+            *act_dmas,
             (
                 weight_ns,
                 batch_loads(
@@ -788,7 +909,8 @@ class TrainiumGemm(OpModel):
 class TrainiumGrid(OpModel):
     """A vector op or a matrix-vector GEMM under ``TrainiumModel``, cut into
     a grid of SBUF tiles by the shared grid search: the fit both share, of
-    the tiles each kind of op cuts its buffers into (``operand_shapes``).
+    the tiles each kind of op cuts its buffers into (``operand_shapes``) and
+    how often its sweep moves each (``transfers``).
 
     Judged in the parent, so it keeps its node, and reads what every
     candidate shares off the graph once, when it is prepared.
@@ -854,22 +976,23 @@ class TrainiumGrid(OpModel):
 
     def fit(self, tiling):
         """``Placement()`` when the translator lowers the tile's MX arrays
-        (``_mx_lowerable``) and every buffer fits SBUF in its pipeline slots,
-        beside the statistics a normalization keeps, else ``None``."""
-        node, model = self.node, self.model
+        (``_mx_lowerable``) and every buffer fits SBUF, else ``None``.  A
+        row op's statistics live in the translator's temporaries, inside the
+        ``scratchpad_offset`` reserve.
+
+        A buffer takes the slots the bufferizer gives it: two for one the
+        sweep moves more than once, one for one it moves once and holds.
+        """
+        model = self.model
         config = model.config
         shapes = self.operand_shapes(tiling)
         mx = self._mx_tiles(shapes)
         if not self._mx_lowerable(mx):
             return None
         needed = 0
-        for n, shape in shapes.items():
-            if shape is not None:
-                needed += config.num_slots * model._buffer_sbuf(n, shape, mx)
-        for _, shape, dtype in reduction_scratch(node, shapes[node], 1):
-            needed += sbuf_bytes(
-                *_rows_cols(shape), get_dtype_width(dtype), config.partitions
-            )
+        for n, shape, count in self.transfers(shapes, tiling):
+            slots = config.num_slots if count > 1 else 1
+            needed += slots * model._buffer_sbuf(n, shape, mx)
         return Placement() if needed <= config.usable_scratchpad_size else None
 
 
@@ -891,6 +1014,11 @@ class TrainiumVector(TrainiumGrid):
         (``vector_operand_shapes``)."""
         return vector_operand_shapes(self.node, tiling)
 
+    def transfers(self, shapes, tiling):
+        """Each buffer the sweep moves, with its tile in ``shapes`` and how
+        often (``vector_transfers``)."""
+        return vector_transfers(self.node, shapes, tiling.grid)
+
     def cost(self, tiling, placement):
         """The tile sweep in TensorE cycles, and its DRAM bytes.
         ``placement`` is the contract's."""
@@ -902,11 +1030,79 @@ class TrainiumVector(TrainiumGrid):
         if self.quantizes_mx:
             busy.update(model.quantize_mx_busy(rows, cols))
         mx = self._mx_tiles(shapes)
-        moves = vector_transfers(self.node, shapes, tiling.grid)
+        moves = self.transfers(shapes, tiling)
         dmas = [(model._buffer_dma_ns(n, s, mx), c) for n, s, c in moves]
         compute = max(busy.values(), default=0.0)
         latency = model.sweep_ns(dmas, math.prod(tiling.grid), compute)
         return Cost(latency * model.config.frequency, _traffic(moves))
+
+
+class TrainiumPool(OpModel):
+    """An NCHW 2-D max pool, one output row per partition: partition ``p``
+    holds output row ``p``'s ``kH`` input rows side by side, so a tile has at
+    most a partition's worth of output rows.
+
+    Attributes:
+        node: The pool, a bare op: nothing fuses into one.
+        model: The ``TrainiumModel``.
+        space: ``TrainiumModel.grid_space``.
+        key: ``None``: a grid search is not shared.
+        input: The node the pool reads, whose tile is the halo.
+        kernel: ``(kH, kW)``.
+        bits: The element width.
+    """
+
+    key = None
+
+    def __init__(self, node, model):
+        self.node = node
+        self.model = model
+        self.space = model.grid_space
+        anchor = get_anchor_node(node)
+        self.input = anchor.args[0]
+        self.kernel = _pair(get_arg_value(anchor, 1, "kernel_size"))
+        self.bits = _bits(node)
+
+    def _tiles(self, tiling):
+        """``(rows, cols, in_cols)`` under ``tiling``: the output tile as
+        rows and columns, and the halo's columns."""
+        shapes = pool_operand_shapes(self.node, tiling)
+        rows, cols = _rows_cols(shapes[self.node])
+        return rows, cols, shapes[self.input][-1]
+
+    def fit(self, tiling):
+        """``Placement()`` when the output rows fit the partitions and, in
+        their pipeline slots, the strip tile (``kH`` halo rows per output
+        row), the output tile and the translator's vertical-max temporary
+        fit SBUF, else ``None``."""
+        config = self.model.config
+        p = config.partitions
+        rows, cols, in_cols = self._tiles(tiling)
+        if rows > p:
+            return None
+        strips = sbuf_bytes(rows, self.kernel[0] * in_cols, self.bits, p)
+        output = sbuf_bytes(rows, cols, self.bits, p)
+        vertical = sbuf_bytes(rows, in_cols, self.bits, p)
+        needed = config.num_slots * (strips + output + vertical)
+        return Placement() if needed <= config.usable_scratchpad_size else None
+
+    def cost(self, tiling, placement):
+        """The tile sweep in TensorE cycles, and its DRAM bytes: each step
+        loads its strips and stores its output tile.  ``placement`` is the
+        contract's."""
+        model = self.model
+        rows, cols, in_cols = self._tiles(tiling)
+        kh, kw = self.kernel
+        steps = math.prod(tiling.grid)
+        compute = (kh - 1) * model._engine_ns("vector", in_cols, self.bits)
+        compute += (kw - 1) * model._engine_ns("vector", cols, self.bits)
+        dmas = [
+            (model._dma_ns(rows, cols, self.bits), steps),
+            (model._dma_ns(rows * kh, in_cols, self.bits), steps),
+        ]
+        latency = model.sweep_ns(dmas, steps, compute)
+        moved = steps * rows * (cols + kh * in_cols) * self.bits // 8
+        return Cost(latency * model.config.frequency, moved)
 
 
 class TrainiumGemv(TrainiumGrid):
@@ -937,6 +1133,11 @@ class TrainiumGemv(TrainiumGrid):
         """Each buffer the kernel holds -> its tile under ``tiling``
         (``gemv_operand_shapes``)."""
         return gemv_operand_shapes(self.node, tiling)
+
+    def transfers(self, shapes, tiling):
+        """Each buffer the sweep moves, with its tile in ``shapes`` and how
+        often (``gemv_transfers``)."""
+        return gemv_transfers(self.node, shapes, tiling.grid)[1]
 
     def cost(self, tiling, placement):
         """The tile sweep in TensorE cycles, and its DRAM bytes.

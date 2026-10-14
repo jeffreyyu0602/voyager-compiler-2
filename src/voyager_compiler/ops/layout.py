@@ -25,16 +25,18 @@ NHWC_TO_NCHW = (0, 3, 1, 2)
 OIHW_TO_HWIO = (2, 3, 1, 0)
 HWIO_TO_OIHW = (3, 2, 0, 1)
 
+# The two memory orders of the 4-D feature maps that conv2d, the 2-D pools
+# and the ops connected to them work in: ``"nchw"`` (channels first,
+# PyTorch's order) and ``"nhwc"`` (channels last).
+TENSOR_LAYOUTS = ("nchw", "nhwc")
+DEFAULT_TENSOR_LAYOUT = "nchw"
+
 # The two GEMM weight layouts: ``"kc"`` = [out, contraction] (aten
 # linear's native weight layout), ``"ck"`` = [contraction, out] (aten
-# matmul's native right-operand layout).
+# matmul's native right-operand layout).  The default serves both the
+# matrix-matrix and the matrix-vector weight layout.
 GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
 DEFAULT_GEMM_WEIGHT_LAYOUT = "kc"
-
-# Matrix-matrix only; a matrix-vector weight follows ``--gemv_weight_layout``.
-POLICY_GEMM_WEIGHT_LAYOUT = {"pytorch": "kc", "systolic": "ck"}
-LAYOUT_POLICIES = tuple(POLICY_GEMM_WEIGHT_LAYOUT)
-DEFAULT_LAYOUT_POLICY = "pytorch"
 
 
 def project(per_axis: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:

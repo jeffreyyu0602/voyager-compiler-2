@@ -8,9 +8,10 @@ documented figures for one core:
 
 - NKI architecture guides (``nki/guides/architecture/trainium2_arch``):
   SBUF 128 partitions x 224 KiB (28 MiB) on NeuronCore-v3, TensorE 128 x 128
-  at 2.4 GHz with FP8 at twice the BF16 rate, a moving operand of at most 512
-  columns (one 2 KiB PSUM bank of float32), VectorE at 0.96 GHz moving 512
-  16-bit (256 wider) elements a cycle, ScalarE at 1.2 GHz moving 128.
+  at 2.4 GHz with FP8 at twice the BF16 rate and FP32 at a quarter of it (20
+  vs 79 dense TFLOPS), a moving operand of at most 512 columns (one 2 KiB
+  PSUM bank of float32), VectorE at 0.96 GHz moving 512 16-bit (256 wider)
+  elements a cycle, ScalarE at 1.2 GHz moving 128.
 - NKI DMA bandwidth guide: 16 DMA engines per core at 23 B/ns (TRN2) or
   33 B/ns (TRN3), about 1300 ns from semaphore to transfer start, and
   transfers under 2 KiB per partition bound by per-packet overhead.
@@ -50,6 +51,9 @@ class TrainiumConfig(AcceleratorConfig):
         instruction_overhead_cycles: Fixed cycles each engine instruction
             costs on top of its elements.
         fp8_matmul_speedup: TensorE's FP8 rate over its 16-bit rate.
+        fp32_matmul_rate: TensorE's FP32 matmul rate over its 16-bit rate.
+        fp32_transpose_rate: TensorE's FP32 transpose rate over its 16-bit
+            rate.
         dma_issue_ns: Time to issue one ``dma_copy``.
         dma_row_overhead_bytes: Per-partition packet overhead, so a row of
             ``b`` bytes moves at the rate of ``b + dma_row_overhead_bytes``.
@@ -65,6 +69,8 @@ class TrainiumConfig(AcceleratorConfig):
     scalar_elements: int = 1
     instruction_overhead_cycles: int = 64
     fp8_matmul_speedup: float = 2.0
+    fp32_matmul_rate: float = 0.25
+    fp32_transpose_rate: float = 0.5
     dma_issue_ns: float = 600.0
     dma_row_overhead_bytes: int = 512
     kernel_overhead_ns: float = 0.0
@@ -101,10 +107,15 @@ def _core(target, sbuf_bytes, dram_bandwidth):
     )
 
 
-# The ``transform`` layouts: weights K-major (``[contraction, out]``), so a
-# weight tile lands with the contraction on the partitions TensorE contracts
-# over.
-LAYOUT = {"layout_policy": "systolic", "gemv_weight_layout": "ck"}
+# The ``transform`` layouts: every GEMM weight contraction-major (``"ck"``,
+# [in, out]; in the kc/ck naming K is the output dim), so a weight tile lands
+# with the contraction on the partitions TensorE contracts over, and feature
+# maps NCHW, so a pool tile has H on the partitions and W on the free axis.
+LAYOUT = {
+    "tensor_layout": "nchw",
+    "gemm_weight_layout": "ck",
+    "gemv_weight_layout": "ck",
+}
 
 TRN2 = _core("trn2", 28 << 20, 16 * 23.0)
 TRN3 = _core("trn3", 30 << 20, 16 * 33.0)

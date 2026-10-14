@@ -19,6 +19,7 @@ from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler.codegen.node_info import (
     _pair,
+    activation_prologue,
     activation_transforms,
     ancestors,
     bound_operands,
@@ -33,19 +34,17 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
     reduced_input_grid,
     reduced_input_tiling,
-    reduction_op,
-    reduction_scratch,
     relayout_view_shape,
     stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
 )
-from voyager_compiler.codegen.subgraph import copy_graph_module
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     commit,
     oracle_disabled,
+    with_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _build_fused_gm,
@@ -2469,8 +2468,9 @@ class _GemmPlan:
         in_specs: One block spec per operand, ``None`` for a whole-tensor one.
         out_specs: The group's outputs.
         kw_idx: Operand index of each tensor kwarg the op takes.
-        gemm_kernel: ``(in_tiles, first) -> tile``, the GEMM (plus any weight
-            decode) on one step; ``first`` says whether the bias folds in.
+        gemm_kernel: ``(in_tiles, first) -> tile``, the GEMM (plus any
+            activation prologue and weight decode) on one step; ``first``
+            says whether the bias folds in.
         fused_gm: The fused tail, or ``None``.
         fused_idx: Operand indices the fused tail consumes after the GEMM.
         outline_dps: Whether the built gm needs ``outline_dps_ops``.
@@ -2634,10 +2634,35 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
 
     bound = bound_operands(node, node.meta.get("submodule"))
     src = lambda n: bound.get(n, n)
-    node_to_spec = {
-        src(act_node): (act_node.value.clone(), act_spec),
-        src(weight_node): (weight, weight_spec),
-    }
+    node_to_spec = {src(weight_node): (weight, weight_spec)}
+
+    # A prologue computes the activation on each step's tile, from operands
+    # that tile like the activation, right-aligned on its (M, K) tile.  Its
+    # ops run as their own graph on those tiles; with a split N they rerun
+    # for every N tile.
+    prologue = activation_prologue(node)
+    pro_phs, pro_gm = [], None
+    if prologue:
+        pro_phs = [
+            n
+            for n in node.meta["submodule"].graph.nodes
+            if n.op == "placeholder"
+            and any(n in op.all_input_nodes for op in prologue)
+        ]
+        act_counts = tuple(b // t for b, t in zip(out_batch, tb))
+        act_counts += (M // tm, K // tk)
+        act_map = tuple(range(nb)) + (gm, gk)
+        for p in pro_phs:
+            spec = _compute_input_spec(act_counts, tuple(p.shape), act_map)
+            node_to_spec[src(p)] = (p.value.clone(), spec)
+        graph = torch.fx.Graph()
+        remap = {p: graph.placeholder(p.name) for p in pro_phs}
+        for n in prologue:
+            remap[n] = graph.node_copy(n, remap.__getitem__)
+        graph.output(remap[act_node])
+        pro_gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    else:
+        node_to_spec[src(act_node)] = (act_node.value.clone(), act_spec)
 
     # Bias [N] tiles along N (grid dim ``gn``); folded once on the k==0 step.
     bias_n = get_arg_value(anchor, 2, "bias")
@@ -2748,7 +2773,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     inputs = [node_to_spec[n][0] for n in node.all_input_nodes]
     in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
 
-    act_idx = order[src(act_node)]
+    act_idx = None if prologue else order[src(act_node)]
+    pro_idx = [order[src(p)] for p in pro_phs]
     weight_idx = order[src(weight_node)]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
@@ -2777,7 +2803,12 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         ``first`` reduction step the bias folds straight in; later steps only
         accumulate partials, which must not re-add it.
         """
-        act_tile = in_tiles[act_idx]
+        if pro_gm is None:
+            act_tile = in_tiles[act_idx]
+        else:
+            # Compute the activation tile from its operands' tiles -- the
+            # graph's own ops, on tiles, like the weight decode below.
+            act_tile = pro_gm(*(in_tiles[i] for i in pro_idx))
         weight_tile = in_tiles[weight_idx]
         if dq_target is not None:
             # Decode the packed tile in place of the weight -- the same call the
@@ -2897,54 +2928,18 @@ def _apply_relayout(node, *seqs, invert=False):
     return tuple(tuple(s[p] for p in perm) for s in seqs)
 
 
-def _naming_scratch(submod, names):
-    """``submod`` with its batched reduction retargeted at the twin that names
-    the scratch, taking one extra placeholder per region appended to the
-    operands.  Returned unchanged when the group holds no such reduction; the
-    original is never mutated (it is the graph's ``meta['submodule']``)."""
-    if not names:
-        return submod
-    gm = copy_graph_module(submod)
-    reduction = next(
-        (n for n in gm.graph.nodes if reduction_op(n) is not None), None
-    )
-    if reduction is None:
-        return submod
-
-    # The scratch placeholders have to come last in the signature (the kernel
-    # passes them after the loaded tiles) *and* before the reduction that reads
-    # them.  Export can leave a lifted constant placeholder after the compute,
-    # so gather the block to the front before appending to it.
-    phs = [p for p in gm.graph.nodes if p.op == "placeholder"]
-    anchor = phs[0]
-    for ph in phs[1:]:
-        anchor.append(ph)
-        anchor = ph
-
-    extra = []
-    for name in names:
-        with gm.graph.inserting_after(anchor):
-            anchor = gm.graph.placeholder(f"scratch_{name}")
-        extra.append(anchor)
-
-    reduction.target = reduction_op(reduction)
-    reduction.kwargs = {**reduction.kwargs, **dict(zip(names, extra))}
-    gm.graph.lint()
-    gm.recompile()
-    return gm
-
-
 def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
-    ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
-    standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
-    writes each output tile once (no cross-tile reduction) -- except a max of
-    a whole tensor into one value (``is_full_reduction``), which tiles its
-    input and folds every tile into that value (``_running_max_kernel``).
+    ops, layernorm·rmsnorm·softmax whose reduction dim is kept whole in the
+    tile, and a standalone ``transpose`` / ``permute`` relayout).  Tiles the
+    output grid and writes each output tile once (no cross-tile reduction) --
+    except a max of a whole tensor into one value (``is_full_reduction``),
+    which tiles its input and folds every tile into that value
+    (``_running_max_kernel``).
 
-    A batched reduction also reserves the on-chip regions its backend kernel
-    keeps beside its tiles (``reduction_scratch``); the kernel ignores them, so
-    the reservation *is* the declaration.  Returns the gm, or ``None``.
+    The op runs beside the on-chip regions its backend's kernel keeps
+    (``with_scratch``); nothing reads them, so naming them *is* the
+    declaration.  Returns the gm, or ``None``.
     """
     anchor = get_anchor_node(node)
     tiling = vector_op_tiling(node, tiler)
@@ -2965,9 +2960,8 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         if isinstance(node.value, (list, tuple))
         else [tiled_shape]
     )
-    # The regions the backend keeps between its passes.  The kernel hands them
-    # to the op, which names them and never reads them.
-    scratch = reduction_scratch(node, tiled_shape, tiler.config.vector_lanes)
+    # The regions the backend keeps beside the op, handed to it by name.
+    scratch = tiler.model.kernel_scratch(node, tiled_shape)
     scratch_names = [name for name, _, _ in scratch]
 
     if node.op == "call_module":
@@ -2983,8 +2977,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
                 continue
             for cb in quant_param_arg_nodes(sn):
                 codebooks.add(bound.get(cb, cb))
-
-        compute = _naming_scratch(submod, scratch_names)
+        op = submod
 
     else:
         # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
@@ -3002,14 +2995,10 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         }
         op_args = [_plain(a) for a in node.args]
         op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
-        # A batched reduction is traced against the twin that names its
-        # scratch, which takes the same operands plus one keyword per region.
-        op = reduction_op(node) or node.target
+        target = node.target
         codebooks = quant_param_arg_nodes(node)
-        n_scratch = len(scratch_names)
 
-        def compute(*tiles):
-            end = len(tiles) - n_scratch
+        def op(*tiles):
             args = [
                 tiles[i] if i is not None else a
                 for i, a in zip(arg_slots, op_args)
@@ -3018,8 +3007,13 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
                 k: tiles[i] if i is not None else op_kwargs[k]
                 for k, i in kw_slots.items()
             }
-            kwargs.update(zip(scratch_names, tiles[end:]))
-            return op(*args, **kwargs)
+            return target(*args, **kwargs)
+
+    def compute(*tiles):
+        end = len(tiles) - len(scratch)
+        return with_scratch(
+            op, tiles[:end], dict(zip(scratch_names, tiles[end:]))
+        )
 
     if node.target in (
         torch.ops.aten.transpose.int,

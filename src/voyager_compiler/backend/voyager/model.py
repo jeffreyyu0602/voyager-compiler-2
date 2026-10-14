@@ -12,9 +12,12 @@ attention.
 
 import math
 
+import torch
+
 import interstellar
 from voyager_compiler.codegen.node_info import (
     get_anchor_node,
+    get_arg_value,
     is_conv2d,
     is_fully_connected,
     is_gemm_op,
@@ -135,6 +138,25 @@ def _matrix_space(config):
     return MatrixSpace(architecture, schedule)
 
 
+# The regions the vector unit keeps beside a batched reduction's tile between
+# its passes: its statistics (one value per row), then its tile-sized
+# regions.  A softmax holds a max and a sum, a layer_norm a mean and a
+# variance plus the normalized tile, an rms_norm a mean square.
+_SCRATCH_REGIONS = {
+    torch.ops.aten.softmax.int: (("max", "sum"), ()),
+    torch.ops.aten.layer_norm.default: (("mean", "variance"), ("normalized",)),
+    torch.ops.aten.rms_norm.default: (("mean_square",), ()),
+}
+
+
+def _reduced_dims(node, ndim: int) -> set:
+    """The dims ``node`` reduces over, as non-negative indices."""
+    if node.target is torch.ops.aten.softmax.int:
+        return {get_arg_value(node, 1, "dim", -1) % ndim}
+    normalized_shape = get_arg_value(node, 1, "normalized_shape") or ()
+    return set(range(ndim - len(normalized_shape), ndim))
+
+
 class VoyagerModel(RuntimeModel):
     """A Voyager accelerator: a weight-stationary PE array behind a banked
     scratchpad, a vector unit ``config.vector_lanes`` wide, one DRAM
@@ -175,16 +197,57 @@ class VoyagerModel(RuntimeModel):
         anchor = get_anchor_node(node)
         if is_gemm_op(anchor):
             if is_fully_connected(anchor):
-                return VoyagerGemv(node, self.grid_space, self.config)
+                return VoyagerGemv(node, self.grid_space, self)
             if is_conv2d(anchor) and matrix_layer(anchor).nifm == 3:
                 return None
             return VoyagerGemm.from_node(node, self)
         if is_pooling(anchor):
-            return VoyagerPool(node, self.pool_space, self.config)
-        return VoyagerVector(node, self.grid_space, self.config)
+            return VoyagerPool(node, self.pool_space, self)
+        return VoyagerVector(node, self.grid_space, self)
 
     def prepare_attention(self, node, acc_dtype, bool_mask):
         """A ``VoyagerAttention`` for the flash-attention ``node``."""
         return VoyagerAttention(
             node, self.attention_space, self.config, acc_dtype, bool_mask
         )
+
+    def kernel_scratch(self, node, out_tile):
+        """The regions the vector unit keeps beside an op's tiles that no FX
+        node names: a batched reduction's (a norm's, a softmax's) between its
+        passes, and none for any other op.
+
+        A statistic is one value per row, held across a lane group; a
+        tile-sized region (layer_norm's normalized output) is the whole tile.
+        A fused group is scanned whole: its reduction need not be its anchor.
+
+        Args:
+            node: The op being bufferized or tiled, bare or fused.
+            out_tile: One tile of ``node``'s output, or one per output, the
+                last naming the iteration space.
+
+        Returns:
+            ``[(name, shape, dtype), ...]``, one per region, in the physical
+            dtype of the op's input.
+        """
+        if not out_tile:
+            return []
+        if isinstance(out_tile[0], (tuple, list)):
+            out_tile = out_tile[-1]
+        tile = tuple(out_tile)
+
+        submod = node.meta.get("submodule")
+        ops = submod.graph.nodes if submod is not None else [node]
+        scratch = []
+        for op in ops:
+            if op.target not in _SCRATCH_REGIONS:
+                continue
+            stat_names, tile_names = _SCRATCH_REGIONS[op.target]
+            reduced = _reduced_dims(op, len(tile))
+            stat = list(tile)
+            for i in reduced:
+                stat[i] = 1
+            stat[max(reduced)] = self.config.vector_lanes
+            dtype = get_arg_value(op, 0, "input").value.dtype
+            scratch += [(name, tuple(stat), dtype) for name in stat_names]
+            scratch += [(name, tile, dtype) for name in tile_names]
+        return scratch

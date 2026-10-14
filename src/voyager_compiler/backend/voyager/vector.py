@@ -28,6 +28,7 @@ import torch
 
 from voyager_compiler.codegen.node_info import (
     LAYER_NORM_OPS,
+    RMS_NORM_OPS,
     SOFTMAX_OPS,
     _pair,
     bound_operands,
@@ -36,7 +37,6 @@ from voyager_compiler.codegen.node_info import (
     is_full_reduction,
     is_fully_connected,
     is_pooling,
-    reduction_scratch,
     require_allocation,
     stream_breaking_quantize,
     tensor_alloc_bytes,
@@ -77,16 +77,20 @@ logger = logging.getLogger(__name__)
 # ``vector_op_utilization``.
 IN, MID, OUT = "in", "mid", "out"
 _LAYER_NORM_PASSES = [(IN, None), (IN, None), (IN, MID), (MID, OUT)]
+# The mean square is reduced on the first pass and overwritten with its rstd,
+# which the second applies with the weight.
+_RMS_NORM_PASSES = [(IN, None), (IN, OUT)]
 _SOFTMAX_PASSES = [(IN, None), (IN, None), (IN, OUT)]
 OP_PASSES = {
     **dict.fromkeys(LAYER_NORM_OPS, _LAYER_NORM_PASSES),
+    **dict.fromkeys(RMS_NORM_OPS, _RMS_NORM_PASSES),
     **dict.fromkeys(SOFTMAX_OPS, _SOFTMAX_PASSES),
 }
 
 # Cycles a pass costs the vector unit whatever it holds: params, instruction
 # issue and pipeline fill/drain.  Fixed per pass, so a tile too small to
 # amortise it is dominated by overhead.  96 on every layer_norm and softmax
-# pass the Sphinx RTL measured.
+# pass the Sphinx RTL measured; an rms_norm pass is charged the same.
 KERNEL_LAUNCH_OVERHEAD = 96
 
 # Cycles a read stream loses each time consecutive requests move to another
@@ -652,14 +656,16 @@ class VoyagerVector(OpModel):
         node: The op.
         space: Its ``GridSpace``.
         key: ``None``: a grid search shares no result.
+        model (VoyagerModel): The model that prepared it.
         config (AcceleratorConfig): The hardware description.
     """
 
-    def __init__(self, node, space, config):
+    def __init__(self, node, space, model):
         self.node = node
         self.space = space
         self.key = None
-        self.config = config
+        self.model = model
+        self.config = model.config
         self.anchor = get_anchor_node(node)
         # The role each loaded buffer plays for a GEMM anchor, which picks its
         # bank (``GEMV_BANK_GROUPS``).
@@ -680,8 +686,8 @@ class VoyagerVector(OpModel):
             self._running_bytes = tensor_alloc_bytes(
                 1,
                 self.anchor.value.dtype,
-                config.bank_width,
-                config.vector_lanes,
+                self.config.bank_width,
+                self.config.vector_lanes,
             )
 
     def operand_shapes(self, tiling):
@@ -777,16 +783,15 @@ class VoyagerVector(OpModel):
 
     def _reserved_bytes(self, shapes):
         """Bytes of the regions the kernel keeps beside its buffers that no
-        FX node names: a batched reduction's intermediates
-        (``reduction_scratch``) and a reduction to one value's running
-        result."""
+        FX node names: the model's scratch regions for the op and a
+        reduction to one value's running result."""
         config = self.config
         reserved = sum(
             tensor_alloc_bytes(
                 math.prod(shape), dtype, config.bank_width, config.vector_lanes
             )
-            for _, shape, dtype in reduction_scratch(
-                self.node, shapes[self.node], config.vector_lanes
+            for _, shape, dtype in self.model.kernel_scratch(
+                self.node, shapes[self.node]
             )
         )
         return reserved + self._running_bytes
@@ -809,8 +814,8 @@ class VoyagerGemv(VoyagerVector):
     vector op's, plus the accumulator a fused tail reduces into, and priced
     by ``gemv_tile_latency``."""
 
-    def __init__(self, node, space, config):
-        super().__init__(node, space, config)
+    def __init__(self, node, space, model):
+        super().__init__(node, space, model)
         sub_gm = node.meta.get("submodule")
         ops = []
         if sub_gm is not None:
