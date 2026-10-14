@@ -961,7 +961,7 @@ def _accumulate_fisher(model, calibration, operands, grid, tap_weights):
             # input band's columns, in the same row-major cell order the
             # collection indexes.
             counts = _resolve_counts(
-                grid[name], (grad.shape[-1], activation.shape[-1])
+                grid[name], (grad.shape[-1], rows.shape[-1])
             )
             per = torch.stack(
                 [

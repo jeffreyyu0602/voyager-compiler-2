@@ -493,7 +493,7 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
 
     orig_fq_users = list(node.users.keys())
     input_node = node.args[0]
-    if input_node.op == "get_attr":
+    if _is_weight(model, input_node):
         # Quantize weight and remove the fq module
         param = fetch_attr(model, input_node.target)
         param.data = torch.ops.quantized_ops.quantize(
@@ -624,8 +624,21 @@ _GEMMS = (
 
 
 def _replace_observer_with_quantize_mx_node_decomposed(
-    model: torch.fx.GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
+    model: torch.fx.GraphModule,
+    node: Node,
+    modules: Dict[str, torch.nn.Module],
+    seed: Optional[Node] = None,
 ):
+    """Replace a microscaling fake-quant with a ``quantize_mx`` and the ops
+    reading it with their ``_mx`` twins.
+
+    Args:
+        model: Graph rewritten in place.
+        node: The fake-quant's ``call_module``.
+        modules: ``model``'s modules by name.
+        seed: int64 scalar an activation's ``quantize_mx`` rounds
+            stochastically under, or None to round to the nearest value.
+    """
     graph = model.graph
     assert modules is not None
     assert isinstance(node.target, str)
@@ -633,6 +646,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     device = assert_and_get_unique_device(activation_post_process)
 
     input_node = node.args[0]
+    is_weight = _is_weight(model, input_node)
     input_dtype = activation_post_process.dtype
     node_to_quantize = input_node
 
@@ -687,7 +701,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             dequant_code = create_getattr_from_value(
                 model, graph, "code", entries
             )
-            if input_node.op != "get_attr":
+            if not is_weight:
                 midpoints = (values[..., :-1] + values[..., 1:]) / 2
                 quant_code = create_getattr_from_value(
                     model, graph, "code", midpoints
@@ -702,9 +716,13 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         raise NotImplementedError(
             "A global scale with outlier filtering has no lowering yet"
         )
+    if seed is not None and filters_outliers:
+        raise NotImplementedError(
+            "Stochastic rounding with outlier filtering has no lowering yet"
+        )
 
     get_attr_node = scale_qmap = global_scale_node = None
-    if input_node.op == "get_attr":
+    if is_weight:
         # quantize model parameter and remove the fq module
         param = fetch_attr(model, input_node.target)
 
@@ -788,8 +806,9 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     torch.ops.aten.clamp_min.default,
                     (ratio, torch.finfo(torch.float32).tiny),
                 )
-                # No seed: a converted graph rounds to nearest.
-                args += [None, global_scale_node]
+
+            if seed is not None or uses_global_scale:
+                args += [seed, global_scale_node]
 
             if activation_post_process.outlier_threshold is not None:
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
@@ -898,9 +917,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 )
             else:
                 kwargs.setdefault("weight_code", kwarg1)
-        elif input_node.op == "get_attr" or id(quantized_node) == id(
-            user.args[1]
-        ):
+        elif is_weight or id(quantized_node) == id(user.args[1]):
             kwargs.setdefault("weight_code", kwarg1)
             kwargs.setdefault("weight_scale", kwarg2)
         else:
@@ -1046,6 +1063,12 @@ def _is_written_buffer(model: GraphModule, node: Node) -> bool:
             if operand.op == "get_attr" and operand.target == node.target:
                 return True
     return False
+
+
+def _is_weight(model: GraphModule, node: Node) -> bool:
+    """Whether ``node`` reads a tensor that is quantized once, at convert: a
+    ``get_attr`` the graph never writes (see ``_is_written_buffer``)."""
+    return node.op == "get_attr" and not _is_written_buffer(model, node)
 
 
 def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(

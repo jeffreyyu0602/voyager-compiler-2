@@ -1197,18 +1197,19 @@ def _is_split_cache(graph: Graph, node) -> bool:
 def _fold_quantize_into_split_cache(
     model: GraphModule, node: Node, folds: dict
 ) -> bool:
-    """Fold a dynamic quantize (``quantize_affine`` or ``quantize_mx``) over
-    a split KV cache into the cache.
+    """Fold a quantize (``quantize_affine``, ``quantize_mx`` or a plain
+    ``quantize``) over a split KV cache into the cache.
 
     The quantize sweeps the whole main cache every step, though only whole,
     block-aligned chunks are ever written into it.  So the buffer is baked
     quantized once, into one buffer per quantize output
-    (``<cache>_scale`` [/ ``_zero_point``] / ``_full``), the read path takes
-    those, and the fold's ``cond`` quantizes the residual instead -- ``R``
-    positions, on the completing step only -- storing its outputs into the
-    baked buffers at the chunk's entries.  The chunk's blocks are its own
-    because ``R`` is a multiple of the block size, so this is the arithmetic
-    the sweep did, on the chunk alone.
+    (``<cache>_scale`` [/ ``_zero_point``] / ``_full``; a plain quantize has
+    its codes alone, ``_full``), the read path takes those, and the fold's
+    ``cond`` quantizes the residual instead -- ``R`` positions, on the
+    completing step only -- storing its outputs into the baked buffers at
+    the chunk's entries.  The chunk's blocks are its own because ``R`` is a
+    multiple of the block size, and a plain quantize's scale is a constant,
+    so this is the arithmetic the sweep did, on the chunk alone.
 
     Returns:
         ``True`` if ``node`` read a split cache and was folded.
@@ -1226,18 +1227,24 @@ def _fold_quantize_into_split_cache(
     write = _fold_write(graph, cache.target)
     if write is None:
         return False
-    outs = {}
-    for user in node.users:
-        if user.target is not operator.getitem:
-            return False
-        outs[user.args[1]] = user
+    # A plain quantize returns its codes alone; the others return their
+    # qparams beside the value, each read through a getitem.
+    plain = node.target is _QUANTIZE
+    if plain:
+        names, outs = ("full",), {0: node}
+    else:
+        names, outs = _OUTPUT_NAMES[node.target], {}
+        for user in node.users:
+            if user.target is not operator.getitem:
+                return False
+            outs[user.args[1]] = user
 
     _, dim, offsets, folded = write.args
     residual = folded.args[1]
     dim %= cache.value.ndim
     length = residual.value.shape[dim]
-    block_size = node.args[3]
-    if length % block_size:
+    block_size = get_arg_value(node, 4, "block_size") if plain else node.args[3]
+    if block_size is not None and length % block_size:
         raise ValueError(
             f"{cache.target}: a {length}-position residual is not a whole "
             f"number of {block_size}-wide blocks"
@@ -1264,12 +1271,14 @@ def _fold_quantize_into_split_cache(
         for a in node.args[1:]
     ]
     baked = node.target(contents, *consts)
+    if plain:
+        baked = (baked,)
     with graph.inserting_before(node):
         buffers = {
             i: create_getattr_from_value(
                 model, graph, f"{cache.target}_{name}", baked[i]
             )
-            for i, name in enumerate(_OUTPUT_NAMES[node.target])
+            for i, name in enumerate(names)
         }
     for i, old in outs.items():
         buffers[i].meta["dtype"] = old.meta.get("dtype")
@@ -1314,16 +1323,20 @@ def _fold_quantize_into_split_cache(
         (branch.placeholder(residual), *branch.arguments(node.args[1:])),
         dtype=node.meta.get("dtype"),
     )
-    fold = _Fold(
-        cache=cache.target,
-        dim=dim,
-        branch=branch,
-        parts={
+    if plain:
+        parts = {0: chunk}
+    else:
+        parts = {
             i: branch.call(
                 operator.getitem, (chunk, i), dtype=outs[i].meta.get("dtype")
             )
             for i in sorted(outs)
-        },
+        }
+    fold = _Fold(
+        cache=cache.target,
+        dim=dim,
+        branch=branch,
+        parts=parts,
         stores={},
         scale_qmap=(
             get_arg_value(node, 6, "scale_qmap")
@@ -1342,9 +1355,9 @@ def _fold_quantize_into_split_cache(
     for n in reads:
         if not n.users:
             graph.erase_node(n)
-    folds[buffers[_value_index(node.target)].target] = fold
+    folds[buffers[len(names) - 1].target] = fold
 
-    for n in (*outs.values(), node):
+    for n in dict.fromkeys((*outs.values(), node)):
         if not n.users:
             graph.erase_node(n)
     logger.info(
@@ -1627,7 +1640,9 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
     collapses into one dequantize -- extending a split cache's fold with the
     qparams that dequantize reads -- before the ``quantize_mx`` hoist would
     lift the re-encode above the relayouts.  The ``quantize_mx`` hoist and
-    cache fold come last.
+    cache fold come last, with the fold of a plain ``quantize`` over a split
+    cache, which ``convert_pt2e`` leaves in the graph because the graph
+    writes the cache.
 
     Args:
         model: The graph module to rewrite in place.
@@ -1667,6 +1682,8 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
         if node.target is _QUANTIZE_MX:
             if not _fold_quantize_into_split_cache(model, node, folds):
                 _fold_quantize_into_cache(model, node)
+        elif node.target is _QUANTIZE:
+            _fold_quantize_into_split_cache(model, node, folds)
 
     graph.lint()
     graph.eliminate_dead_code()

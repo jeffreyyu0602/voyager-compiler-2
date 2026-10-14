@@ -70,7 +70,9 @@ from voyager_compiler.quantization.codebook_optimizer import _quantized_operands
 logger = logging.getLogger(__name__)
 
 WINDOW = 1024
-BF16_PERPLEXITY = 5.924286365509033
+#: bf16 perplexity in non-overlapping 2048-token scoring windows, the
+#: ``--max_length`` and ``--stride`` defaults.
+BF16_PERPLEXITY = 6.239959
 
 
 def calibration_text(corpus, docs):

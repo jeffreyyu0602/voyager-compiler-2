@@ -17,10 +17,11 @@ taking its type's spec blocked along its GEMM's contraction axis, and
 ``prepare`` inserts the fake-quants.  Everything but the GEMM operands stays
 in high precision, the bias gradient included.
 
-A tensor several GEMMs read, as it is or transposed, with the same spec
-whose values do not depend on the axis -- per-tensor, a plain cast, or
-blocks spanning both axes -- is quantized once: every such GEMM reads one
-fake-quant's output, which the split saves when the backward reads it.
+A tensor several GEMMs read, as it is or through views, with the same spec
+whose values do not depend on the axis -- per-tensor or a plain cast,
+through any view, or blocks spanning both axes, through transposes -- is
+quantized once: every such GEMM reads one fake-quant's output, which the
+split saves when the backward reads it.
 
 For the compiler, a training step is two graphs: ``gradient_program`` runs
 the forward, the loss and the backward, and ``update_program`` the
@@ -28,6 +29,7 @@ optimizer's update.  Each writes the tensors it updates in place.
 """
 
 import copy
+import operator
 import types
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
@@ -48,9 +50,11 @@ from torch._functorch.aot_autograd import (
     make_boxed_func,
 )
 from torch._functorch.partitioners import default_partition
+from torch._dispatch.python import enable_python_dispatcher
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.export._unlift import _check_inputs_match
 from torch.fx import CodeGen, Graph, GraphModule, Node
+from torch.fx.node import map_arg
 from torch.utils import _pytree as pytree
 from torchao.quantization.pt2e import FakeQuantizeBase
 from torchao.quantization.pt2e import prepare as torchao_prepare
@@ -61,9 +65,11 @@ from voyager_compiler.export_utils import (
     export_model,
 )
 from voyager_compiler.quantization.fake_quantize import (
+    SEED_BOUND,
     FusedAmaxObsFakeQuantize,
     MXFakeQuantize,
     RandomHadamardTransform,
+    HADAMARD_SIZE,
     _DerivedObserverOrFakeQuantize,
 )
 from voyager_compiler.quantization.quantize_pt2e import (
@@ -366,13 +372,16 @@ def _is_transpose(node: Node) -> bool:
     return {d % ndim for d in node.args[1:3]} == {ndim - 2, ndim - 1}
 
 
-def _share_quantized_transposes(joint: GraphModule) -> None:
-    """Quantize once a tensor that one GEMM reads and another transposes.
+def _share_quantized_views(joint: GraphModule) -> None:
+    """Quantize once a tensor that one GEMM reads and another views.
 
     ``prepare`` gives a tensor's readers with the same spec one fake-quant.
-    A GEMM operand that transposes a tensor another GEMM reads, both with
-    the same spec quantizing once, becomes such a reader: its transposes
-    are rebuilt to take the tensor through that fake-quant.
+    A GEMM operand that views a tensor another GEMM reads, both with the
+    same spec quantizing once, becomes such a reader: its views are rebuilt
+    to take the tensor through that fake-quant.  A per-tensor scale or a
+    plain cast quantizes each element on its own, so it is shared through
+    any view; blocks spanning both axes only through transposes, which keep
+    each block whole.
 
     Args:
         joint: Annotated joint graph, rewritten in place.
@@ -386,7 +395,9 @@ def _share_quantized_transposes(joint: GraphModule) -> None:
             if spec is None or not _quantized_once(spec):
                 continue
             chain, source, shared = [], operand, False
-            while not shared and _is_transpose(source):
+            while not shared and source.target in _VIEWS:
+                if spec.qscheme in _BLOCKS and not _is_transpose(source):
+                    break
                 chain.append(source)
                 source = source.args[0]
                 shared = any(
@@ -399,10 +410,14 @@ def _share_quantized_transposes(joint: GraphModule) -> None:
                 )
             if not shared:
                 continue
-            copies = {source: source}
+            copies = {}
             with graph.inserting_before(gemm):
                 for node in reversed(chain):
-                    copies[node] = graph.node_copy(node, copies.__getitem__)
+                    # A view's other inputs, such as a symbolic size, are
+                    # read as they are.
+                    copies[node] = graph.node_copy(
+                        node, lambda arg: copies.get(arg, arg)
+                    )
                     # The split places a node by its tag.
                     copies[node].meta["partitioner_tag"] = gemm.meta[
                         "partitioner_tag"
@@ -641,7 +656,7 @@ def prepare_training(
                         "Per-channel specs have no contraction axis to "
                         "quantize along; use per-tensor or block specs"
                     )
-            _share_quantized_transposes(joint)
+            _share_quantized_views(joint)
             torchao_prepare._get_obs_or_fq_map = _get_obs_or_fq_map
             with unset_fake_temporarily():
                 prepared = torchao_prepare.prepare(joint, {}, True)
@@ -791,6 +806,58 @@ def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
             user.replace_input_with(gemm, result)
 
 
+def _insert_rotation(
+    graph: Graph, operand: Node, axis: int, matrix: Node
+) -> Node:
+    """Insert the ops ``_rotate`` runs, at the graph's insertion point.
+
+    A length known at capture is padded only if it needs to be; a symbolic
+    one is padded by a size computed in the graph, zero when it is whole.
+    The matrix is read through a float32 cast of its own, so a pass that
+    narrows the computation to 16 bits narrows it too.  Each node gets its
+    fake value, as capture gives every node, for the passes that read it.
+
+    Args:
+        graph: The program's graph.
+        operand: The tensor to rotate.
+        axis: Its last or second-to-last axis.
+        matrix: The ``get_attr`` of ``hadamard_matrix``, with its fake value.
+
+    Returns:
+        The rotated tensor, in ``operand``'s dtype, its axis padded.
+    """
+
+    def call(target, *args, **kwargs):
+        node = graph.call_function(target, args, kwargs)
+        # Symbolic sizes take the dispatcher tracing uses.
+        with value.fake_mode, enable_python_dispatcher():
+            node.meta["val"] = target(
+                *map_arg(args, lambda arg: arg.meta["val"]), **kwargs
+            )
+        return node
+
+    value = operand.meta["val"]
+    axis %= value.ndim
+    padding = -value.shape[axis] % HADAMARD_SIZE
+    if not isinstance(padding, int):
+        length = call(aten.sym_size.int, operand, axis)
+        padding = call(operator.mod, call(operator.neg, length), HADAMARD_SIZE)
+    if padding:
+        trailing = [0, 0] * (value.ndim - 1 - axis)
+        operand = call(
+            aten.constant_pad_nd.default, operand, [*trailing, 0, padding]
+        )
+    x = call(aten._to_copy.default, operand, dtype=torch.float32)
+    runs = call(aten.unflatten.int, x, axis, [-1, HADAMARD_SIZE])
+    matrix = call(aten._to_copy.default, matrix, dtype=torch.float32)
+    if axis == value.ndim - 1:
+        rotated = call(aten.matmul.default, runs, matrix)
+    else:
+        rotated = call(aten.matmul.default, call(aten.t.default, matrix), runs)
+    flat = call(aten.flatten.using_ints, rotated, axis, axis + 1)
+    return call(aten._to_copy.default, flat, dtype=value.dtype)
+
+
 def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     """Replace each fake-quant of ``program`` with the ops that quantize.
 
@@ -798,6 +865,11 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
     reading it their ``_mx`` twins, as ``convert_pt2e`` lowers an
     activation's.  A weight is a program input that changes every step, so
     it is quantized in the graph like an activation rather than baked.
+    Stochastic rounding draws a fresh seed for each ``quantize_mx`` from
+    torch's generator, as the fake-quant does.  A random Hadamard transform
+    rotates the operand before its ``quantize_mx`` (``_insert_rotation``);
+    where the fake-quant rotates it back, the GEMM multiplies the rotations
+    of its two operands, which cancel, over the padded contraction axis.
 
     A per-tensor fake-quant scales by its delayed-scaling state: its amax
     history and scale become program inputs, named after the fake-quant's
@@ -813,9 +885,9 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             in the model.
 
     Raises:
-        NotImplementedError: A fake-quant's scheme, random Hadamard
-            transform or stochastic rounding has no lowering yet, or a
-            per-tensor quantized tensor is read by an op other than a GEMM.
+        NotImplementedError: A fake-quant's scheme has no lowering yet, a
+            GEMM rotates one of its operands only, or a per-tensor quantized
+            tensor is read by an op other than a GEMM.
     """
     graph = program.graph
     calls = [n for n in graph.nodes if n.target is _fake_quantize]
@@ -848,6 +920,22 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
         states[target] = state
         current[target] = state[1]
 
+    rotated = set()
+    for node in calls:
+        fake_quant = program.get_submodule(node.args[0].target)
+        if (
+            isinstance(fake_quant, RandomHadamardTransform)
+            and fake_quant.fake_quant_enabled
+            and fake_quant.rht_axis is not None
+        ):
+            rotated.add(node)
+    for node in rotated:
+        for gemm in node.users:
+            if not rotated.issuperset(gemm.args[:2]):
+                raise NotImplementedError(
+                    f"{gemm.name} rotates one of its operands only"
+                )
+
     scales = {}
     for node in calls:
         fake_quant_attr, operand = node.args
@@ -857,28 +945,38 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             node.replace_all_uses_with(operand)
             graph.erase_node(node)
             continue
-        if (
-            isinstance(fake_quant, RandomHadamardTransform)
-            and fake_quant.rht_axis is not None
-        ):
-            raise NotImplementedError(
-                "The random Hadamard transform has no lowering yet"
-            )
-        if (
-            isinstance(fake_quant, MXFakeQuantize)
-            and fake_quant.stochastic_rounding
-        ):
-            raise NotImplementedError("Stochastic rounding has no lowering yet")
         if isinstance(fake_quant, MXFakeQuantize):
-            # The lowering replaces the call_module form ``prepare`` leaves.
             with graph.inserting_before(node):
+                # Each call draws a fresh seed, as the fake-quant does.
+                seed = (
+                    graph.call_function(
+                        aten.randint.default,
+                        (SEED_BOUND, []),
+                        {"device": operand.meta["val"].device},
+                    )
+                    if fake_quant.stochastic_rounding
+                    else None
+                )
+                if fake_quant.rht_axis is not None:
+                    matrix = create_getattr_from_value(
+                        program, graph, "rht_matrix", fake_quant.rht_matrix
+                    )
+                    fake_mode = operand.meta["val"].fake_mode
+                    matrix.meta["val"] = fake_mode.from_tensor(
+                        fake_quant.rht_matrix
+                    )
+                    operand = _insert_rotation(
+                        graph, operand, fake_quant.rht_axis, matrix
+                    )
+                # The lowering replaces the call_module form ``prepare``
+                # leaves.
                 call = graph.call_module(target, (operand,))
             call.meta = node.meta
             node.replace_all_uses_with(call)
             graph.erase_node(node)
             modules = dict(program.named_modules(remove_duplicate=False))
             _replace_observer_with_quantize_mx_node_decomposed(
-                program, call, modules
+                program, call, modules, seed
             )
             continue
         if isinstance(fake_quant, FusedAmaxObsFakeQuantize):
@@ -1012,7 +1110,10 @@ def gradient_program(model: nn.Module) -> GraphModule:
         one = graph.call_function(
             aten.full.default,
             ([], 1.0),
-            {"dtype": tangent.meta["val"].dtype},
+            {
+                "dtype": tangent.meta["val"].dtype,
+                "device": tangent.meta["val"].device,
+            },
         )
     one.meta["val"] = tangent.meta["val"]
     tangent.replace_all_uses_with(one)

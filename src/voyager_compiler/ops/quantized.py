@@ -611,27 +611,36 @@ def linear_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    input = _dequantize_mx(input, input_scale, input_code, block_size)
+    decoded_input = _dequantize_mx(input, input_scale, input_code, block_size)
     decoded_weight = _dequantize_mx(
         weight, weight_scale, weight_code, block_size
     )
 
-    # ``alpha`` scales the product alone, so the bias is added after it.
+    # ``alpha`` scales the product alone, so the bias is added after it.  As
+    # the hardware's GEMM does, both apply to the product summed in float32
+    # (or the input's dtype, if wider), rounded to the input's dtype once,
+    # after them.
     gemm_bias = bias if alpha is None else None
+    dtype = decoded_input.dtype
+    if alpha is not None:
+        accumulate = torch.promote_types(dtype, torch.float32)
+        decoded_input = decoded_input.to(accumulate)
+        decoded_weight = decoded_weight.to(accumulate)
 
-    # Call the operator matching the weight's storage layout: aten for
-    # the KC-native layout, the layout twin for a CK-stored weight.
-    if weight_layout == "kc":
-        dense_out = torch.ops.aten.linear(input, decoded_weight, gemm_bias)
-    else:
-        dense_out = torch.ops.quantized_ops.linear(
-            input, decoded_weight, gemm_bias
-        )
+    # The operator matching the weight's storage layout: aten for the
+    # KC-native layout, the layout twin for a CK-stored weight.
+    linear = (
+        torch.ops.aten.linear
+        if weight_layout == "kc"
+        else torch.ops.quantized_ops.linear
+    )
+    dense_out = linear(decoded_input, decoded_weight, gemm_bias)
 
     if alpha is not None:
         dense_out = dense_out * alpha
         if bias is not None:
             dense_out = dense_out + bias
+        dense_out = dense_out.to(dtype)
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -688,18 +697,29 @@ def matmul_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    self = _dequantize_mx(self, input_scale, input_code, block_size)
+    decoded_self = _dequantize_mx(self, input_scale, input_code, block_size)
     decoded_other = _dequantize_mx(other, weight_scale, weight_code, block_size)
 
-    # Call the operator matching the right operand's storage layout:
-    # aten for the CK-native layout, the layout twin for KC storage.
-    if weight_layout == "ck":
-        dense_out = torch.ops.aten.matmul(self, decoded_other)
-    else:
-        dense_out = torch.ops.quantized_ops.matmul(self, decoded_other)
+    # As in ``linear_mx``: ``alpha`` scales the product summed in float32
+    # (or the input's dtype, if wider), rounded to the input's dtype once,
+    # after it.
+    dtype = decoded_self.dtype
+    if alpha is not None:
+        accumulate = torch.promote_types(dtype, torch.float32)
+        decoded_self = decoded_self.to(accumulate)
+        decoded_other = decoded_other.to(accumulate)
+
+    # The operator matching the right operand's storage layout: aten for
+    # the CK-native layout, the layout twin for KC storage.
+    matmul = (
+        torch.ops.aten.matmul
+        if weight_layout == "ck"
+        else torch.ops.quantized_ops.matmul
+    )
+    dense_out = matmul(decoded_self, decoded_other)
 
     if alpha is not None:
-        dense_out = dense_out * alpha
+        dense_out = (dense_out * alpha).to(dtype)
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
