@@ -31,7 +31,7 @@ optimizer's update.  Each writes the tensors it updates in place.
 import copy
 import operator
 import types
-from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -1292,6 +1292,75 @@ def gemm_partners(model: nn.Module) -> Dict[str, Set[str]]:
             partners[first].add(second)
             partners[second].add(first)
     return partners
+
+
+def forward_gemm_operands(
+    model: nn.Module,
+) -> Dict[str, List[Tuple[Node, int]]]:
+    """Each fake-quant of a prepared model feeding forward GEMMs -> where.
+
+    Read off the joint graph ``capture_training`` keeps, as
+    ``gemm_partners`` reads it: a forward GEMM's operand traced back past
+    its views reaches the fake-quant that quantized it.
+
+    Args:
+        model: Model ``prepare_training`` prepared.
+
+    Returns:
+        ``name -> [(GEMM, position)]``, by the names in
+        ``model.training_quantizers``: the forward GEMMs each fake-quant
+        feeds, in graph order, and which of their two operands it is.
+    """
+    joint = model.forward.graphs["joint"]
+    names = {
+        id(module): name
+        for name, module in model.training_quantizers.named_children()
+    }
+    operands = {}
+    for gemm in joint.graph.nodes:
+        if gemm.meta.get("gemm_kind") != "fprop":
+            continue
+        for position, operand in enumerate(gemm.args[:2]):
+            while operand.target in _VIEWS:
+                operand = operand.args[0]
+            if operand.target is _fake_quantize:
+                fake_quant = joint.get_submodule(operand.args[0].target)
+                operands.setdefault(names[id(fake_quant)], []).append(
+                    (gemm, position)
+                )
+    return operands
+
+
+def operand_gradient(gemm: Node, position: int) -> Optional[Node]:
+    """Return the backward GEMM computing a forward GEMM operand's gradient.
+
+    A forward GEMM's backward GEMMs carry its ``seq_nr``, and the dgrad of
+    its operand ``position`` takes the incoming gradient at that same
+    position.
+
+    Args:
+        gemm: A forward GEMM of the joint graph.
+        position: Which of its two operands, 0 or 1.
+
+    Returns:
+        The dgrad node, or None when the operand takes no gradient.
+
+    Raises:
+        ValueError: Several backward GEMMs match.
+    """
+    matches = [
+        node
+        for node in gemm.graph.nodes
+        if node.meta.get("gemm_kind") == "dgrad"
+        and node.meta["seq_nr"] == gemm.meta["seq_nr"]
+        and node.meta["operand_types"][position] == "error"
+    ]
+    if len(matches) > 1:
+        raise ValueError(
+            f"{len(matches)} backward GEMMs compute the gradient of "
+            f"{gemm.name}'s operand {position}"
+        )
+    return matches[0] if matches else None
 
 
 def disable_observers(model: nn.Module) -> None:

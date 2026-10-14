@@ -38,7 +38,11 @@ from voyager_compiler.quantization.fake_quantize import (
     calculate_global_scale,
     entry_levels,
 )
-from voyager_compiler.quantization.training import gemm_partners
+from voyager_compiler.quantization.training import (
+    forward_gemm_operands,
+    gemm_partners,
+    operand_gradient,
+)
 from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
@@ -1570,29 +1574,30 @@ def _install_tables(operands, tables):
 
 @contextlib.contextmanager
 def _reading(model, visit, reads):
-    """Hand each tensor to ``visit`` during the passes run inside.
+    """Hand each read's tensors to ``visit`` during the passes run inside.
 
     A parameter is the same tensor on every calibration input, so reading
     it once is reading it every time: the moments scale together and the
-    solver's minimum stays where it was.  It is read once, off the model,
-    on entry.  Any other tensor is read by a call inserted after the node
-    yielding it, on every forward pass; the calls are erased on exit, which
-    leaves the graph as it was.
+    solver's minimum stays where it was.  A read of one parameter is made
+    once, off the model, on entry.  Any other read is a call inserted after
+    the last node yielding its tensors, on every pass; the calls are erased
+    on exit, which leaves the graph as it was.
 
     Args:
-        model: The prepared graph module.
-        visit: Called as ``visit(key, tensor)`` with each tensor.
-        reads: ``(key, node)`` per tensor: ``node`` yields it.
+        model: The graph module.
+        visit: Called as ``visit(key, *tensors)`` with each read's tensors.
+        reads: ``(key, *nodes)`` per read: the nodes yielding its tensors.
     """
     graph = model.graph
+    order = {node: index for index, node in enumerate(graph.nodes)}
     inserted = []
     try:
-        for key, node in reads:
-            if node.op == "get_attr":
-                visit(key, fetch_attr(model, node.target))
+        for key, *nodes in reads:
+            if len(nodes) == 1 and nodes[0].op == "get_attr":
+                visit(key, fetch_attr(model, nodes[0].target))
                 continue
-            with graph.inserting_after(node):
-                inserted.append(graph.call_function(visit, (key, node)))
+            with graph.inserting_after(max(nodes, key=order.__getitem__)):
+                inserted.append(graph.call_function(visit, (key, *nodes)))
         model.recompile()
         yield
     finally:
@@ -1731,34 +1736,89 @@ def _as_quantized(module, tensor):
     return _rotate(tensor, module.rht_axis, module.rht_matrix)
 
 
+def _training_operand_names(model, operands):
+    """Name each forward GEMM operand of a training graph as
+    ``fit_codebooks`` names an inference graph's.
+
+    A GEMM's scope is the innermost module the export recorded for it.
+
+    Args:
+        model: Model ``prepare_training`` prepared.
+        operands: ``name -> [(GEMM, position)]`` from
+            ``forward_gemm_operands``.
+
+    Returns:
+        ``fake-quant name -> operand name``, after the first GEMM each
+        fake-quant feeds.
+    """
+    scopes, order, seen = {}, {}, {}
+    for gemm in model.forward.graphs["joint"].graph.nodes:
+        if gemm.meta.get("gemm_kind") != "fprop":
+            continue
+        scopes[gemm] = list(gemm.meta["nn_module_stack"].values())[-1][0]
+        key = (scopes[gemm], gemm.target)
+        order[gemm] = seen.get(key, 0)
+        seen[key] = order[gemm] + 1
+    return {
+        name: _operand_name(scopes[gemm], gemm, order[gemm], position)
+        for name, ((gemm, position), *_) in operands.items()
+    }
+
+
 class CodebookRefitter:
     """Refit a training model's forward lookup tables to what it now sees.
 
     A window of training steps runs under ``measure`` and then
     ``accumulate``.  The first records each operand's channel energy and
-    whether it goes negative; the rest bin each forward table's operand,
-    weighted by its partners' energy, as ``fit_codebooks`` bins a
-    calibration set.  ``refit`` then installs the table each histogram's
-    optimum gives.  The gradients' tables stay as they are, and a partner
-    without microscaling blocks to measure along leaves its operand
-    unweighted.
+    whether it goes negative, and under ``fisher_activations`` each forward
+    GEMM activation's loss-gradient diagonal, read off the backward graph.
+    The rest bin each forward table's operand, weighted by its own diagonal
+    when it has one and by its partners' energy otherwise, as
+    ``fit_codebooks`` bins a calibration set.  ``refit`` then installs the
+    table each histogram's optimum gives, one per cell for a table with a
+    granularity.  The gradients' tables are refitted too when asked,
+    weighted by their partners' energy.  A partner without microscaling
+    blocks to measure along leaves its operand unweighted.
 
     Args:
         model: Model ``prepare_training`` prepared with lookup-table specs.
         pin_zero: Force a zero level into every table.
         resolution: Candidates across the range for entries that keep the
             model's dtype.
+        weighting: ``Weighting.PARTNER`` or ``Weighting.FISHER_ACTIVATIONS``.
+        granularity: ``name substring -> counts``, how many tables a forward
+            table is fitted along each axis, as ``fit_codebooks`` takes it.
+            A forward GEMM's operand goes by the name ``fit_codebooks``
+            gives it -- ``<module path>|q`` is attention's query -- and any
+            other table by its fake-quant's name.
+        refit_gradients: Refit the gradients' tables as well.
+
+    Raises:
+        ValueError: ``weighting`` is neither of those.
     """
 
-    def __init__(self, model, pin_zero=True, resolution=FLOAT_RESOLUTION):
+    def __init__(
+        self,
+        model,
+        pin_zero=True,
+        resolution=FLOAT_RESOLUTION,
+        weighting=Weighting.PARTNER,
+        granularity=None,
+        refit_gradients=False,
+    ):
+        if weighting not in (Weighting.PARTNER, Weighting.FISHER_ACTIVATIONS):
+            raise ValueError(
+                "a refit weights by partner energy or fisher_activations, "
+                f"not {weighting.value}"
+            )
         quantizers = model.training_quantizers
         self.modules = dict(quantizers.named_children())
-        self.forward_tables = [
+        self.tables = [
             name
             for name, module in self.modules.items()
             if isinstance(module, MXFakeQuantize)
             and module.is_codebook_quantization
-            and name not in quantizers.gradients
+            and (refit_gradients or name not in quantizers.gradients)
         ]
         partners = gemm_partners(model)
         self.partners = {
@@ -1767,33 +1827,83 @@ class CodebookRefitter:
                 for partner in sorted(partners[name])
                 if isinstance(self.modules[partner], MXFakeQuantize)
             ]
-            for name in self.forward_tables
+            for name in self.tables
         }
+        operands = forward_gemm_operands(model)
+        labels = _training_operand_names(model, operands)
+        self.grid = {
+            name: tuple(counts)
+            for pattern, counts in (granularity or {}).items()
+            for name in self.tables
+            if pattern in labels.get(name, name)
+        }
+        self.leading = {}
+        for name, counts in self.grid.items():
+            axis = leading_split(counts)
+            if axis is not None:
+                self.leading[name] = axis
+        # A split table's error reaches the output through its partners' own
+        # slices of that axis, so they are measured per slice too.
+        for name, axis in list(self.leading.items()):
+            for other in self.partners[name]:
+                self.leading[other] = axis
+
+        # Under ``fisher_activations``, each forward activation's gradient:
+        # the outputs of the dgrads of the GEMMs it feeds, in the backward
+        # graph.
+        self.backward = model.forward.graphs["backward"]
+        self.gradients = []
+        if weighting is Weighting.FISHER_ACTIVATIONS:
+            nodes = {node.name: node for node in self.backward.graph.nodes}
+            for name in self.tables:
+                dgrads = [
+                    operand_gradient(gemm, position)
+                    for gemm, position in operands.get(name, [])
+                    if gemm.meta["operand_types"][position] == "activation"
+                ]
+                dgrads = [nodes[dgrad.name] for dgrad in dgrads if dgrad]
+                if dgrads:
+                    self.gradients.append((name, *dgrads))
+
         self.pin_zero = pin_zero
         self.resolution = resolution
         self.energies = {}
         self.nonnegative = {}
+        self.fisher = {}
+        self.counts = {}
         self.histograms = {}
 
     @contextlib.contextmanager
     def measure(self):
-        """Start a window: record each operand's channel energy and sign.
+        """Start a window: record each operand's channel energy and sign,
+        and under ``fisher_activations`` each forward activation's
+        loss-gradient diagonal.
 
-        Hooks the forward tables and their partners for the step it wraps.
-        Each sign stays on the device until the step ends, and one read then
-        brings them all back.
+        Hooks the forward tables and their partners, and reads the
+        activations' gradients off the backward graph, for the step it
+        wraps.  Each sign stays on the device until the step ends, and one
+        read then brings them all back.
         """
-        self.energies, self.nonnegative, self.histograms = {}, {}, {}
-        names = set(self.forward_tables).union(*self.partners.values())
-        with _pre_hooks({n: self.modules[n] for n in names}, self._record):
+        self.energies, self.nonnegative, self.fisher = {}, {}, {}
+        self.counts, self.histograms = {}, {}
+        names = set(self.tables).union(*self.partners.values())
+        gradients = (
+            _reading(self.backward, self._record_gradient, self.gradients)
+            if self.gradients
+            else contextlib.nullcontext()
+        )
+        with (
+            _pre_hooks({n: self.modules[n] for n in names}, self._record),
+            gradients,
+        ):
             yield
         signs = torch.stack(list(self.nonnegative.values())).tolist()
         self.nonnegative = dict(zip(self.nonnegative, signs))
 
     def accumulate(self):
-        """Hook the forward tables to bin their operands, after ``measure``
-        in the same window."""
-        tables = {name: self.modules[name] for name in self.forward_tables}
+        """Hook the tables to bin their operands, after ``measure`` in the
+        same window."""
+        tables = {name: self.modules[name] for name in self.tables}
         return _pre_hooks(tables, self._bin)
 
     def refit(self):
@@ -1801,21 +1911,29 @@ class CodebookRefitter:
 
         Histograms over the same candidates, fitted to the same number of
         levels, are solved together, and their lookup tables built together.
+        A table with a grid is solved per cell and installed as a codebook.
 
         Returns:
-            ``name -> fitted levels``.
+            ``name -> fitted levels``, a grid's as
+            ``{"granularity": counts, "levels": tables}``.
         """
-        groups = {}
-        for name, histogram in self.histograms.items():
-            k = min(
-                2 ** self.modules[name].index_bits, histogram.levels.numel()
-            )
-            key = (tuple(histogram.levels.tolist()), k)
-            groups.setdefault(key, []).append(name)
-        fitted = {}
+        groups, fitted = {}, {}
+        for name, histograms in self.histograms.items():
+            module = self.modules[name]
+            k = min(2**module.index_bits, histograms[0].levels.numel())
+            if name in self.grid:
+                levels = optimal_codebooks(histograms, k, self.pin_zero)
+                install_codebook(module, levels, self.counts[name])
+                fitted[name] = {
+                    "granularity": list(self.counts[name]),
+                    "levels": levels,
+                }
+            else:
+                key = (tuple(histograms[0].levels.tolist()), k)
+                groups.setdefault(key, []).append(name)
         for (_, k), names in groups.items():
             codebooks = optimal_codebooks(
-                [self.histograms[name] for name in names], k, self.pin_zero
+                [self.histograms[name][0] for name in names], k, self.pin_zero
             )
             fitted.update(zip(names, codebooks))
             device = self.modules[names[0]].qmap.device
@@ -1823,10 +1941,25 @@ class CodebookRefitter:
                 self.modules[name].qmap = qmap
         return fitted
 
+    def _cells(self, name, shape):
+        """Return a forward table's grid against its operand's shape."""
+        if name in self.grid:
+            return _resolve_counts(self.grid[name], shape)
+        return (1,) * len(shape)
+
     def _record(self, name, module, inputs):
         """Add one operand's channel energy and sign to the window's."""
         tensor = _as_quantized(module, inputs[0])
-        energy = _channel_energy(tensor, module.ch_axis)
+        slices = self.leading.get(name)
+        if slices is None:
+            energy = _channel_energy(tensor, module.ch_axis)
+        else:
+            energy = torch.stack(
+                [
+                    _channel_energy(piece, module.ch_axis)
+                    for piece in tensor.unbind(slices)
+                ]
+            )
         self.energies[name] = self.energies.get(name, 0) + energy
         nonnegative = (tensor >= 0).all()
         held = self.nonnegative.get(name)
@@ -1834,25 +1967,64 @@ class CodebookRefitter:
             nonnegative if held is None else held & nonnegative
         )
 
+    @torch.no_grad()
+    def _record_gradient(self, name, *gradients):
+        """Add one forward activation's Fisher diagonal to the window's.
+
+        Its gradient is the sum of those the GEMMs it feeds pass back, and
+        the diagonal is that squared and summed over every position but the
+        contraction axis, per cell of its grid.
+        """
+        module = self.modules[name]
+        gradient = _as_quantized(module, sum(gradients).float())
+        cells = [
+            _contraction_last(cell, module.ch_axis).flatten(0, -2)
+            for _, cell in _grid_cells(
+                gradient, self._cells(name, gradient.shape)
+            )
+        ]
+        diagonal = torch.stack([cell.pow(2).sum(0) for cell in cells])
+        held = self.fisher.get(name)
+        self.fisher[name] = diagonal if held is None else held + diagonal
+
     def _bin(self, name, module, inputs):
-        """Bin one forward table's operand, weighted by its partners."""
+        """Bin one forward table's operand into its cells, weighted by its
+        own Fisher diagonal or else its partners' energy."""
+        operand = module.prepare(inputs[0])
         if name not in self.histograms:
+            self.counts[name] = self._cells(name, operand.shape)
             candidates = _candidate_levels(
                 module, self.nonnegative[name], self.resolution
             )
-            self.histograms[name] = Histogram(candidates)
-        energies = [
-            self.energies[partner]
-            for partner in self.partners[name]
-            if partner in self.energies
-        ]
-        operand = module.prepare(inputs[0])
+            self.histograms[name] = [
+                Histogram(candidates)
+                for _ in range(math.prod(self.counts[name]))
+            ]
+        counts = self.counts[name]
+        if name in self.fisher:
+            energies = list(self.fisher[name])
+        else:
+            shares = [
+                self.energies[partner]
+                for partner in self.partners[name]
+                if partner in self.energies
+            ]
+            energies = (
+                _partner_cells(
+                    sum(shares),
+                    counts,
+                    self.leading.get(name),
+                    module.ch_axis,
+                )
+                if shares
+                else None
+            )
         _accumulate(
             operand,
             module,
-            [sum(energies)] if energies else None,
-            [self.histograms[name]],
-            (1,) * operand.dim(),
+            energies,
+            self.histograms[name],
+            counts,
             _global_scale(module, operand),
         )
 
