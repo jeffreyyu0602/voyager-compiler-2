@@ -1376,7 +1376,12 @@ def _node_label(node, named) -> Optional[str]:
 
 
 def _render(model: GraphModule, output_file: str) -> None:
-    """Draw one box per node and one edge per use, then write the SVG."""
+    """Draw one box per node and one edge per use, then write the SVG.
+
+    A constant gets a box of its own beside each use: one shared box with an
+    edge to every user, such as a causal mask feeding each layer, stretches
+    edges across the whole graph and makes the layout blow up.
+    """
     g = graphviz.Digraph()
     named = dict(model.named_modules(remove_duplicate=False))
     edges = []
@@ -1386,6 +1391,12 @@ def _render(model: GraphModule, output_file: str) -> None:
             continue
         label = _node_label(node, named)
         if label is None:
+            continue
+        if node.op == "get_attr":
+            for u in node.users:
+                box = f"{node.name}@{u.name}"
+                g.node(box, label=label, shape="Mrecord")
+                edges.append((box, u.name))
             continue
         g.node(node.name, label=label, shape="Mrecord")
         edges += [(node.name, u.name) for u in node.users]

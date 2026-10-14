@@ -233,8 +233,9 @@ class ShapeProp:
     them as opaque callables (what other callers rely on).
 
     The module's own state is left as found: a buffer the graph writes in
-    place (a KV cache) is run on a copy, and a ``get_attr`` is stamped with
-    the value it holds when the graph starts, before any write of the step.
+    place (a KV cache) is run on a copy in a real run and on a fake stand-in
+    in a fake run, and a ``get_attr`` is stamped with the value it holds
+    when the graph starts, before any write of the step.
 
     Fake inputs make a fake run, the passes' mode; inputs with no fake
     tensor among them make a real run (see ``materialized_values``).
@@ -256,7 +257,7 @@ class ShapeProp:
         real = not any(isinstance(t, FakeTensor) for t in tree_flatten(args)[0])
         with self._mode or nullcontext():
             with materialized_values() if real else nullcontext():
-                return self._propagate(*args)
+                return self._propagate(real, *args)
 
     def _subprop(self, target, inputs):
         """Recursively propagate a HOP / ``call_module`` subgraph, returning its
@@ -265,7 +266,7 @@ class ShapeProp:
             *inputs
         )
 
-    def _propagate(self, *args):
+    def _propagate(self, real, *args):
         args_iter = iter(args)
         env: Dict[str, Node] = {}
 
@@ -298,7 +299,7 @@ class ShapeProp:
             elif node.op == "get_attr":
                 result = _attr_value(self.mod, node)
                 if node.target in written and isinstance(result, torch.Tensor):
-                    result = result.clone()
+                    result = result.clone() if real else fake_like(result)
                 set_node_value(node, result)
             elif node.op == "output":
                 result = load_arg(node.args[0])

@@ -1155,7 +1155,8 @@ def bufferize_graph(
     merge_base_tables(model)
     for gm in modules:
         gm.graph.lint()
-        gm.recompile()
+    # The passes below only edit graphs; rename_nest_nodes recompiles the
+    # whole module tree once at the end.
     lower_views(model)
     _dedup_regions(model)
     annotate_tensor_spaces(model)
@@ -1257,7 +1258,6 @@ def _dedup_regions(gm: GraphModule) -> None:
         gm.graph.erase_node(node)
         merged.add(orig)
     gm.graph.lint()
-    gm.recompile()
     for node in list(gm.graph.nodes):
         if node.op in ("get_attr", "call_module"):
             sub = _subgraph(gm, node.target)

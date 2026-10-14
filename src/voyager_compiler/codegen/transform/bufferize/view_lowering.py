@@ -86,7 +86,6 @@ def lower_views(model: GraphModule) -> GraphModule:
         elif node.target is _COPY:
             _fold_copy(model, node)
     model.graph.lint()
-    model.recompile()
     return model
 
 
