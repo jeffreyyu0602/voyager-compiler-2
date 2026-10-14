@@ -22,7 +22,12 @@ import torch
 from torch.fx import Interpreter
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops import calculate_mx_qparam, quantize, vmap
+from voyager_compiler.ops import (
+    calculate_mx_qparam,
+    compiled_on_gpu,
+    quantize,
+    vmap,
+)
 from voyager_compiler.quantization.codebook_optimizer import EPS
 from voyager_compiler.shape_prop import fetch_attr
 
@@ -76,7 +81,8 @@ def hessian_inverse_chol(hessian, tokens, damping):
 SHRINK_GRID = (1.0, 0.93, 0.86, 0.79, 0.72)
 
 
-def block_scale(block, weights, fake_quant, shrink):
+@compiled_on_gpu(dynamic=False)
+def block_scale(block, weights, qmap, scale_qmap, quant_max, shrink):
     """Choose each row's scale for one microscaling block.
 
     The scale is normally ``amax / quant_max``, which spends the whole
@@ -86,26 +92,27 @@ def block_scale(block, weights, fake_quant, shrink):
     it has not reached yet, which is why the search belongs inside the loop
     rather than in a preprocessing pass.  Shrinking keeps the deployed scale
     exact: the clipped value still lands on ``quant_max``, so recomputing the
-    scale from the stored weights returns the same number.
+    scale from the stored weights returns the same number.  Compiled whole,
+    so the candidates are tried in a few fused kernels.
 
     Args:
         block: The block's weights, ``[out, 64]``.
         weights: Per-column Hessian diagonal, the salience each column's
             error is charged at.
-        fake_quant: The fake-quant this weight will be deployed through,
-            which carries the codebook, the scale codebook and the range.
+        qmap: The lookup table or codebook the weight is quantized into.
+        scale_qmap: The lookup table the scale is quantized into.
+        quant_max: Largest magnitude ``qmap`` represents.
         shrink: Search below the maximum, instead of taking it.
 
     Returns:
         One scale per output row.
     """
-    scale_qmap = fake_quant.scale_qmap
     base = (
         calculate_mx_qparam(
             block,
             axes=-1,
             block_size=block.shape[-1],
-            quant_max=fake_quant.quant_max,
+            quant_max=quant_max,
             scale_qmap=scale_qmap,
         )
         .reshape(-1)
@@ -124,8 +131,7 @@ def block_scale(block, weights, fake_quant, shrink):
             .clamp_min(EPS)
         )
         quantized = (
-            quantize(block, scale[:, None], qmap=fake_quant.qmap).float()
-            * scale[:, None]
+            quantize(block, scale[:, None], qmap=qmap).float() * scale[:, None]
         )
         error = ((block - quantized).pow(2) * weights).sum(dim=1)
         if lowest is None:
@@ -177,6 +183,41 @@ def salience_order(hessian, columns, within_block, block_size):
         )
     base = torch.arange(blocks, device=hessian.device).unsqueeze(1)
     return (base * block_size + rank)[block_order].reshape(-1)
+
+
+@compiled_on_gpu(dynamic=False)
+def quantize_block(block, scale, hinv, qmap):
+    """Quantize one block column by column, compensating the columns after.
+
+    Compiled whole, so each column step runs as one fused kernel rather
+    than a dozen launches.
+
+    Args:
+        block: The block's weights, ``[out, n]``, as compensated so far.
+        scale: Each row's scale for the block.
+        hinv: The block's diagonal tile of the upper Cholesky factor of the
+            inverse Hessian, ``[n, n]``.
+        qmap: The lookup table or codebook the weight is quantized into.
+
+    Returns:
+        ``(quantized, deltas)``: the block on the grid, and each column's
+        error over its pivot, which the caller carries into the columns
+        after the block.
+    """
+    quantized, deltas = [], []
+    for column in range(block.shape[1]):
+        values = block[:, column]
+        # The codebook names every axis of the weight, so a column
+        # enters as the column it is rather than a bare vector.
+        level = quantize(values[:, None], scale[:, None], qmap=qmap)[:, 0]
+        level = level * scale
+        delta = (values - level) / hinv[column, column].clamp_min(EPS)
+        # The factor is upper triangular, so the columns already done take
+        # nothing from this update.
+        block = block - delta[:, None] * hinv[column]
+        quantized.append(level)
+        deltas.append(delta)
+    return torch.stack(quantized, dim=1), torch.stack(deltas, dim=1)
 
 
 def compensate_weight(
@@ -245,28 +286,19 @@ def compensate_weight(
     for start in range(0, columns, block_size):
         end = min(start + block_size, columns)
         scale = block_scale(
-            work[:, start:end], salience[start:end], fake_quant, shrink
+            work[:, start:end],
+            salience[start:end],
+            fake_quant.qmap,
+            fake_quant.scale_qmap,
+            fake_quant.quant_max,
+            shrink,
         )
-        deltas = torch.zeros(weight.shape[0], end - start, device=weight.device)
-        for offset, column in enumerate(range(start, end)):
-            values = work[:, column]
-            # The codebook names every axis of the weight, so a column
-            # enters as the column it is rather than a bare vector.
-            quantized = (
-                quantize(
-                    values[:, None], scale[:, None], qmap=fake_quant.qmap
-                ).float()[:, 0]
-                * scale
-            )
-            out[:, column] = quantized
-            delta = (values - quantized) / hinv_chol[column, column].clamp_min(
-                EPS
-            )
-            deltas[:, offset] = delta
-            if column + 1 < end:
-                work[:, column + 1 : end] -= delta.unsqueeze(1) * hinv_chol[
-                    column, column + 1 : end
-                ].unsqueeze(0)
+        out[:, start:end], deltas = quantize_block(
+            work[:, start:end],
+            scale,
+            hinv_chol[start:end, start:end],
+            fake_quant.qmap,
+        )
         if end < weight.shape[1]:
             work[:, end:] -= deltas @ hinv_chol[start:end, end:]
     if perm is None:
@@ -334,10 +366,36 @@ def _live_at(nodes, index):
     return carry
 
 
-#: Module path of one decoder layer, where the walk parks.  A bare
-#: top-level name does not match, so ``lm_head`` resumes from the last
-#: layer rather than opening a spot at its own first node.
-PARKING = re.compile(r".*\.\d+")
+def _advance(interpreter, stretch, keep):
+    """Run the nodes of a stretch the environment does not hold yet.
+
+    Each value is dropped once its last user has run, as
+    ``Interpreter.run`` does, so a stretch holds only what is still live
+    rather than every intermediate it made.
+
+    Args:
+        interpreter: The interpreter whose ``env`` the stretch reads and
+            fills.
+        stretch: The nodes to run, in order.
+        keep: Values to hold past their last use, for the caller to read
+            after the stretch.
+    """
+    for node in stretch:
+        if node in interpreter.env:
+            continue
+        interpreter.env[node] = interpreter.run_node(node)
+        for value in interpreter.user_to_last_uses.get(node, ()):
+            if value not in keep:
+                del interpreter.env[value]
+
+
+#: Module path of one decoder layer, or of the norm after its attention,
+#: where the walk parks.  The MLP fold parks after the attention it has
+#: just replayed with its compensated weights, so the next layer's pass
+#: replays the MLP alone.  A bare top-level name does not match, so
+#: ``lm_head`` resumes from the last layer rather than opening a spot at its
+#: own first node.
+PARKING = re.compile(r".*\.\d+(?:\.post_attention_layernorm)?")
 
 #: Module path of a layer's attention or MLP half, the unit the walk folds.
 FOLDS = re.compile(r".*\.\d+(?:\.\w+)?|[^.]+")
@@ -401,6 +459,11 @@ def _carried_bytes(environment):
 #: memory, never recomputation.
 CACHE_RESERVE = 12 << 30
 
+#: Calibration windows one forward carries when the graph's batch axis is
+#: dynamic.  At this size the forward already keeps the GPU busy, so a larger
+#: batch only holds more memory.
+BATCH = 8
+
 
 def _cache_budget(device, reserve):
     """Return the bytes of activation cache a device can hold.
@@ -430,6 +493,7 @@ def gptq(
     folded=True,
     budget=None,
     reserve=CACHE_RESERVE,
+    fast_hessian=True,
 ):
     """Compensate every quantized weight in a prepared model, in place.
 
@@ -440,13 +504,14 @@ def gptq(
     past it.  Weights sharing an activation are compensated together, which
     is exact: their Hessians are equal and none of them feeds another.
 
-    Where the walk *parks* is not where it stops.  Held state sits between
-    decoder layers, where only the residual stream crosses, and the stretch
-    from there to each weight is re-run.  Parking at the weight instead
-    holds two attention score matrices per input, which for a long
-    calibration set does not fit on a device.  Re-running a stretch is
-    arithmetic and, under microscaling, changes nothing: the scale is
-    computed from the input every time.
+    Where the walk *parks* is not where it stops.  Held state sits where
+    only the residual stream crosses -- between decoder layers, and between
+    a layer's attention and its MLP -- and the stretch from there to each
+    weight is re-run.  Parking at the weight instead holds two attention
+    score matrices per input, which for a long calibration set does not fit
+    on a device.  Re-running a stretch is arithmetic and, under
+    microscaling, changes nothing: the scale is computed from the input
+    every time.
 
     The codebook, the scale codebook and the range all come from the
     fake-quant the quantizer already attached to each weight, so nothing has
@@ -455,7 +520,9 @@ def gptq(
     Args:
         model: Graph module from ``prepare_pt2e``, before ``convert_pt2e``.
         calibration: The calibration set; each entry is a tuple of
-            positional arguments matching the graph's placeholders.
+            positional arguments matching the graph's placeholders.  When
+            the graph was exported with a dynamic batch axis, ``BATCH``
+            entries are stacked along it into each forward.
         skip: Substrings of weight names to leave alone.
         damping: Fraction of the mean Hessian diagonal added before
             inverting.
@@ -475,6 +542,11 @@ def gptq(
             larger than this moves to host memory instead; the frontier
             advances either way.
         reserve: Device memory to leave free, when ``budget`` is derived.
+        fast_hessian: Multiply each Hessian's ``X^T X`` on the tensor cores
+            in the activation's own dtype, with an fp32 result.  For a bf16
+            activation every product is still exact and only the summation
+            changes, to tensor-core accumulation; False casts to fp32 first,
+            the slower exact reference.
 
     Returns:
         The same model, its weights compensated.
@@ -484,6 +556,20 @@ def gptq(
     placeholders = [node for node in nodes if node.op == "placeholder"]
     device = next(model.parameters()).device
     calibration = list(calibration)
+    windows = len(calibration)
+    # A dynamic batch axis lets one forward carry several windows, paying
+    # the walk's per-node cost once for all of them.  An argument that is
+    # not a tensor -- a flag -- is the same in every entry, so the batch
+    # takes it from its first.
+    example = placeholders[0].meta["val"]
+    batch = BATCH if isinstance(example.shape[0], torch.SymInt) else 1
+    calibration = [
+        tuple(
+            torch.cat(values) if torch.is_tensor(values[0]) else values[0]
+            for values in zip(*calibration[start : start + batch])
+        )
+        for start in range(0, windows, batch)
+    ]
     if budget is None:
         budget = _cache_budget(device, reserve)
 
@@ -504,12 +590,13 @@ def gptq(
         position.setdefault(node.args[0], index)
 
     # Park and fold at the model's own boundaries, at two granularities.
-    # Only the residual stream crosses a decoder layer, so parking there
-    # holds one hidden state; a half-layer boundary sits on its own first
-    # weight, whose fake-quant would then be carried across the cut instead
-    # of recomputed from the compensated value.  A graph with no repeated
-    # structure parks at each weight: correct, but it holds a mid-layer live
-    # set that a long calibration set cannot fit on a device.
+    # Only the residual stream crosses a decoder layer or the norm after its
+    # attention, so parking there holds one hidden state; a fold boundary
+    # sits on its own first weight, whose fake-quant would then be carried
+    # across the cut instead of recomputed from the compensated value.  A
+    # graph with no repeated structure parks at each weight: correct, but it
+    # holds a mid-layer live set that a long calibration set cannot fit on a
+    # device.
     cuts = list(position.values())
     parks = [s for s in _blocks(model, nodes, PARKING) if s <= max(cuts)]
     folds = [s for s in _blocks(model, nodes, FOLDS) if s <= max(cuts)]
@@ -517,13 +604,14 @@ def gptq(
     boundaries = [0] + (folds or cuts)
     total = sum(len(weights) for weights in operands.values())
     logger.info(
-        "compensating %d weights in %d groups over %d calibration inputs, "
-        "parking the cache at %d %s and folding at %d",
+        "compensating %d weights in %d groups over %d calibration inputs "
+        "in batches of %d, parking the cache at %d %s and folding at %d",
         total,
         len(operands),
-        len(calibration),
+        windows,
+        batch,
         len(checkpoints),
-        "layer boundaries" if parks else "weights",
+        "residual-stream boundaries" if parks else "weights",
         len(boundaries),
     )
 
@@ -547,18 +635,31 @@ def gptq(
     started, done = time.monotonic(), 0
     frontier, offload, pending = 0, False, []
     cache = [dict(zip(placeholders, entry)) for entry in calibration]
+    # The walk calls ``run_node`` itself, which reads nothing but ``env``,
+    # and frees values by the interpreter's last-use table, which depends on
+    # the graph alone, so one interpreter serves every batch of every pass.
+    interpreter = Interpreter(model)
     for target, members in spans:
         until = max(cut for _, cut, _ in members)
         # One pass is one fold, so what the pass before it held commits now.
         for parameter, value in pending:
             parameter.data.copy_(value)
         pending.clear()
+        # A node reading parameters alone -- a weight's fake-quant -- gives
+        # every batch the same value, and the weights change only between
+        # passes, so the stretch's ones run once here rather than per batch.
+        shared = dict(parameters)
+        interpreter.env = shared
+        for node in nodes[frontier:until]:
+            inputs = node.all_input_nodes
+            if inputs and all(arg.op == "get_attr" for arg in inputs):
+                shared[node] = interpreter.run_node(node)
         carry = _live_at(nodes, target)
+        keep = {activation for activation, _, _ in members}
         hessians = {cut: None for _, cut, _ in members}
         rows = 0
         for index, environment in enumerate(cache):
-            interpreter = Interpreter(model)
-            interpreter.env = dict(parameters)
+            interpreter.env = dict(shared)
             interpreter.env.update(
                 (
                     node,
@@ -573,22 +674,18 @@ def gptq(
             # Advance to the checkpoint first, so what the cache holds is
             # exactly the live set there, then carry on to the weight.
             # Anything the resumed run was handed is not recomputed.
-            for node in nodes[frontier:target]:
-                if node not in interpreter.env:
-                    interpreter.env[node] = interpreter.run_node(node)
+            _advance(interpreter, nodes[frontier:target], keep)
             carried = {
                 node: value
                 for node, value in interpreter.env.items()
                 if node in carry
             }
-            for node in nodes[target:until]:
-                if node not in interpreter.env:
-                    interpreter.env[node] = interpreter.run_node(node)
+            _advance(interpreter, nodes[target:until], keep)
             # Every member's operand is defined before its own cut, and the
             # pass ran to the last of them, so they are all in hand.
             for activation, cut, _ in members:
                 inputs = interpreter.env[activation]
-                inputs = inputs.reshape(-1, inputs.shape[-1]).float()
+                inputs = inputs.reshape(-1, inputs.shape[-1])
                 if hessians[cut] is None:
                     hessians[cut] = torch.zeros(
                         inputs.shape[-1],
@@ -596,13 +693,24 @@ def gptq(
                         device=inputs.device,
                         dtype=torch.float32,
                     )
-                hessians[cut] += inputs.T @ inputs
+                # Only CUDA multiplies one dtype into another's result.
+                if fast_hessian and inputs.is_cuda:
+                    torch.addmm(
+                        hessians[cut],
+                        inputs.T,
+                        inputs,
+                        out_dtype=torch.float32,
+                        out=hessians[cut],
+                    )
+                else:
+                    inputs = inputs.float()
+                    hessians[cut].addmm_(inputs.T, inputs)
                 if cut == until:
                     rows += inputs.shape[0]
                 del inputs
             # Overwriting the slot in place releases the environment this
             # input arrived with, so one cache is live at a time, not two.
-            del interpreter
+            interpreter.env = {}
             share = _carried_bytes(carried)
             if not offload and share * len(cache) > budget:
                 # The live set grows and shrinks along the graph, so a cache

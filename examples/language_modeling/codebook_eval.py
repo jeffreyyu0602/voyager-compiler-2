@@ -377,9 +377,13 @@ def main(args):
     quantizer = get_default_quantizer()
     quantizer.set_module_name("model.rotary_emb", None)
     set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.config])
+    # A dynamic batch axis lets GPTQ run several calibration windows per
+    # forward.  Export fixes an axis whose example size is 1, so the example
+    # batch is 2.
     example = torch.randint(
-        0, model.config.vocab_size, (1, WINDOW), device=device
+        0, model.config.vocab_size, (2, WINDOW), device=device
     )
+    batch = torch.export.Dim("batch", min=1)
     chunk = torch.export.Dim(
         "chunk_dim", min=2, max=max(WINDOW, args.max_length) // 64
     )
@@ -390,8 +394,8 @@ def main(args):
             (example,),
             {"labels": example.clone(), "use_cache": False},
             {
-                "input_ids": {1: chunk * 64},
-                "labels": {1: chunk * 64},
+                "input_ids": {0: batch, 1: chunk * 64},
+                "labels": {0: batch, 1: chunk * 64},
                 "use_cache": None,
             },
         )
