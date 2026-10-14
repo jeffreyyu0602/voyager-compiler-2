@@ -244,6 +244,17 @@ class View:
         window = np.unravel_index(linear, self.window)
         return [s + w * t for s, w, t in zip(self.start, window, self.step)]
 
+    def key(self):
+        """The view as a hashable tuple."""
+        return (
+            self.box.name,
+            self.slot,
+            self.start,
+            self.step,
+            self.window,
+            self.shape,
+        )
+
 
 @dataclass
 class Chunk:
@@ -505,6 +516,14 @@ def _rows_cols(shape):
     return math.prod(shape[:-1]), shape[-1]
 
 
+def _block_positions(offsets, sizes, shape):
+    """Row-major positions in ``shape`` of the ``sizes`` block at
+    ``offsets``."""
+    block = np.indices(sizes).reshape(len(sizes), -1)
+    block += np.array(offsets)[:, None]
+    return np.ravel_multi_index(block, shape)
+
+
 def _runs(n, size):
     """``(start, stop)`` of each run of at most ``size`` of ``n``."""
     return [(s, min(n, s + size)) for s in range(0, n, size)]
@@ -564,6 +583,11 @@ class Kernel:
         self.uses = {}
         self.lines = []
         self.pools = {}
+        # Emit-pass results by their inputs: transfers replayed shifted
+        # (``_shifted_transfer``) and GEMM operand access patterns.
+        self.memo = {}
+        # The patterns ``_try_dma`` emits, while a transfer is recorded.
+        self.dma_log = None
         for analyze in (True, False):
             self.analyze = analyze
             self.env = {}
@@ -797,9 +821,15 @@ class Kernel:
         for i, index in enumerate(kw["indices"]):
             d = dims[i] if dims is not None else i
             offsets[d] = index * steps[d]
-        block = np.indices(sizes).reshape(len(sizes), -1)
-        block += np.array(offsets)[:, None]
-        hbm_linear = np.ravel_multi_index(block, hbm.shape)
+        if (
+            hbm.box.name not in self.mx
+            and not kw.get("transposed")
+            and sbuf.box.name not in self.windows
+            and (hbm.covers_box() or hbm.shape == hbm.window)
+        ):
+            self._shifted_transfer(hbm, offsets, sizes, sbuf, load)
+            return
+        hbm_linear = _block_positions(offsets, sizes, hbm.shape)
         if hbm.box.name in self.mx:
             if kw.get("transposed"):
                 raise NotImplementedError("a transposing MX transfer")
@@ -810,6 +840,42 @@ class Kernel:
             self._window_load(hbm, hbm_linear, sizes, sbuf)
         else:
             self._transfer(hbm, hbm_linear, sbuf, load)
+
+    def _shifted_transfer(self, hbm, offsets, sizes, sbuf, load):
+        """``_transfer`` of the ``sizes`` block of ``hbm`` at ``offsets``,
+        replayed from an earlier copy of the same shape when there is one.
+
+        ``hbm`` is its box reshaped or a window of it seen in the window's
+        shape, so the HBM offsets of two such blocks differ by one constant,
+        the difference of their first elements': a replay emits the recorded
+        patterns with their HBM offsets shifted by it."""
+        key = (
+            "dma",
+            hbm.box.name,
+            hbm.step,
+            hbm.window,
+            hbm.shape,
+            sbuf.key(),
+            sizes,
+            load,
+        )
+        # Raveling the block's last element checks it is in bounds.
+        last = [o + s - 1 for o, s in zip(offsets, sizes)]
+        corners = np.ravel_multi_index(np.array([offsets, last]).T, hbm.shape)
+        base = int(self.flat(hbm, corners)[0])
+        if key not in self.memo:
+            self.dma_log = []
+            hbm_linear = _block_positions(offsets, sizes, hbm.shape)
+            self._transfer(hbm, hbm_linear, sbuf, load)
+            self.memo[key] = [
+                (on_chip, steps, offset - base)
+                for on_chip, (steps, offset) in self.dma_log
+            ]
+            self.dma_log = None
+            return
+        hbm_var = self.var(hbm.box)
+        for on_chip, steps, offset in self.memo[key]:
+            self._emit_dma(on_chip, _ap(hbm_var, (steps, offset + base)), load)
 
     def _mx_transfer(self, hbm, hbm_linear, sbuf, load):
         """Copy an MX array between HBM and an SBUF tile, word by word for
@@ -892,10 +958,16 @@ class Kernel:
         aps = fit([(free, s), (None, h)], s.shape[0])
         if aps is None:
             return False
-        on_chip, hbm = _ap(sbuf_var, aps[0]), _ap(hbm_var, aps[1], dtype)
+        on_chip = _ap(sbuf_var, aps[0])
+        if self.dma_log is not None:
+            self.dma_log.append((on_chip, aps[1]))
+        self._emit_dma(on_chip, _ap(hbm_var, aps[1], dtype), load)
+        return True
+
+    def _emit_dma(self, on_chip, hbm, load):
+        """``dma_copy`` between access patterns ``on_chip`` and ``hbm``."""
         dst, src = (on_chip, hbm) if load else (hbm, on_chip)
         self.emit(f"nisa.dma_copy(dst={dst}, src={src})")
-        return True
 
     def _dma(self, sbuf_var, free, s, hbm_var, h, load, dtype=None):
         """``dma_copy`` the rows of offsets ``s`` (SBUF) and ``h`` (HBM),
@@ -1104,12 +1176,14 @@ class Kernel:
                     if prologue:
                         block = f"{pa}[0:{r}, {lo}:{hi}]"
                     else:
-                        rows = (act_row + np.arange(r))[:, None]
-                        linear = rows * k + lo + np.arange(hi - lo)[None, :]
-                        aps = fit(
-                            [(self.free(act.box), self.flat(act, linear))], r
-                        )
-                        block = _ap(act_var, aps[0])
+                        key = ("act", act.key(), act_row, r, lo, hi)
+                        if key not in self.memo:
+                            rows = (act_row + np.arange(r))[:, None]
+                            linear = rows * k + lo + np.arange(hi - lo)[None, :]
+                            a = self.flat(act, linear)
+                            aps = fit([(self.free(act.box), a)], r)
+                            self.memo[key] = _ap(act_var, aps[0])
+                        block = self.memo[key]
                     transposed = self._transpose(block, r, hi - lo, dtype)
                     at = c * PARTITIONS
                     self.emit(
@@ -1125,15 +1199,18 @@ class Kernel:
                         ACCUMULATORS,
                     )
                     for c, (lo, hi) in enumerate(depth):
-                        rows = (ew * k + lo + np.arange(hi - lo))[:, None]
-                        linear = rows * n + j + np.arange(w)[None, :]
-                        b = self.flat(weight, linear)
-                        aps = fit([(self.free(weight.box), b)], hi - lo)
+                        key = ("moving", weight.key(), ew, lo, hi, j, w)
+                        if key not in self.memo:
+                            rows = (ew * k + lo + np.arange(hi - lo))[:, None]
+                            linear = rows * n + j + np.arange(w)[None, :]
+                            b = self.flat(weight, linear)
+                            aps = fit([(self.free(weight.box), b)], hi - lo)
+                            self.memo[key] = _ap(weight_var, aps[0])
                         at = c * PARTITIONS
                         self.emit(
                             f"nisa.nc_matmul(dst={acc}[0:{r}, 0:{w}], "
                             f"stationary={act_t}[0:{hi - lo}, {at}:{at + r}], "
-                            f"moving={_ap(weight_var, aps[0])}, "
+                            f"moving={self.memo[key]}, "
                             f"accumulate={c > 0})"
                         )
                     grid = np.stack(

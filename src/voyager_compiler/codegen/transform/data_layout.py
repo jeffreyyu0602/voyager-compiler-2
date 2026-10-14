@@ -402,12 +402,15 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
             model.graph
         ):
             value = fetch_attr(model, arg.target)
+            # A view of the weight, unless it shares a larger storage, which
+            # saving the view would write out whole.
             transposed = create_getattr_from_value(
                 model,
                 model.graph,
                 arg.name + "_T",
                 value.mT,
                 derived_producer(arg, torch.ops.aten.transpose.int, -2, -1),
+                copy=value.untyped_storage().nbytes() != value.nbytes,
             )
         else:
             transposed = model.graph.call_function(

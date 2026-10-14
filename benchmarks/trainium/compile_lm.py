@@ -127,7 +127,12 @@ def main():
     quantizer.set_object_type(torch.ops.aten.matmul.default, None)
     gm, example_args, example_kwargs, _, transform_args, compile_args, _ = (
         llama.quantize_model(
-            model, tokenizer, quantizer, VECTOR_PIPELINE, voyager
+            model,
+            tokenizer,
+            quantizer,
+            VECTOR_PIPELINE,
+            voyager,
+            reference=False,
         )
     )
     transform_args.update(LAYOUT, config=config)

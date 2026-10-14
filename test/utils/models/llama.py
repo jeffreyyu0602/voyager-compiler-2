@@ -22,6 +22,7 @@ import torch
 from datasets import load_dataset
 from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.utils._pytree import tree_flatten
+from torchao.quantization.pt2e import FakeQuantizeBase
 from torchao.quantization.pt2e.quantizer.utils import annotate_output_qspec
 from transformers import (
     AutoConfig,
@@ -41,6 +42,7 @@ from voyager_compiler import (
     compile,
     convert_pt2e,
     export_model,
+    fake_like,
     prepare_pt2e,
     split_kv_cache,
     transform,
@@ -332,14 +334,33 @@ def restore_kv_cache(gm, state):
         getattr(gm, name).copy_(saved)
 
 
-def quantize_model(model, tokenizer, quantizer, vector_stages, args):
-    """Export and quantize the stage ``args.model`` names (``llama_prefill`` /
-    ``llama_decode`` / ``llama_verify``), stopping short of ``transform``.
-    Returns ``(gm, example_args, example_kwargs, old_output, transform_args,
-    compile_args, kv_state)`` -- the converted graph with shapes propagated,
-    its example inputs and reference output, the keyword sets ``transform``
-    and ``compile`` take, and the KV-cache state to restore before running
-    the graph again (``restore_kv_cache``)."""
+def quantize_model(
+    model, tokenizer, quantizer, vector_stages, args, reference=True
+):
+    """Exports and quantizes the stage ``args.model`` names.
+
+    Covers ``llama_prefill`` / ``llama_decode`` / ``llama_verify`` and stops
+    short of ``transform``. Calibration runs only when the quantizer inserted
+    a fake-quantize module.
+
+    Args:
+        model: The Hugging Face model to export.
+        tokenizer: The model's tokenizer, used to build the example prompt.
+        quantizer: The PT2E quantizer that annotates the graph.
+        vector_stages: The vector-unit pipeline stages ``transform`` fuses.
+        args: The parsed command-line arguments.
+        reference: Whether to run the converted graph on the real example
+            inputs for a reference output. When False, shapes are propagated
+            with fake tensors instead.
+
+    Returns:
+        ``(gm, example_args, example_kwargs, old_output, transform_args,
+        compile_args, kv_state)``: the converted graph with shapes
+        propagated, its example inputs, the reference output (None without
+        ``reference``), the keyword sets ``transform`` and ``compile`` take,
+        and the KV-cache state to restore before running the graph again
+        (``restore_kv_cache``).
+    """
     transform_args = get_transform_args(args, vector_stages)
     compile_args = get_compile_args(args)
     config = transform_args["config"]
@@ -415,15 +436,21 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
 
     gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
 
-    for _ in range(2):
-        restore_kv_cache(gm, kv_state)
-        gm(*example_args, **example_kwargs)
+    if any(isinstance(m, FakeQuantizeBase) for m in gm.modules()):
+        for _ in range(2):
+            restore_kv_cache(gm, kv_state)
+            gm(*example_args, **example_kwargs)
     restore_kv_cache(gm, kv_state)
 
     convert_pt2e(gm, args.bias)
 
     flatten_args, _ = tree_flatten((example_args, example_kwargs))
-    old_output = ShapeProp(gm).propagate(*flatten_args)
+    if reference:
+        old_output = ShapeProp(gm).propagate(*flatten_args)
+    else:
+        # Stamp dtypes for remove_fp32_casts without running the model.
+        ShapeProp(gm).propagate(*map(fake_like, flatten_args))
+        old_output = None
     return (
         gm,
         example_args,

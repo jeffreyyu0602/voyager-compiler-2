@@ -22,6 +22,7 @@ from typing import Dict, Optional
 import torch
 import torch.fx as fx
 from torch.fx import GraphModule, Node
+from torch.fx.graph import _illegal_names
 
 from voyager_compiler.codegen.node_info import (
     DYNAMIC_QUANTIZE_OPS,
@@ -772,19 +773,29 @@ def rename_nest_nodes(model: GraphModule) -> None:
     it is just renumbered model-wide: ``select_137``, ``async_copy_402``.
     """
     used = {n.name for n in model.graph.nodes}
+    next_suffix = {}
 
     def rename(node: Node, candidate: str) -> None:
-        """Name ``node`` ``candidate``, or the first numbered variant of it
-        that is unused model-wide.  A graph's namespace may hand back a
-        different name than asked (a suffix it counts up past names of
-        erased nodes), so it is the name assigned, not the one requested,
-        that has to be unique."""
-        base, i = candidate, 1
-        node._rename(candidate)  # registers the name in the graph's namespace
-        while node.name in used:
-            node._rename(f"{base}_{i}")
-            i += 1
-        used.add(node.name)
+        """Name ``node`` ``candidate`` or its next free numbered variant.
+
+        Variants are counted model-wide per candidate.  The name chosen is
+        unused model-wide, not a builtin, and free in the node's own graph
+        namespace (which keeps erased nodes' names), so FX assigns it
+        unchanged.
+        """
+        taken = node.graph._graph_namespace._used_names
+        name = candidate
+        if (
+            name in used
+            or name in _illegal_names
+            or (name != node.name and name in taken)
+        ):
+            i = next_suffix.get(candidate, 1)
+            while (name := f"{candidate}_{i}") in used or name in taken:
+                i += 1
+            next_suffix[candidate] = i + 1
+        node._rename(name)
+        used.add(name)
 
     def rename_node(
         gm: GraphModule, n: Node, scope: str, anchor_target, keep: set, bound

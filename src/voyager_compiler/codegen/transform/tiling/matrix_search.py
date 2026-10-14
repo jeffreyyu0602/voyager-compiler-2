@@ -120,8 +120,13 @@ def _prepare_search(node, tiler, constraint):
 
     sub_gm = node.meta.get("submodule")
     if sub_gm is not None and not is_fully_connected(anchor):
+        # A get_attr operand is not copied: a buffer the graph writes was
+        # already stamped with a copy of itself.
         ShapeProp(sub_gm).propagate(
-            *(n.value.clone() for n in node.all_input_nodes)
+            *(
+                n.value if n.op == "get_attr" else n.value.clone()
+                for n in node.all_input_nodes
+            )
         )
         dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
         phs = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]

@@ -113,6 +113,7 @@ from voyager_compiler.quantization.dtypes import (
 )
 from voyager_compiler.shape_prop import (
     ShapeProp,
+    constant_value,
     fake_like,
     fetch_attr,
     propagate_shape,
@@ -332,8 +333,9 @@ def compile(
 
     Args:
         model: A graph ``transform`` lowered, bufferized in place.
-        example_args: The inputs ``model`` runs on, so one it writes, such
-            as a gradient buffer, is overwritten.
+        example_args: The inputs ``model`` runs on. With ``dump_tensors``,
+            one it writes, such as a gradient buffer, is overwritten;
+            otherwise only their shapes and dtypes are read.
         example_kwargs: Keyword inputs; ``None`` for none.
         config: The accelerator's ``AcceleratorConfig``; ``None`` models no
             hardware.
@@ -376,9 +378,19 @@ def compile(
     plan_memory(model, config, dram_layout)
     print_bufferized_graph(model)
 
+    # Without a dump the emitter reads only shapes and dtypes, so it runs on
+    # fake inputs. The deferred constants are installed before it, so the
+    # emitter reads them, and every node computed from them alone, as real
+    # values, and the callers that run or save the graph find them in place.
+    for sub in model.modules():
+        if isinstance(sub, torch.fx.GraphModule):
+            for node in sub.graph.find_nodes(op="get_attr"):
+                constant_value(sub, node)
     path = os.path.join(output_dir, "tensor_files")
     params = gen_code_bufferized(
-        model, flatten_args, path if dump_tensors else None
+        model,
+        flatten_args if dump_tensors else list(map(fake_like, flatten_args)),
+        path if dump_tensors else None,
     )
 
     with open(os.path.join(output_dir, "model.txt"), "w") as f:

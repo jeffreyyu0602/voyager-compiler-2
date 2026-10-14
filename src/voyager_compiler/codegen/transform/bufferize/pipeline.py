@@ -1275,8 +1275,13 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
 
+    # A get_attr operand is not copied: a buffer the graph writes was
+    # already stamped with a copy of itself.
     ShapeProp(submod).propagate(
-        *(n.value.clone() for n in node.all_input_nodes)
+        *(
+            n.value if n.op == "get_attr" else n.value.clone()
+            for n in node.all_input_nodes
+        )
     )
 
     tiling, l3_order = get_tiling(node, tiler)

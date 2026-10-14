@@ -94,6 +94,7 @@ def replace_node_with_graph_module(
     O(N^2) ``named_modules`` rescans ``propagate_shape`` does each call.
     """
     graph = model.graph
+    taken = _taken_names(model)
     if value_remap is None:
         value_remap = {}
 
@@ -121,7 +122,7 @@ def replace_node_with_graph_module(
                     # cond / body subgraph of a while_loop: register an
                     # independent copy (shared body objects would collide when
                     # later passes stamp per-site meta on their nodes).
-                    name = get_new_node_name_with_prefix(n.target)(model)
+                    name = _fresh_name(n.target, taken)
                     setattr(model, name, copy_graph_module(attr))
                     value_remap[n] = graph.create_node("get_attr", name)
                 else:
@@ -138,13 +139,14 @@ def replace_node_with_graph_module(
                 # an independent copy under a fresh name, like a body subgraph,
                 # and retarget the copied call at it.
                 sub = fetch_attr(replacement, n.target)
-                name = get_new_node_name_with_prefix(n.target)(model)
+                name = _fresh_name(n.target, taken)
                 setattr(model, name, copy_graph_module(sub))
                 new = graph.node_copy(n, lambda x: value_remap[x])
                 new.target = name
                 value_remap[n] = new
             else:
                 value_remap[n] = graph.node_copy(n, lambda n: value_remap[n])
+            taken.add(value_remap[n].name)
             if propagate:
                 propagate_shape(value_remap[n], model)
 
@@ -197,27 +199,46 @@ def get_unique_node_name(node: Node):
     return node.name
 
 
+def _taken_names(module: GraphModule) -> set:
+    """Names a fresh node or submodule of ``module`` must avoid.
+
+    These are its graph's node names plus its direct child module names. A
+    fresh name never contains a dot, so deeper submodules cannot clash.
+    """
+    taken = {n.name for n in module.graph.nodes}
+    taken.update(k for k, m in module._modules.items() if m is not None)
+    return taken
+
+
+def _fresh_name(prefix: str, taken: set) -> str:
+    """Picks the first of ``prefix``, ``prefix_1``, ``prefix_2``, ... not taken.
+
+    Dots in ``prefix`` become underscores first.
+
+    Args:
+        prefix: Base name, e.g. a node target.
+        taken: Names already in use; updated with the result.
+
+    Returns:
+        The picked name.
+    """
+    prefix = prefix.replace(".", "_")
+    name, i = prefix, 0
+    while name in taken:
+        i += 1
+        name = f"{prefix}_{i}"
+    taken.add(name)
+    return name
+
+
 def get_new_node_name_with_prefix(prefix: str):
     """
     Generate a new attribute name with a given prefix that is not already used
     in the module's graph.
     """
-    prefix = prefix.replace(".", "_")
 
     def get_new_node_name(module: torch.nn.Module):
-        existing_names = {n.name for n in module.graph.nodes}
-        existing_names.update(dict(module.named_modules()).keys())
-
-        if prefix not in existing_names:
-            return prefix
-
-        i = 1
-        while f"{prefix}_{i}" in existing_names:
-            i += 1
-
-        node_name = f"{prefix}_{i}"
-        logger.debug(f"Generated new unique node name: {node_name}")
-        return node_name
+        return _fresh_name(prefix, _taken_names(module))
 
     return get_new_node_name
 
