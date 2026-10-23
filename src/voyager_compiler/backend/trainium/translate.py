@@ -2010,7 +2010,7 @@ class Kernel:
         after it read."""
         index = next(i for i, p in enumerate(prims) if p.target in ROWWISE)
         pre, prim, post = prims[:index], prims[index], prims[index + 1 :]
-        if self.layouts[dst.box.name].spread:
+        if isinstance(dst, View) and self.layouts[dst.box.name].spread:
             self._rms_norm_spread(prim, dst)
             return
         if pre and post:

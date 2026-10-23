@@ -216,10 +216,12 @@ class TrainiumVector(TrainiumGrid):
         kmajor_dtype: That RMS norm's element type.
         kmajor_post: The chain (``chain_ops``) after that RMS norm.
         group: The group of ops the translator runs (``group_ops``).
-        flat: The translator cuts a tile of the group across the partitions
-            (``row_parts``): it is an elementwise chain whose stored inputs
-            (``require_allocation``; a lookup table is not one) are each its
-            output's size or one element, or an RMS norm alone (on one row).
+        flat: The translator may cut a tile of the group across the
+            partitions (``row_parts``): it is an elementwise chain, or an
+            RMS norm alone (on one row).
+        inputs: The shapes of the group's stored inputs
+            (``require_allocation``; a lookup table is not one), read only
+            for a ``flat`` group.
     """
 
     def __init__(self, node, model):
@@ -238,16 +240,15 @@ class TrainiumVector(TrainiumGrid):
         self.kmajor_post = chain_ops(ops[ops.index(norm) + 1 :]) if norm else ()
         self.group = group_ops(ops)
         row_op = self.group[1]
-        size = math.prod(node.value.shape)
         self.flat = (
             not any(op.target in NOT_FLAT for op in ops)
             and (row_op is None or (row_op in RMS_NORM_OPS and len(ops) == 1))
-            and all(
-                math.prod(n.value.shape) in (1, size)
-                for n in node.all_input_nodes
-                if require_allocation(n)
-            )
         )
+        self.inputs = [
+            tuple(n.value.shape)
+            for n in node.all_input_nodes
+            if self.flat and require_allocation(n)
+        ]
 
     def row_parts(self, out_tile):
         """``(parts, spread)`` for an output tile ``out_tile``: the
@@ -256,10 +257,18 @@ class TrainiumVector(TrainiumGrid):
         cuts its tiles evenly across the most partitions it can
         (``spread_partitions``), an operand of one element copied onto each;
         any other puts its rows on the partitions, a one-row operand copied
-        onto each partition its rows take."""
+        onto each partition its rows take.  A flat op spreads only when each
+        stored input's tile -- its shape cut to ``out_tile``, a broadcast
+        dim staying 1 -- is the output tile's size or one element."""
         rows, cols = rows_cols(out_tile)
-        parts = spread_partitions(rows * cols)
-        if self.flat and (rows == 1 or self.group[1] is None) and parts > 1:
+        size = rows * cols
+        parts = spread_partitions(size)
+        flat = self.flat and all(
+            math.prod(min(d, t) for d, t in zip(s[::-1], out_tile[::-1]))
+            in (1, size)
+            for s in self.inputs
+        )
+        if flat and (rows == 1 or self.group[1] is None) and parts > 1:
             return parts, True
         return min(rows, PARTITIONS), False
 
