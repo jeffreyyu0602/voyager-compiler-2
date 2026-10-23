@@ -10,13 +10,13 @@ their dependences, so the semaphores and waits are dropped.
 
 A tile in SBUF has its rows -- every dim but the last, flattened -- on the
 partitions, 128 at a time, and its last dim free: a slot of ``B`` row blocks
-of ``C`` columns is an NKI tensor ``[P, B * C]``.  A flat row -- a one-row
-tile every op of the kernel touching it reads or writes as a row of its
-own, elementwise or an RMS norm, and TensorE never reads -- is cut across
-the partitions, each op on it running there (``Layout.spread``): HBM still
-holds the row as a row.  Any other one-row tile read as an elementwise
-operand is copied onto each partition the op reading it takes when it is
-loaded.
+of ``C`` columns is an NKI tensor ``[P, B * C]``.  A flat tile -- one every
+op of the kernel touching it reads or writes whole, element for element, in
+an elementwise chain (or, one row, an RMS norm alone), and TensorE never
+reads -- is cut in row-major order across the partitions, each op on it
+running there (``Layout.spread``): HBM still holds it as rows.  Any other
+one-row tile read as an elementwise operand is copied onto each partition
+the op reading it takes when it is loaded.
 Every access is an ``.ap()`` access pattern, found by mapping each element's
 logical coordinates to its offset and factoring the offsets into one nesting
 per instruction (``fit``), so views and relayouts fused into a kernel need
@@ -278,9 +278,9 @@ class Layout:
     room for ``cols`` columns (at least the box's), row ``r`` on partition
     ``r % span`` of block ``r // span``, its elements ``spacing`` apart; a
     ``replicated`` one-row box on each of its ``parts`` partitions.  A box
-    with ``span`` 1 is all on one partition.  A ``spread`` one-row box is
-    its row cut across the partitions, ``cols`` elements to each, element
-    ``c`` on partition ``c // cols``."""
+    with ``span`` 1 is all on one partition.  A ``spread`` box is its
+    elements cut in row-major order across the partitions, ``cols`` to each,
+    element ``e`` on partition ``e // cols``."""
 
     parts: int
     blocks: int
@@ -301,9 +301,9 @@ class OpUse:
     analysis walk records it (``Kernel._lay_out``).
 
     Attributes:
-        flat: The op can run on a row cut across the partitions: an
-            elementwise chain or an RMS norm alone, whose result and every
-            operand are one row of ``cols`` elements in SBUF or a single
+        flat: The op can run on its result cut across the partitions: an
+            elementwise chain, or an RMS norm alone on one row, whose result
+            and every operand are ``cols`` elements in SBUF or a single
             element.
         parts: The partitions the op's rows take otherwise.
         cols: The elements of its result.
@@ -826,7 +826,7 @@ class Kernel:
             self.uses.setdefault(box.name, set()).add(role)
 
     def _lay_out(self):
-        """Every on-chip box's layout: rows on the partitions, a flat row cut
+        """Every on-chip box's layout: rows on the partitions, a flat box cut
         across them (``_spread_ops``), any other one-row box only ever
         read as an elementwise operand copied onto each partition an op
         reading it takes, and a pool input as its windows (``windows``).
@@ -850,9 +850,10 @@ class Kernel:
                 )
                 continue
             if box.name in spread:
-                parts = spread_partitions(box.cols)
+                elements = math.prod(box.shape)
+                parts = spread_partitions(elements)
                 self.layouts[box.name] = Layout(
-                    parts, 1, box.cols // parts, False, spread=True
+                    parts, 1, elements // parts, False, spread=True
                 )
                 continue
             replicated = (
@@ -960,20 +961,20 @@ class Kernel:
     def flat(self, view, linear, partitions=None):
         """Flat offsets in its tensor of ``view``'s elements at positions
         ``linear``; a replicated box is read on ``partitions``, a spread
-        one's row where it is cut (``Layout.spread``)."""
+        one where it is cut (``Layout.spread``)."""
         box = view.box
         # The view is the box reshaped when it covers it: position is the
         # box's own.
         position = linear if view.covers_box() else view.positions(linear)
         if box.level == DRAM:
             return position
-        row, col = np.divmod(position, box.cols)
         layout = self.layouts[box.name]
+        if layout.spread:
+            part, col = np.divmod(position, layout.cols)
+            return part * layout.free + col
+        row, col = np.divmod(position, box.cols)
         if layout.replicated:
             return partitions * layout.free + col
-        if layout.spread:
-            part, col = np.divmod(col, layout.cols)
-            return part * layout.free + col
         part, block = row % layout.span, row // layout.span
         return part * layout.free + (block * layout.cols + col) * layout.spacing
 
@@ -1115,7 +1116,7 @@ class Kernel:
         """Copy between the HBM elements ``hbm_linear`` of ``hbm`` and
         ``sbuf``'s, in ``sbuf``'s row-major order: the whole tile in one
         ``dma_copy`` when a pattern walks it -- a load in one per piece of
-        its 128-row blocks (``stream_blocks``), a spread row cut across the
+        its 128-row blocks (``stream_blocks``), a spread tile cut across the
         partitions as it lies -- else 128 rows at a time."""
         layout = self.layouts[sbuf.box.name]
         rows, cols = _rows_cols(sbuf.shape)
@@ -1336,9 +1337,9 @@ class Kernel:
 
     def _op_use(self, prims, dst, flat):
         """The ``OpUse`` of a compute op of ``prims`` writing ``dst``, which
-        may run flat if ``flat`` and its shapes allow: an elementwise chain
-        or an RMS norm alone, whose result is one row in SBUF and whose
-        operands are each that row's size or one element.  An op's rows
+        may run flat if ``flat`` and its shapes allow: an elementwise chain,
+        or an RMS norm alone on one row, whose result is in SBUF and whose
+        operands are each the result's size or one element.  An op's rows
         take ``min(rows, 128)`` partitions of its first result, a row op's
         of its input; another op's, every partition."""
         operands = [
@@ -1366,9 +1367,12 @@ class Kernel:
         rows = {dst.box.name} if isinstance(dst, View) else set()
         flat = (
             flat
-            and (not rowwise or [p.target for p in prims] == ["aten::rms_norm"])
+            and (
+                not rowwise
+                or [p.target for p in prims] == ["aten::rms_norm"]
+                and dst.box.rows == 1
+            )
             and dst.box.level == SCRATCHPAD
-            and dst.box.rows == 1
             and dst.covers_box()
             and spread_partitions(cols) > 1
         )
@@ -1377,7 +1381,6 @@ class Kernel:
                 continue
             if (
                 view.box.level == SCRATCHPAD
-                and view.box.rows == 1
                 and math.prod(view.box.shape) == cols
                 and view.covers_box()
             ):
@@ -1511,7 +1514,7 @@ class Kernel:
 
     def _elementwise(self, prims, dst):
         """Elementwise ops, chunk by chunk of the first op's result: 128 rows
-        and up to ``CHUNK_FREE`` columns at a time, a row cut across the
+        and up to ``CHUNK_FREE`` columns at a time, a tile cut across the
         partitions (``Layout.spread``) on all of them, or, reading a tile
         from PSUM in whole 128-row blocks, every block at once -- PSUM holds
         a tile's blocks side by side within a bank."""
@@ -1529,7 +1532,7 @@ class Kernel:
             self.layouts.get(dst.box.name) if isinstance(dst, View) else None
         )
         if layout is not None and layout.spread:
-            # Partition ``p`` holds the row's elements ``p * cols ..``.
+            # Partition ``p`` holds the tile's elements ``p * cols ..``.
             for lo, hi in _runs(layout.cols, CHUNK_FREE):
                 linear = np.arange(layout.parts)[:, None] * layout.cols
                 linear = linear + np.arange(lo, hi)[None, :]

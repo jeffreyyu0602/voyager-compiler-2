@@ -357,12 +357,10 @@ def vector_op_tiling(node, tiler):
         else output_shape(node)
     )
     search = partial(_search_grid, op, shape, multiple_of=multiple_of)
-    # An elementwise op may split its rows too, in whole lane groups: a ranked
-    # space prices those tilings beside the whole-row ones, an unranked one
-    # takes them only when no whole row fits.
-    splits = is_elementwise_op(anchor) and last_dim is not None
-    result = search(last_dim=None if splits and op.space.ranked else last_dim)
-    if result is None and splits:
+    result = search(last_dim=last_dim)
+    # An elementwise op whose whole rows do not fit splits its rows too, in
+    # whole lane groups.
+    if result is None and is_elementwise_op(anchor) and last_dim is not None:
         result = search(last_dim=None)
     if result is None:
         raise RuntimeError(

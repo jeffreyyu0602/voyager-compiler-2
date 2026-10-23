@@ -18,7 +18,7 @@ what they share:
   of its issue and its rows' bytes, packet overhead included, at the core's
   DMA bandwidth -- half of it for a copy within half the partitions --
   plus the rings' time between copies; a store issues from ScalarE's queue;
-  a vector op's one-row tile lies as the translator lays it out
+  a vector op's tile lies as the translator lays it out
   (``TrainiumVector``);
 - an MX (microscaling) tile, stored contraction-major: 4 consecutive
   contraction elements per 32-bit word, a 512-element chunk per 128
@@ -297,25 +297,29 @@ class TrainiumModel(RuntimeModel):
         quadrants = math.ceil(partitions / QUADRANT)
         return quadrants * self.dma_ns(QUADRANT_SCALES, words, 8)
 
-    def buffer_sbuf(self, n, shape, mx):
+    def buffer_sbuf(self, n, shape, mx, parts=1, spread=False):
         """SBUF bytes of buffer ``n``'s tile ``shape``: one array per output,
-        rows on the partitions, or the MX layout ``mx``
+        rows on the partitions -- cut evenly across ``parts`` of them when
+        ``spread`` (``TrainiumVector.row_parts``) -- or the MX layout ``mx``
         (``TrainiumGrid._mx_tiles``) gives it."""
         if n in mx:
             return sum(self.mx_sbuf(*array) for array in mx[n])
         p = self.config.partitions
-        return sum(
-            sbuf_bytes(*rows_cols(s), bits, p)
-            for s, bits in output_buffers(shape, n)
-        )
+        total = 0
+        for s, bits in output_buffers(shape, n):
+            rows, cols = rows_cols(s)
+            if spread:
+                rows, cols = parts, rows * cols // parts
+            total += sbuf_bytes(rows, cols, bits, p)
+        return total
 
     def buffer_dma_ns(self, n, shape, mx, load, parts=1, spread=False):
         """One transfer of buffer ``n``'s tile ``shape``, a ``load`` or a
         store: each output's ``dma_copy`` instructions (``_dma_count``), or
-        the MX layout's transfers.  A one-row tile lies on ``parts``
-        partitions, as the translator lays out a vector op's
-        (``TrainiumVector.row_parts``): its row cut evenly across them when
-        ``spread``, else, loaded, a copy of it on each."""
+        the MX layout's transfers.  A tile lies on ``parts`` partitions, as
+        the translator lays out a vector op's (``TrainiumVector.row_parts``):
+        cut evenly across them in one ``dma_copy`` when ``spread``, else,
+        one row loaded, a copy of it on each."""
         if n in mx:
             return sum(self.mx_dma_ns(*array) for array in mx[n])
         values = n.value if isinstance(n.value, (tuple, list)) else [n.value]
@@ -323,11 +327,11 @@ class TrainiumModel(RuntimeModel):
         total = 0.0
         for (s, bits), value in zip(output_buffers(shape, n), values):
             rows, cols = rows_cols(s)
-            if rows == 1 and spread:
-                rows, cols = parts, cols // parts
+            count = _dma_count(tuple(s), value.shape, p)
+            if spread:
+                rows, cols, count = parts, rows * cols // parts, 1
             elif rows == 1 and load:
                 rows = parts
-            count = _dma_count(tuple(s), value.shape, p)
             total += self.dma_ns(rows, cols, bits, count, load)
         return total
 

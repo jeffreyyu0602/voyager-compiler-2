@@ -569,6 +569,12 @@ class TrainiumGrid(OpModel):
             tiles[self.node] = [(depth, other, True), (depth, other, False)]
         return tiles
 
+    def row_parts(self, out_tile):
+        """``(parts, spread)`` for an output tile ``out_tile``: its rows on
+        the partitions, none cut across them; a flat vector op overrides
+        it (``TrainiumVector.row_parts``)."""
+        return min(rows_cols(out_tile)[0], PARTITIONS), False
+
     def _mx_lowerable(self, mx):
         """Whether the translator lowers the MX tiles ``mx``
         (``_mx_tiles``): the GEMM's operands contract whole chunks
@@ -587,8 +593,9 @@ class TrainiumGrid(OpModel):
         (``_mx_lowerable``) and its buffers fit SBUF, else ``None``.
 
         A buffer takes the slots the bufferizer gives it: two for one the
-        sweep moves more than once, one for one it moves once and holds.
-        The placement's buffers and scratch count too.
+        sweep moves more than once, one for one it moves once and holds,
+        laid out as ``row_parts`` says.  The placement's buffers and scratch
+        count too.
         """
         model = self.model
         config = model.config
@@ -601,9 +608,13 @@ class TrainiumGrid(OpModel):
         if placement is None:
             return None
         needed = sbuf_placed_bytes(config, placement.buffers, placement.scratch)
+        out_tile = output_buffers(shapes[self.node], self.node)[-1][0]
+        parts, spread = self.row_parts(out_tile)
         for n, shape, count in moves:
             slots = config.num_slots if count > 1 else 1
-            needed += slots * model.buffer_sbuf(n, shape, mx)
+            needed += slots * model.buffer_sbuf(
+                n, shape, mx, parts, spread and math.prod(shape) > 1
+            )
         if needed > config.usable_scratchpad_size:
             return None
         return placement
