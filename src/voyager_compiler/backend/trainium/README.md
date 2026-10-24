@@ -69,9 +69,9 @@ Follow these when extending this backend or adding another one.
    `aten.sdpa` stands for an entire attention that a dedicated kernel
    implements. Do not define a custom op for a single instruction.
 6. **Operand layouts are an argument, not an op variant.** A GEMM op takes
-   one `layout` string, `"<activation>,<weight>[,<output>]"`, in the
+   one `layout` string, `"<activation>,<weight>-><output>"`, in the
    `--gemm_layout` letters (`x` the rows M, `c` the contraction K, `k` the
-   output columns N): `"cx,ck"`, or `"cx,ck,kx"` for an output stored
+   output columns N): `"cx,ck->xk"`, or `"cx,ck->kx"` for an output stored
    `[N, M]`. Likewise a GEMM writing PSUM says so by its `out_dtype`
    argument (float32): its product is summed and returned in it.
 7. **The op class's fit decides every buffer.** Each kernel's buffers at
@@ -103,7 +103,7 @@ Follow these when extending this backend or adding another one.
 
 | Stage | Trainium |
 |---|---|
-| Export, PT2E quantization, `transform()` passes | shared as is; `LAYOUT` stores every GEMM weight contraction-major (`ck`, [in, out]), the activations between matrix-matrix GEMMs contraction-major too (`gemm_layout="cx,ck"`), and keeps feature maps NCHW |
+| Export, PT2E quantization, `transform()` passes | shared as is; `LAYOUT` stores every GEMM weight contraction-major (`ck`, [in, out]), the activations between matrix-matrix GEMMs contraction-major too (`gemm_layout="cx,ck->xk"`), and keeps feature maps NCHW |
 | Tile search (interstellar for GEMMs, the shared grid search for vector ops and GEMVs) | shared; it asks the target's runtime model (`tiling/runtime_model.py`) to prepare each op, then whether each candidate fits and what it costs |
 | Runtime model | custom: `TrainiumModel` in `model.py`, preparing per op a `TrainiumGemm` or `TrainiumGemv` (`gemm.py`), a `TrainiumAttention` (`attention.py`) or a `TrainiumVector` or `TrainiumPool` (`vector.py`) from the graph facts in `tiling/lowering.py` |
 | Bufferization, memory planning, `model.txt` | shared, but a dense GEMM (`linear`, `matmul`, their MX forms, a decode GEMV) lowers by Trainium's own builder, `gemm.py`, and a K-major flash attention by `attention.py` (`TrainiumFlashAttention`, a subclass of the shared FA3 pipeline), both registered ahead of the shared ones (`TrainiumConfig.backend`) |
@@ -204,11 +204,11 @@ One file per op, holding its op class (fit and cost) and its builder:
   runs there in place. A GEMM tail ending in one evicts each 128-row
   chunk's slices into the output tile, then the builder runs it on the
   chunk's rows, so `TrainiumModel` keeps an output tile's rows whole.
-- **A K-major GEMM** (`linear` or `matmul` of layout `"cx,ck"`) reads
+- **A K-major GEMM** (`linear` or `matmul` of layout `"cx,ck->xk"`) reads
   its activation `[..., K, M]` as stored, the contraction already on the
   partitions, so it transposes nothing: the activation is the stationary
   operand, or, when the GEMM writes its output transposed (`[..., N, M]`,
-  layout `"cx,ck,kx"`), the moving one and the weight the stationary, and
+  layout `"cx,ck->kx"`), the moving one and the weight the stationary, and
   the slices run over 128 of N and 512 of M.
 - **A K-major RMS norm** (`rms_norm_kmajor`) normalizes over the
   partitions: per 512 columns, the 128-row blocks are squared on ScalarE,

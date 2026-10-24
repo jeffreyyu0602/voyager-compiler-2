@@ -17,7 +17,8 @@ decomposes it into matmul / softmax / matmul.
 
 The layouts are Trainium's ``LAYOUT`` unless ``--tensor_layout``,
 ``--gemm_layout`` or ``--gemv_layout`` says otherwise: ``--gemm_layout
-xc,ck`` keeps the activations between GEMMs row-major.
+'xc,ck->xk'`` keeps the activations between GEMMs row-major (quote the
+value: ``>`` is a shell redirect).
 
 ``--dtype fp8`` quantizes the linear layers' activations and weights, per
 tensor, to the E4M3 Trn2 multiplies natively: the IEEE format

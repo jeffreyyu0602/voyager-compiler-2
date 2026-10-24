@@ -87,6 +87,14 @@ from voyager_compiler.shape_prop import ShapeProp, fake_like, set_node_value
 
 _SRAM = int(MemoryLevel.SRAM)
 
+# Each aten GEMM's ``quantized_ops`` twin: the same product, in the aten
+# op's layout by default, that also takes an ``out_dtype``.
+_OUT_DTYPE_TWINS = {
+    torch.ops.aten.conv2d.default: torch.ops.quantized_ops.conv2d.default,
+    torch.ops.aten.linear.default: torch.ops.quantized_ops.linear.default,
+    torch.ops.aten.matmul.default: torch.ops.quantized_ops.matmul.default,
+}
+
 # A microscaling quantize fuses onto the *end* of an MHA output relayout, so it
 # is what the body returns and the permute sits one step above it.
 _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
@@ -1803,7 +1811,8 @@ def _reduction_fused_kernel(
 
     Args:
         compute: ``compute(in_slots, first)``, the bare op on the current
-            tiles; ``first`` folds the bias into the op.
+            tiles, returning its partial in the accumulator's dtype;
+            ``first`` folds the bias into the op.
         reduction_dim: Grid dim of the cross-tile reduction (K / C).
         last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``);
             0 selects the single-round variant.
@@ -1834,9 +1843,10 @@ def _reduction_fused_kernel(
         n_in = len(args) - num_outputs - 1
         return args[:n_in], args[n_in : n_in + num_outputs], args[-1]
 
-    def _to_acc(result, scratch):
-        # Upcast a partial to the (possibly wider, e.g. fp32) accumulator dtype.
-        return result if op_dtype is None else result.to(scratch.dtype)
+    def _to_out(acc):
+        # Round a finished accumulator to the op's output dtype, the value
+        # every tail op reads.
+        return acc if op_dtype is None else acc.to(op_dtype)
 
     def _accumulate(grid_index, in_slots, scratch):
         """Fold this round's partial into the scratch accumulator: the op with
@@ -1844,10 +1854,10 @@ def _reduction_fused_kernel(
         accumulator after."""
 
         def init():
-            return _to_acc(compute(in_slots, True), scratch)
+            return compute(in_slots, True)
 
         def accumulate(prev=scratch):
-            return _to_acc(compute(in_slots, False), scratch) + prev
+            return compute(in_slots, False) + prev
 
         voyager.insert(
             torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
@@ -1858,7 +1868,7 @@ def _reduction_fused_kernel(
         """Cast the completed accumulator, apply the fused tail once, and store
         each output.  A tail that writes the output slots itself returns
         ``None``, leaving nothing to store."""
-        outs = scratch if op_dtype is None else scratch.to(op_dtype)
+        outs = _to_out(scratch)
         if fused_gm is not None:
             fused = [in_slots[i] for i in fused_operand_indices]
             outs = fused_gm(outs, *fused)
@@ -1871,10 +1881,11 @@ def _reduction_fused_kernel(
 
     def _staged_quantize(in_slots, out_slots, scratch):
         """The split-off pass: relayout + quantize the staged tile straight
-        out of scratch and write the out slots.  The staged tile keeps the
-        accumulator's own shape (the head is layout-preserving)."""
+        out of scratch, read at the op's output dtype, and write the out
+        slots.  The staged tile keeps the accumulator's own shape (the head
+        is layout-preserving)."""
         fused = [in_slots[i] for i in fused_operand_indices]
-        outs = split[1](scratch, *fused)
+        outs = split[1](_to_out(scratch), *fused)
         for slot, out in zip(out_slots, outs):
             voyager.insert(out, slot)
 
@@ -1883,19 +1894,19 @@ def _reduction_fused_kernel(
         if single_round:
             # The only round both initializes (bias folded) and completes
             # the tile: stage it and run the tail from scratch.
-            voyager.insert(_to_acc(compute(in_slots, True), scratch), scratch)
+            voyager.insert(compute(in_slots, True), scratch)
             _finalize(in_slots, out_slots, scratch)
             return
 
         if chain_tail:
 
             def on_last():
-                total = _to_acc(compute(in_slots, False), scratch) + scratch
+                total = compute(in_slots, False) + scratch
                 if split is None:
                     _finalize(in_slots, out_slots, total)
                 else:
                     fused = [in_slots[i] for i in fused_operand_indices]
-                    head = split[0](total, *fused)
+                    head = split[0](_to_out(total), *fused)
                     voyager.insert(head.reshape(scratch.shape), scratch)
                     _staged_quantize(in_slots, out_slots, scratch)
                 return 0
@@ -1924,9 +1935,9 @@ def _reduction_fused_kernel(
         in_slots, out_slots, scratch = _split(args)
         if single_round:
             # The only round: bias folds in, no prior partial to add.
-            total = _to_acc(compute(in_slots, True), scratch)
+            total = compute(in_slots, True)
         else:
-            total = _to_acc(compute(in_slots, False), scratch) + scratch
+            total = compute(in_slots, False) + scratch
         if split is None and chain_tail:
             _finalize(in_slots, out_slots, total)
         elif not chain_tail:
@@ -1937,7 +1948,7 @@ def _reduction_fused_kernel(
             # Layout-preserving chained head; the split-off relayout +
             # quantize pass reads the staged tile.
             fused = [in_slots[i] for i in fused_operand_indices]
-            head = split[0](total, *fused)
+            head = split[0](_to_out(total), *fused)
             voyager.insert(head.reshape(scratch.shape), scratch)
             if scratch_slots > 1:
                 _staged_quantize(in_slots, out_slots, scratch)
@@ -2230,25 +2241,27 @@ def _stamp_anchor_meta(gm, anchor) -> None:
     mapping the proto emitter turns into a ``Tiling`` and whose cost the
     reporting model charges a tile -- onto the kernels of the nest just
     built, at every nesting level (loop body, cond branch); the anchor
-    itself is erased on splice.
+    itself is erased on splice.  A kernel runs the anchor's op, or its
+    ``_OUT_DTYPE_TWINS`` twin when it returns float32 partials.
     """
     if (result := anchor.meta.get("tile_result")) is None:
         return
+    targets = {anchor.target, _OUT_DTYPE_TWINS.get(anchor.target)}
     for m in gm.modules():
         if not isinstance(m, torch.fx.GraphModule):
             continue
         named = dict(m.named_modules())
         for n in m.graph.nodes:
             sub = named.get(n.target) if n.op == "call_module" else None
-            if n.target is anchor.target or (
+            if n.target in targets or (
                 isinstance(sub, torch.fx.GraphModule)
-                and any(x.target is anchor.target for x in sub.graph.nodes)
+                and any(x.target in targets for x in sub.graph.nodes)
             ):
                 n.meta["tile_result"] = result
 
 
 def build_conv2d(
-    node: torch.fx.Node, ctx: BuildContext, *, accumulate_fp32: bool = False
+    node: torch.fx.Node, ctx: BuildContext
 ) -> Optional[torch.fx.GraphModule]:
     """Pipeline builder for a conv2d (groups=1) node — incl. the microscaling /
     codebook (``conv2d_mx``) variant, a fused bias, and the systolic NHWC layout
@@ -2360,6 +2373,12 @@ def build_conv2d(
         for k, v in anchor.kwargs.items()
         if not isinstance(v, torch.fx.Node)
     }
+    # A split reduction accumulating in fp32 sums fp32 partials, not
+    # partials already rounded to the output dtype.  aten.conv2d takes no
+    # ``out_dtype``, so it runs as its ``quantized_ops`` twin.
+    if ctx.accumulate_fp32 and num_k > 1:
+        target = _OUT_DTYPE_TWINS.get(target, target)
+        scalar_kwargs["out_dtype"] = torch.float32
     kw_nodes = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
@@ -2458,7 +2477,7 @@ def build_conv2d(
         out_specs=out_specs,
         fused_idx=fused_idx,
         anchor=anchor,
-        accumulate_fp32=accumulate_fp32,
+        accumulate_fp32=ctx.accumulate_fp32,
         async_pipeline=ctx.async_pipeline,
         single_buffer_tail=ctx.single_buffer_tail,
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
@@ -2556,7 +2575,9 @@ class _GemmPlan:
         return self.anchor.value.dtype
 
 
-def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
+def _gemm_plan(
+    node, tiler=None, k_tiles=None, accumulate_fp32=False
+) -> Optional[_GemmPlan]:
     """Derive a GEMM node's grid, operands and per-step call — everything a
     builder needs before it picks a kernel.  Returns ``None`` for a node that
     has no tiling and is not a BMM.
@@ -2572,6 +2593,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         tiler: Tile-search backend, forwarded to ``get_tiling``.
         k_tiles: Reduction-tile count to use instead of the one the tile
             search picked. A sparse GEMM sets this to its CSR's slice count.
+        accumulate_fp32: A reduction split across K accumulates in float32,
+            so each step's op returns its partial in float32.
 
     Returns:
         A ``_GemmPlan``, or ``None``.
@@ -2596,8 +2619,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     if not isinstance(out, torch.Tensor) or act.ndim < 2 or weight.ndim < 2:
         return None
 
-    # The grid is in logical M / N / K; a GEMM of layout "cx,ck" stores its
-    # activation [K, M], and of "cx,ck,kx" its output [N, M] too, so the
+    # The grid is in logical M / N / K; a GEMM of layout "cx,ck->xk" stores its
+    # activation [K, M], and of "cx,ck->kx" its output [N, M] too, so the
     # specs swap those dims.
     kmajor, out_transposed = reads_kmajor(anchor), writes_transposed(anchor)
     out_shape = gemm_output_shape(anchor)
@@ -2855,6 +2878,12 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
 
     op = anchor.target
     num_k = K // tk  # reduction tiles (grid extent along ``gk``)
+    # A split reduction accumulating in fp32 sums fp32 partials, not
+    # partials already rounded to the output dtype.  An aten GEMM takes no
+    # ``out_dtype``, so it runs as its ``quantized_ops`` twin.
+    if accumulate_fp32 and num_k > 1:
+        op = _OUT_DTYPE_TWINS.get(op, op)
+        scalar_kwargs["out_dtype"] = torch.float32
 
     def activation(in_tiles):
         """The activation tile: its operand's, or the prologue's result."""
@@ -2927,7 +2956,7 @@ def build_gemm(
     K innermost; the kernel accumulates ``act_tile @ weight_tile`` into the
     output slot.  Returns the gm, or ``None``.
     """
-    plan = _gemm_plan(node, ctx.tiler)
+    plan = _gemm_plan(node, ctx.tiler, accumulate_fp32=ctx.accumulate_fp32)
     if plan is None:
         return None
 

@@ -114,6 +114,7 @@ def compiled_cuda_kernel(fn):
 # created, before any importer references them.
 from voyager_compiler.ops.layout import (  # noqa: E402
     DEFAULT_GEMM_OUTPUT,
+    DEFAULT_TENSOR_LAYOUT,
     LINEAR_LAYOUT,
     MATMUL_LAYOUT,
     GemmLayout,
@@ -589,12 +590,15 @@ def _decode_and_scale(input, scale, code, block_size):
     return input
 
 
+# ``quantized_ops.conv2d`` on the decoded operands: ``layout`` and
+# ``out_dtype`` are its arguments.
 quantized_ops_lib.define(
     "conv2d_mx(Tensor input, Tensor weight, Tensor? bias=None, "
     "SymInt[2] stride=1, SymInt[2] padding=0, SymInt[2] dilation=1, "
     "SymInt groups=1, *, Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, "
-    'Tensor? weight_code=None, str layout="nchw") -> Tensor'
+    f'Tensor? weight_code=None, str layout="{DEFAULT_TENSOR_LAYOUT}", '
+    "ScalarType? out_dtype=None) -> Tensor"
 )
 
 
@@ -613,11 +617,10 @@ def conv2d_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
-    layout: str = "nchw",
+    layout: str = DEFAULT_TENSOR_LAYOUT,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     from voyager_compiler.codegen.node_info import _pair
-
-    assert layout in ("nchw", "nhwc"), layout
 
     input = _dequantize_mx(input, input_scale, input_code, block_size)
     weight = _dequantize_mx(weight, weight_scale, weight_code, block_size)
@@ -626,13 +629,16 @@ def conv2d_mx(
     # signature's scalar defaults; the strict op calls below need pairs.
     stride, padding, dilation = _pair(stride), _pair(padding), _pair(dilation)
 
-    if layout == "nhwc":
-        # The generated NHWC twin (NHWC activations, HWIO weight).
-        return torch.ops.quantized_ops.conv2d(
-            input, weight, bias, stride, padding, dilation, groups
-        )
-    return torch.ops.aten.conv2d(
-        input, weight, bias, stride, padding, dilation, groups
+    return torch.ops.quantized_ops.conv2d(
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        groups,
+        layout=layout,
+        out_dtype=out_dtype,
     )
 
 
@@ -676,32 +682,28 @@ def linear_mx(
         weight, weight_scale, weight_code, block_size
     )
 
-    # ``alpha`` scales the product alone, so the bias is added after it.  As
-    # the hardware's GEMM does, both apply to the product summed in float32
-    # (or the input's dtype, if wider), rounded to ``out_dtype`` (or the
-    # input's dtype) once, after them.
-    gemm_bias = bias if alpha is None else None
+    # As the hardware's GEMM does, the product, its ``alpha`` scale, the bias
+    # and the outlier product are summed in float32 (or the output dtype, if
+    # wider) and rounded to ``out_dtype`` (or the input's dtype) once, after
+    # them all.  ``alpha`` scales the product alone, so the bias is added
+    # after it.
     dtype = decoded_input.dtype if out_dtype is None else out_dtype
-    if alpha is not None:
-        accumulate = torch.promote_types(dtype, torch.float32)
-        decoded_input = decoded_input.to(accumulate)
-        decoded_weight = decoded_weight.to(accumulate)
+    accumulate = torch.promote_types(dtype, torch.float32)
 
     # The product is computed [tokens, out], the order the bias and the
     # outlier product add in, and stored as ``layout`` says last.
     out = torch.ops.quantized_ops.linear(
         decoded_input,
         decoded_weight,
-        gemm_bias,
+        bias if alpha is None else None,
         layout=str(stored._replace(output=DEFAULT_GEMM_OUTPUT)),
-        out_dtype=out_dtype,
+        out_dtype=accumulate,
     )
 
     if alpha is not None:
         out = out * alpha
         if bias is not None:
             out = out + bias
-        out = out.to(dtype)
 
     if A_data is not None:
         out = out + torch.ops.quantized_ops.spmm_csr(
@@ -713,8 +715,10 @@ def linear_mx(
             weight_code,
             block_size,
             stored.weight,
+            out_dtype=accumulate,
         )
 
+    out = out.to(dtype)
     return out.mT.contiguous() if stored.output != DEFAULT_GEMM_OUTPUT else out
 
 
@@ -765,14 +769,11 @@ def matmul_mx(
     decoded_self = _dequantize_mx(self, input_scale, input_code, block_size)
     decoded_other = _dequantize_mx(other, weight_scale, weight_code, block_size)
 
-    # As in ``linear_mx``: ``alpha`` scales the product summed in float32
-    # (or the input's dtype, if wider), rounded to ``out_dtype`` (or the
-    # input's dtype) once, after it.
+    # As in ``linear_mx``: the product, its ``alpha`` scale and the outlier
+    # product are summed in float32 (or the output dtype, if wider) and
+    # rounded to ``out_dtype`` (or the input's dtype) once.
     dtype = decoded_self.dtype if out_dtype is None else out_dtype
-    if alpha is not None:
-        accumulate = torch.promote_types(dtype, torch.float32)
-        decoded_self = decoded_self.to(accumulate)
-        decoded_other = decoded_other.to(accumulate)
+    accumulate = torch.promote_types(dtype, torch.float32)
 
     # As in ``linear_mx``: computed [tokens, out], stored as ``layout`` says
     # last.
@@ -780,11 +781,11 @@ def matmul_mx(
         decoded_self,
         decoded_other,
         layout=str(stored._replace(output=DEFAULT_GEMM_OUTPUT)),
-        out_dtype=out_dtype,
+        out_dtype=accumulate,
     )
 
     if alpha is not None:
-        out = (out * alpha).to(dtype)
+        out = out * alpha
 
     if A_data is not None:
         out = out + torch.ops.quantized_ops.spmm_csr(
@@ -796,8 +797,10 @@ def matmul_mx(
             weight_code,
             block_size,
             stored.weight,
+            out_dtype=accumulate,
         )
 
+    out = out.to(dtype)
     return out.mT.contiguous() if stored.output != DEFAULT_GEMM_OUTPUT else out
 
 
@@ -1558,10 +1561,12 @@ def _(
     return fake_data, fake_indices, fake_indptr
 
 
+# The product of the CSR matrix ``data``/``indices``/``indptr`` and ``B``,
+# summed in float32 and returned in ``out_dtype``, or ``B``'s dtype.
 quantized_ops_lib.define(
     "spmm_csr(Tensor data, Tensor indices, Tensor indptr, Tensor B, "
     "Tensor? B_scale=None, Tensor? B_code=None, int? block_size=None, "
-    'str weight_layout="kc") -> Tensor'
+    'str weight_layout="kc", *, ScalarType? out_dtype=None) -> Tensor'
 )
 
 
@@ -1575,6 +1580,8 @@ def spmm_csr(
     B_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     weight_layout: str = "kc",
+    *,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
@@ -1625,7 +1632,9 @@ def spmm_csr(
         )
 
         # Sparse mm only supports float32 for now
-        output = torch.sparse.mm(csr, B_batch.to(torch.float32)).to(B.dtype)
+        output = torch.sparse.mm(csr, B_batch.to(torch.float32)).to(
+            B.dtype if out_dtype is None else out_dtype
+        )
         outputs.append(output)
 
     output = torch.stack(outputs, dim=0)
@@ -1644,8 +1653,10 @@ def _(
     B_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     weight_layout: str = "kc",
+    *,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     batch_shape = indptr.shape[:-1]
     X = indptr.shape[-1] - 1
     K = B.shape[-1] if weight_layout == "ck" else B.shape[-2]
-    return data.new_empty((*batch_shape, X, K))
+    return data.new_empty((*batch_shape, X, K), dtype=out_dtype)

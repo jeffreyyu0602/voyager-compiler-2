@@ -880,7 +880,7 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         tensor_layout="nhwc",
-        gemm_layout="xc,ck",
+        gemm_layout="xc,ck->xk",
         keep_fp32=False,
     )
 

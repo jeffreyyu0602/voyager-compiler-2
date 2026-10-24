@@ -2,24 +2,24 @@
 
 The data-layout passes re-store certain operands in hardware-friendly
 layouts: NHWC activations + HWIO conv weights, and GEMM operands
-contraction-major.  Each affected conv / pool operator gets a
-``quantized_ops`` twin with the SAME name and the SAME schema (extracted
-verbatim from the aten ``OpOverload``, so the backend keeps seeing the
-familiar targets); the generated eager impl permutes the
-layout-transformed inputs back to aten's native layout, calls the
-original operator, and permutes the result into the hardware layout.
-The GEMMs, ``quantized_ops.linear`` and ``quantized_ops.matmul``, take
-aten's operands plus one ``layout`` argument naming how each is stored
-(``GemmLayout``).  The op and its arguments therefore carry the layout
-contract: eager execution of a transformed graph is correct with no
-process-global monkeypatching.
+contraction-major.  Each affected pool operator gets a ``quantized_ops``
+twin with the SAME name and the SAME schema (extracted verbatim from the
+aten ``OpOverload``, so the backend keeps seeing the familiar targets);
+the generated eager impl permutes the layout-transformed inputs back to
+aten's native layout, calls the original operator, and permutes the
+result into the hardware layout.  ``quantized_ops.conv2d`` takes aten's
+operands plus a ``layout`` argument, ``"nchw"`` or ``"nhwc"``, and the
+GEMMs, ``quantized_ops.linear`` and ``quantized_ops.matmul``, one naming
+how each operand is stored (``GemmLayout``).  The op and its arguments
+therefore carry the layout contract: eager execution of a transformed
+graph is correct with no process-global monkeypatching.
 
 This module is a leaf (it imports only torch): the ops are registered
 the moment ``quantized`` imports it, before any module that references
 ``torch.ops.quantized_ops.conv2d`` etc. at import time can load.
 """
 
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -34,31 +34,30 @@ HWIO_TO_OIHW = (3, 2, 0, 1)
 TENSOR_LAYOUTS = ("nchw", "nhwc")
 DEFAULT_TENSOR_LAYOUT = "nchw"
 
-# A GEMM's layout, ``"<activation>,<weight>"`` in C (contraction), K (output
-# features) and X (tokens, the activation's rows): ``"xc,kc"`` is PyTorch's,
-# ``"xc,ck"`` stores the weight [contraction, out], and ``"cx,ck"`` also
-# stores the activations between GEMMs contraction-major, [features, tokens],
-# the order a Trainium TensorE contracts over its partitions.  A
-# contraction-major activation needs the CK weight.  A matrix-vector GEMM's
-# activation is a single row, the same bytes in either order, so its layout
-# is always ``"xc"``.  The default serves both the matrix-matrix and the
-# matrix-vector layout.
-GEMM_LAYOUTS = ("xc,kc", "xc,ck", "cx,ck")
-GEMV_LAYOUTS = ("xc,kc", "xc,ck")
-DEFAULT_GEMM_LAYOUT = "xc,kc"
-
-# A GEMM op's ``layout`` argument, ``"<activation>,<weight>[,<output>]"``,
-# each part a tensor's last two dims in the letters above: the activation
-# ``"xc"`` or ``"cx"``, the weight ``"kc"`` or ``"ck"``, and the output
-# ``"xk"`` [tokens, out] -- the default, left out -- or ``"kx"``.
+# A GEMM op's ``layout`` argument names how its operands and output are
+# stored, in einsum form over their last two dims (batch dims left out),
+# ``"<activation>,<weight>-><output>"``, in C (contraction), K (output
+# features) and X (tokens, the activation's rows): the activation ``"xc"``
+# or ``"cx"``, the weight ``"kc"`` or ``"ck"``, and the output ``"xk"``
+# [tokens, out], as aten computes it, or ``"kx"``.  ``"xc,kc->xk"`` is
+# PyTorch's, ``"xc,ck->xk"`` stores the weight [contraction, out], and
+# ``"cx,ck->xk"`` also stores the activations between GEMMs
+# contraction-major, [features, tokens], the order a Trainium TensorE
+# contracts over its partitions.  A contraction-major activation needs the
+# CK weight.  A matrix-vector GEMM's activation is a single row, the same
+# bytes in either order, so it is always ``"xc"``.  The default serves both
+# the matrix-matrix and the matrix-vector layout.
+GEMM_LAYOUTS = ("xc,kc->xk", "xc,ck->xk", "cx,ck->xk")
+GEMV_LAYOUTS = ("xc,kc->xk", "xc,ck->xk")
+DEFAULT_GEMM_LAYOUT = "xc,kc->xk"
 GEMM_ACTIVATION_LAYOUTS = ("xc", "cx")
 GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
 DEFAULT_GEMM_OUTPUT = "xk"
 GEMM_OUTPUT_LAYOUTS = (DEFAULT_GEMM_OUTPUT, "kx")
 # The layouts ``aten.linear`` and ``aten.matmul`` compute in: the default of
 # each GEMM op.
-LINEAR_LAYOUT = "xc,kc"
-MATMUL_LAYOUT = "xc,ck"
+LINEAR_LAYOUT = "xc,kc->xk"
+MATMUL_LAYOUT = "xc,ck->xk"
 
 
 class GemmLayout(NamedTuple):
@@ -67,21 +66,21 @@ class GemmLayout(NamedTuple):
 
     activation: str
     weight: str
-    output: str = DEFAULT_GEMM_OUTPUT
+    output: str
 
     @classmethod
     def parse(cls, layout: str) -> "GemmLayout":
         """The parts of ``layout``, a GEMM op's ``layout`` argument."""
-        parts = cls(*layout.split(","))
+        operands, output = layout.split("->")
+        parts = cls(*operands.split(","), output)
         assert parts.activation in GEMM_ACTIVATION_LAYOUTS, layout
         assert parts.weight in GEMM_WEIGHT_LAYOUTS, layout
         assert parts.output in GEMM_OUTPUT_LAYOUTS, layout
         return parts
 
     def __str__(self) -> str:
-        """The ``layout`` argument, its output left out when the default."""
-        parts = self[:2] if self.output == DEFAULT_GEMM_OUTPUT else self
-        return ",".join(parts)
+        """The ``layout`` argument."""
+        return f"{self.activation},{self.weight}->{self.output}"
 
 
 def project(per_axis: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
@@ -121,10 +120,9 @@ def unproject(physical: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
     return tuple(physical[dims.index(a)] for a in range(len(physical)))
 
 
-# Operators consuming NHWC activations (their twin takes and returns
-# hardware-layout tensors; a conv weight is HWIO).
+# The pools consuming NHWC activations (their twin takes and returns
+# hardware-layout tensors).
 NHWC_LAYOUT_OPS: List[torch._ops.OpOverload] = [
-    torch.ops.aten.conv2d.default,
     torch.ops.aten.max_pool2d.default,
     torch.ops.aten.avg_pool2d.default,
     torch.ops.aten.adaptive_avg_pool2d.default,
@@ -137,76 +135,77 @@ NHWC_LAYOUT_OPS: List[torch._ops.OpOverload] = [
 _QUANTIZED_OPS_FRAGMENT = torch.library.Library("quantized_ops", "FRAGMENT")
 
 
-def _define_layout_variant(aten_op, arg_transforms, out_transform):
-    """Register the ``quantized_ops`` twin of ``aten_op`` — SAME name,
-    SAME schema — and return its ``OpOverload``.
+def _define_nhwc_variant(aten_op):
+    """Register the NHWC twin of the pool ``aten_op`` and return its
+    ``OpOverload``.
 
-    ``arg_transforms`` maps an argument name to ``fn(value, bound)`` that
-    converts that input from the hardware layout back to aten's native
-    layout (``bound`` is the full name->value argument mapping, so a
-    transform may depend on another argument, e.g. conv ``groups``);
-    ``out_transform`` converts the aten result into the hardware layout
-    (``None`` = unchanged).  The impl is ``CompositeExplicitAutograd``,
-    so fake tensors / export trace through it and no per-op fake impl is
-    needed.
+    The twin has aten's name and schema; it takes its first (activation)
+    argument NHWC and returns NHWC.  The impl is
+    ``CompositeExplicitAutograd``, so fake tensors and export trace through
+    it with no fake impl.
     """
     schema = aten_op._schema
-    assert not schema.is_mutable and all(
-        a.alias_info is None for a in schema.arguments
-    ), f"layout variant of aliasing/mutating op {schema.name} unsupported"
-    assert len(schema.returns) == 1, f"{schema.name}: single return required"
-
     name = schema.name.split("::")[1]
     _QUANTIZED_OPS_FRAGMENT.define(str(schema).split("::", 1)[1])
 
-    arg_names = [a.name for a in schema.arguments]
-
-    def wrapper(*args, **kwargs):
-        bound = dict(zip(arg_names, args)) | kwargs
-        args = list(args)
-        for key, fn in arg_transforms.items():
-            i = arg_names.index(key)
-            if i < len(args) and args[i] is not None:
-                args[i] = fn(args[i], bound)
-            elif kwargs.get(key) is not None:
-                kwargs[key] = fn(kwargs[key], bound)
-        out = aten_op(*args, **kwargs)
-        return out_transform(out) if out_transform is not None else out
+    def nhwc_impl(input, *args):
+        out = aten_op(input.permute(NHWC_TO_NCHW), *args)
+        return out.permute(NCHW_TO_NHWC)
 
     torch.library.impl(
         _QUANTIZED_OPS_FRAGMENT, name, "CompositeExplicitAutograd"
-    )(wrapper)
+    )(nhwc_impl)
     return getattr(torch.ops.quantized_ops, name).default
 
 
-def register_nhwc_operators() -> Dict:
-    """Generate the NHWC twin of every ``NHWC_LAYOUT_OPS`` entry: the
-    first (activation) argument arrives NHWC, a ``weight`` argument
-    arrives HWIO (kept as-is for a depthwise conv, whose weight layout
-    is not transformed), and the result is returned NHWC.  Returns
-    ``{aten OpOverload: generated OpOverload}``.
-    """
-
-    def to_nchw(t, bound):
-        return t.permute(NHWC_TO_NCHW)
-
-    def weight_to_nchw(t, bound):
-        return t.permute(HWIO_TO_OIHW) if bound.get("groups", 1) == 1 else t
-
-    def to_nhwc(t):
-        return t.permute(NCHW_TO_NHWC)
-
-    variants = {}
-    for op in NHWC_LAYOUT_OPS:
-        arg_names = [a.name for a in op._schema.arguments]
-        transforms = {arg_names[0]: to_nchw}
-        if "weight" in arg_names:
-            transforms["weight"] = weight_to_nchw
-        variants[op] = _define_layout_variant(op, transforms, to_nhwc)
-    return variants
+# ``{aten pool: its NHWC twin}``.
+NHWC_OP_VARIANTS = {op: _define_nhwc_variant(op) for op in NHWC_LAYOUT_OPS}
 
 
-NHWC_OP_VARIANTS = register_nhwc_operators()
+# aten's ``conv2d`` on feature maps stored as ``layout`` says, a
+# ``TENSOR_LAYOUTS`` entry: under ``"nhwc"`` the input and result are NHWC
+# and a dense conv's weight is HWIO (a grouped conv's stays OIHW).
+# ``out_dtype``, when given, is the dtype the convolution is summed in
+# float32 and returned in, as for ``linear`` below.
+_QUANTIZED_OPS_FRAGMENT.define(
+    "conv2d(Tensor input, Tensor weight, Tensor? bias=None, "
+    "SymInt[2] stride=[1, 1], SymInt[2] padding=[0, 0], "
+    "SymInt[2] dilation=[1, 1], SymInt groups=1, *, "
+    f'str layout="{DEFAULT_TENSOR_LAYOUT}", ScalarType? out_dtype=None) '
+    "-> Tensor"
+)
+
+
+@torch.library.impl(
+    _QUANTIZED_OPS_FRAGMENT, "conv2d", "CompositeExplicitAutograd"
+)
+def _conv2d(
+    input,
+    weight,
+    bias=None,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    groups=1,
+    *,
+    layout=DEFAULT_TENSOR_LAYOUT,
+    out_dtype=None,
+):
+    assert layout in TENSOR_LAYOUTS, layout
+    nhwc = layout == "nhwc"
+    if nhwc:
+        input = input.permute(NHWC_TO_NCHW)
+        if groups == 1:
+            weight = weight.permute(HWIO_TO_OIHW)
+    if out_dtype is not None:
+        input, weight = input.float(), weight.float()
+        bias = None if bias is None else bias.float()
+    out = torch.ops.aten.conv2d(
+        input, weight, bias, stride, padding, dilation, groups
+    )
+    if out_dtype is not None:
+        out = out.to(out_dtype)
+    return out.permute(NCHW_TO_NHWC) if nhwc else out
 
 
 # The GEMMs in any layout: aten's ``linear`` and ``matmul`` on operands

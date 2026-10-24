@@ -478,7 +478,7 @@ class TrainiumAttention(OpModel):
 # its product summed and returned in float32.
 KMAJOR_MATMUL = functools.partial(
     torch.ops.quantized_ops.matmul.default,
-    layout="cx,ck",
+    layout="cx,ck->xk",
     out_dtype=torch.float32,
 )
 

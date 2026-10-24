@@ -199,8 +199,8 @@ def _core(target, sbuf_bytes, dram_bandwidth):
 # on the free axis.
 LAYOUT = {
     "tensor_layout": "nchw",
-    "gemm_layout": "cx,ck",
-    "gemv_layout": "xc,ck",
+    "gemm_layout": "cx,ck->xk",
+    "gemv_layout": "xc,ck->xk",
 }
 
 TRN2 = _core("trn2", 28 << 20, 16 * 27.0)

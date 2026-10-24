@@ -1145,6 +1145,7 @@ def build_sparse_gemm(
             node,
             ctx.tiler,
             k_tiles=geom.n_k if geom is not None else None,
+            accumulate_fp32=ctx.accumulate_fp32,
         )
     if plan is None:
         return None

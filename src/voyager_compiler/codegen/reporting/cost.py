@@ -172,10 +172,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
 
     if is_conv2d(anchor):
         w = _shape(anchor.args[1])
-        nhwc = (
-            anchor.target is torch.ops.quantized_ops.conv2d.default
-            or anchor.kwargs.get("layout") == "nhwc"
-        )
+        nhwc = anchor.kwargs.get("layout") == "nhwc"
         if nhwc and not is_depthwise_conv(anchor):  # HWIO = [kh, kw, C, K]
             kh, kw, c = w[0], w[1], w[2]
         else:  # OIHW = [K, C, kh, kw]

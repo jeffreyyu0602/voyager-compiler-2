@@ -53,43 +53,43 @@ DIFF_EXCERPT_LINES = 60
 SCHEME_ARGS = {
     "E4M3": (
         "--activation fp8_e4m3 --weight fp8_e4m3 --bf16 "
-        "--tensor_layout nhwc --gemm_layout xc,ck"
+        "--tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
     "P8_1": (
         "--activation posit8_1 --weight posit8_1 --bf16 "
-        "--tensor_layout nhwc --gemm_layout xc,ck"
+        "--tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
     "INT8": (
         "--activation int8,qs=per_tensor_symmetric "
         "--weight int8,qs=per_tensor_symmetric --bias int24 --bf16 "
-        "--calibration_steps 3 --tensor_layout nhwc --gemm_layout xc,ck"
+        "--calibration_steps 3 --tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
     "MXINT8": (
         "--activation int8,qs=microscaling,bs=16,pot=1 "
         "--weight int8,qs=microscaling,bs=16,pot=1 "
-        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
     "MXNF4": (
         "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
         "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --tensor_layout nhwc "
-        "--gemm_layout xc,ck --scratchpad_size 2097152 --num_banks 16 "
+        "--gemm_layout xc,ck->xk --scratchpad_size 2097152 --num_banks 16 "
         "--conv2d_im2col"
     ),
-    "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck",
+    "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk",
     # Training schemes: the gradients (--error) are quantized too.  FP8 is
     # e4m3 forward and e5m2 gradients with per-tensor delayed scaling.
     "FP8": (
         "--activation fp8_e4m3,qs=per_tensor_symmetric,ahl=16 "
         "--weight fp8_e4m3,qs=per_tensor_symmetric,ahl=16 "
         "--error fp8_e5m2,qs=per_tensor_symmetric,ahl=16 "
-        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
     "MXFP4": (
         "--activation fp4_e2m1,qs=microscaling,bs=32,pot=1 "
         "--weight fp4_e2m1,qs=microscaling,bs=32,pot=1 "
         "--error fp4_e2m1,qs=microscaling,bs=32,pot=1 "
-        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck"
+        "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk"
     ),
 }
 

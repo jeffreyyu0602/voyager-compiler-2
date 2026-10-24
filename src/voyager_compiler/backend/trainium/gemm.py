@@ -11,7 +11,7 @@ keeps its running sum in PSUM across them, so it is split only when its
 output tile fits there beside the kernel's other PSUM boxes
 (``gemm_buffers``, ``fits_psum``).  An activation stored K-major
 (``activation_k_major``) needs no transposes, and a K-major GEMM writing its
-output transposed (layout ``"cx,ck,kx"``) holds ``cols`` on the PSUM
+output transposed (layout ``"cx,ck->kx"``) holds ``cols`` on the PSUM
 partitions: the weight is stationary and the activation moves.  An MX GEMM
 step runs one ``nc_matmul_mx`` per 512-K chunk with no transposes.
 
@@ -1524,7 +1524,7 @@ class GemmSteps:
         plan: The GEMM's ``_GemmPlan``.
         op: The GEMM op each slice calls.
         kwargs: The GEMM's arguments other than tensors, with each slice's
-            ``layout``: the GEMM's own, or ``"cx,ck"`` reading a transposed
+            ``layout``: the GEMM's own, or ``"cx,ck->xk"`` reading a transposed
             row-major activation.
         mx: The GEMM's operands are MX.
         buffers: The buffers the tile search placed, by role
@@ -1593,7 +1593,7 @@ class GemmSteps:
             for k, v in anchor.kwargs.items()
             if not isinstance(v, torch.fx.Node)
         }
-        self.kwargs["layout"] = "cx,ck" if self.transposes else str(layout)
+        self.kwargs["layout"] = "cx,ck->xk" if self.transposes else str(layout)
         # Each slice's product lands in a PSUM tile, summed in its dtype.
         self.kwargs["out_dtype"] = self.buffers[RESULTS].dtype
         p, free = config.partitions, config.moving_free_max

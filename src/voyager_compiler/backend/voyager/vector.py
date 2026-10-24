@@ -895,28 +895,35 @@ class VoyagerGemv(VoyagerVector):
         self._staged = breaks_stream or not fusible
 
     def _reserved_bytes(self, shapes, scratch):
-        """``VoyagerVector._reserved_bytes`` plus the accumulator a fused
-        tail reduces into, the one ``_ScratchSpec`` the builder allocates for
-        the whole kernel when the reduction is split across K, and when a
-        stream-breaking tail stages the finished tile even for a single round
-        (``_gemm_scratch_and_kernel``).  It is sized off the shape-preserving
-        output tile -- a ``quantize_mx`` tail returns ``(scale, value)`` --
-        in the anchor's own dtype, the partial sum it holds."""
+        """``VoyagerVector._reserved_bytes`` plus the scratch accumulator the
+        builder allocates once for the whole kernel
+        (``_gemm_scratch_and_kernel``): when a reduction split across K
+        accumulates in float32, or when a fused tail reads the finished tile
+        from scratch -- a split reduction's, or a stream-breaking tail's even
+        for a single round.  It holds the shape-preserving output tile -- a
+        ``quantize_mx`` tail returns ``(scale, value)`` -- in the dtype it
+        accumulates in: float32 under ``accumulate_fp32``, else the anchor's
+        own."""
         reserved = super()._reserved_bytes(shapes, scratch)
-        if not self._has_tail:
-            return reserved
         split_k = any(
             n in shapes and shapes[n][-1] < self._reduction_size
             for n in self._input_buffers
         )
-        if not (split_k or self._staged):
+        out_dtype = self.anchor.value.dtype
+        acc_dtype = (
+            torch.float32
+            if split_k and self.model.accumulate_fp32
+            else out_dtype
+        )
+        staged = self._has_tail and (split_k or self._staged)
+        if acc_dtype == out_dtype and not staged:
             return reserved
         out_tile = shapes[self.node]
         if isinstance(out_tile[0], (tuple, list)):
             out_tile = out_tile[-1]
         return reserved + tensor_alloc_bytes(
             math.prod(out_tile),
-            self.anchor.value.dtype,
+            acc_dtype,
             self.config.bank_width,
             self.config.vector_lanes,
         )

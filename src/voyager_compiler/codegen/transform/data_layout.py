@@ -73,6 +73,7 @@ def extract_conv2d_graph(
         torch.ops.aten.slice.Tensor,
         torch.ops.aten.cat.default,
         torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.aten.conv2d.default,
         torch.ops.quantized_ops.conv2d_mx.default,
     }
 
@@ -266,7 +267,10 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
     if node.target in NHWC_OP_VARIANTS:
         node.target = NHWC_OP_VARIANTS[node.target]
         node.meta["transposed"] = True
-    elif node.target is torch.ops.quantized_ops.conv2d_mx.default:
+    elif is_conv2d(node):
+        # aten.conv2d takes no layout, so it runs as its quantized_ops twin.
+        if node.target is torch.ops.aten.conv2d.default:
+            node.target = torch.ops.quantized_ops.conv2d.default
         node.kwargs = {**node.kwargs, "layout": "nhwc"}
         node.meta["transposed"] = True
 
@@ -278,8 +282,7 @@ def normalize_conv2d_layout(model: GraphModule):
 
     for node in list(graph.nodes):
         if node in visited or (
-            node.target not in NHWC_OP_VARIANTS
-            and node.target != torch.ops.quantized_ops.conv2d_mx.default
+            node.target not in NHWC_OP_VARIANTS and not is_conv2d(node)
         ):
             continue
 
@@ -1301,13 +1304,13 @@ def _rotation(size: int, dtype: torch.dtype) -> torch.Tensor:
 
 def _rotate_by_matmul(graph, cat: Node, x: Node, rotation: Node) -> None:
     """Replace ``cat``, the rotate-half of K-major ``x`` across its
-    partitions, by ``matmul(x, rotation, layout="cx,ck,kx")``, ``rotationᵀ
+    partitions, by ``matmul(x, rotation, layout="cx,ck->kx")``, ``rotationᵀ
     x`` (``_rotation``)."""
     with graph.inserting_before(cat):
         matmul = graph.call_function(
             quantized_ops.matmul.default,
             (x, rotation),
-            {"layout": "cx,ck,kx"},
+            {"layout": "cx,ck->kx"},
         )
     matmul.meta["dtype"] = cat.meta.get("dtype")
     cat.replace_all_uses_with(matmul)
@@ -1331,8 +1334,8 @@ def normalize_activation_layout(model: GraphModule) -> GraphModule:
     views and moves, whichever transposes fewer 128 x 128 blocks where the
     island meets a reader that wants the other layout.  Every matrix-matrix
     GEMM reads its activation K-major and writes its output in its island's
-    orientation, as its ``layout`` argument says (``"cx,ck"``, or
-    ``"cx,ck,kx"`` for an output ``[N, M]``).  So does every attention,
+    orientation, as its ``layout`` argument says (``"cx,ck->xk"``, or
+    ``"cx,ck->kx"`` for an output ``[N, M]``).  So does every attention,
     ``sdpa_kmajor`` (its output by ``transpose_output``):
     TensorE contracts the head dim of ``Q Kᵀ`` over the partitions, so it
     reads its query and key K-major, ``[..., head_dim, tokens]``, and its

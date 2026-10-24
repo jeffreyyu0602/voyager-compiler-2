@@ -83,6 +83,7 @@ from voyager_compiler.ops.layout import (
     GEMM_LAYOUTS,
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
+    GemmLayout,
 )
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
@@ -304,14 +305,14 @@ def transform(
             ``"nchw"`` (channels first, PyTorch's order) or ``"nhwc"``
             (channels last, with HWIO conv weights). GEMM operands are not
             affected; they follow ``gemm_layout`` and ``gemv_layout``.
-        gemm_layout: The layout of a matrix-matrix GEMM's activation, then
-            its weight, in C (contraction), K (output features) and X
-            (tokens): ``"xc,kc"`` (PyTorch's), ``"xc,ck"`` (the weight
-            [contraction, out]) or ``"cx,ck"`` (also the activations between
-            GEMMs [features, tokens] wherever that transposes less, for a
-            Trainium TensorE; see ``normalize_activation_layout``).
+        gemm_layout: The layout of a matrix-matrix GEMM in einsum form, in
+            C (contraction), K (output features) and X (tokens):
+            ``"xc,kc->xk"`` (PyTorch's), ``"xc,ck->xk"`` (the weight
+            [contraction, out]) or ``"cx,ck->xk"`` (also the activations
+            between GEMMs [features, tokens] wherever that transposes less,
+            for a Trainium TensorE; see ``normalize_activation_layout``).
         gemv_layout: The layout of a matrix-vector GEMM (a single activation
-            row): ``"xc,kc"`` or ``"xc,ck"``.
+            row): ``"xc,kc->xk"`` or ``"xc,ck->xk"``.
         skip_op_fusion: Skip operator fusion.
         fuse_reshape: Let fusion fold a trailing reshape or permute into
             its producer's output.
@@ -350,10 +351,10 @@ def transform(
 
     assert gemm_layout in GEMM_LAYOUTS, gemm_layout
     assert gemv_layout in GEMV_LAYOUTS, gemv_layout
-    gemm_activation, gemm_weight = gemm_layout.split(",")
-    gemv_weight = gemv_layout.split(",")[1]
-    normalize_gemm_weight_layout(model, gemm_weight, gemv_weight)
-    if gemm_activation == "cx":
+    gemm = GemmLayout.parse(gemm_layout)
+    gemv_weight = GemmLayout.parse(gemv_layout).weight
+    normalize_gemm_weight_layout(model, gemm.weight, gemv_weight)
+    if gemm.activation == "cx":
         normalize_activation_layout(model)
 
     if config.pe_array_size is not None:

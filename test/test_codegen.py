@@ -108,7 +108,6 @@ FUSION_PATTERNS = [
 def main():
     torch.manual_seed(0)
     torch.set_printoptions(sci_mode=False, precision=10)
-    torch.set_num_threads(32)
     torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()

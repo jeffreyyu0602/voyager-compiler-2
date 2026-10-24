@@ -318,17 +318,18 @@ def add_layout_args(parser):
         "--gemm_layout",
         choices=GEMM_LAYOUTS,
         default=DEFAULT_GEMM_LAYOUT,
-        help="Matrix-matrix GEMM layout, the activation's then the weight's, "
-        "in C (contraction), K (output features) and X (tokens): xc,kc is "
-        "PyTorch's, xc,ck stores the weight [contraction, out], cx,ck also "
-        "stores the activations between GEMMs [features, tokens].",
+        help="Matrix-matrix GEMM layout in einsum form, in C (contraction), "
+        "K (output features) and X (tokens): xc,kc->xk is PyTorch's, "
+        "xc,ck->xk stores the weight [contraction, out], cx,ck->xk also "
+        "stores the activations between GEMMs [features, tokens]. Quote "
+        "it in a shell, e.g. --gemm_layout 'xc,ck->xk'.",
     )
     parser.add_argument(
         "--gemv_layout",
         choices=GEMV_LAYOUTS,
         default=DEFAULT_GEMM_LAYOUT,
-        help="Matrix-vector GEMM layout (a single activation row): xc,kc or "
-        "xc,ck.",
+        help="Matrix-vector GEMM layout (a single activation row): "
+        "xc,kc->xk or xc,ck->xk, quoted in a shell.",
     )
 
 

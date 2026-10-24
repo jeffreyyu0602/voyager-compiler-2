@@ -47,10 +47,10 @@ columns of its result and per 128-deep chunk of its contraction (two whole
 ones in an FP8 ``double_row`` matmul, ``_nc_matmul``; 512-deep MX), a
 transpose per 128 x 128 block.
 
-A GEMM on a K-major activation (its ``layout`` ``"cx,ck"``, ``[..., K, M]``)
+A GEMM on a K-major activation (its ``layout`` ``"cx,ck->xk"``, ``[..., K, M]``)
 reads it as stored, its contraction already on the partitions: the
 activation is the stationary operand, or the moving one and the weight the
-stationary when the GEMM writes its output transposed (``"cx,ck,kx"``,
+stationary when the GEMM writes its output transposed (``"cx,ck->kx"``,
 ``[..., N, M]``), and nothing is transposed.  Across the partitions of a
 K-major tile, an RMS norm sums the squares by a ones-matmul on TensorE;
 RoPE's rotate-half arrives as a K-major ``matmul`` by a signed permutation
