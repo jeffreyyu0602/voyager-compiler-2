@@ -11,10 +11,11 @@ Runs in the ``trn`` env (Neuron SDK, torch 2.9), which cannot import
 ``<dir>`` holds ``translate``'s output beside ``tensors.pt``, the value of
 every HBM box -- the inputs, the parameters and each kernel's results, as
 Voyager's own bufferized graph computed them.  A kernel call runs on the
-values of its inputs and is compared with the values of its outputs; the
-program runs on the inputs and parameters alone.  The error is the largest
-absolute difference over the largest reference magnitude; an MX output's
-is taken block by block (``mx_error``).
+values of its inputs and is compared with the values of its outputs, of an
+output it writes part of (its step's ``partial``) only there; the program
+runs on the inputs and parameters alone.  The error is the largest absolute
+difference over the largest reference magnitude; an MX output's is taken
+block by block (``mx_error``).
 """
 
 import argparse
@@ -189,10 +190,15 @@ def check_calls(directory, kernels, manifest, tensors, only, distinct):
             # An MX array is checked with the other half of its pair.
             codes = codes_of.get(b, b)
             if codes not in pairs:
-                errors.append(error(got[b], tensors[b]))
+                want = tensors[b].float().flatten()
+                runs = call["partial"].get(b, [[0, want.numel()]])
+                at = torch.cat([torch.arange(a, z) for a, z in runs])
+                errors.append(error(got[b].float().flatten()[at], want[at]))
                 bars.append(MAX_FP8_ERROR.get(dtypes.get(b), MAX_ERROR))
                 continue
             scales = pairs[codes]["scales"]
+            if {codes, scales} & set(call["partial"]):
+                raise NotImplementedError(f"{b}: an MX array written in part")
             if codes not in got or scales not in got:
                 raise NotImplementedError(f"{b}: half an MX pair written")
             errors.append(

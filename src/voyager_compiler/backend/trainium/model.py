@@ -318,8 +318,9 @@ class TrainiumModel(RuntimeModel):
         store: each output's ``dma_copy`` instructions (``_dma_count``), or
         the MX layout's transfers.  A tile lies on ``parts`` partitions, as
         the translator lays out a vector op's (``TrainiumVector.row_parts``):
-        cut evenly across them in one ``dma_copy`` when ``spread``, else,
-        one row loaded, a copy of it on each."""
+        cut evenly across them in one ``dma_copy`` when ``spread``, else a
+        load of fewer rows copied onto each: one row in one ``dma_copy``,
+        several loaded once per copy."""
         if n in mx:
             return sum(self.mx_dma_ns(*array) for array in mx[n])
         values = n.value if isinstance(n.value, (tuple, list)) else [n.value]
@@ -328,11 +329,14 @@ class TrainiumModel(RuntimeModel):
         for (s, bits), value in zip(output_buffers(shape, n), values):
             rows, cols = rows_cols(s)
             count = _dma_count(tuple(s), value.shape, p)
+            copies = 1
             if spread:
                 rows, cols, count = parts, rows * cols // parts, 1
             elif rows == 1 and load:
                 rows = parts
-            total += self.dma_ns(rows, cols, bits, count, load)
+            elif rows < parts and load:
+                copies = parts // rows
+            total += copies * self.dma_ns(rows, cols, bits, count, load)
         return total
 
     def quantize_mx_busy(self, rows, cols):

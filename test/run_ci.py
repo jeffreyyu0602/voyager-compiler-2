@@ -192,6 +192,13 @@ COMMANDS = [
 TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 
+# The CI's name, heading its output and report.
+TITLE = "voyager codegen CI"
+# The files each command's outputs are compared by.
+OUTPUTS = ("model.txt",)
+# The verdicts that fail a run.
+GATED = ("FAILED", "MISMATCH")
+
 
 def _label(command):
     """``<network>/<scheme>/<unrolling>`` — unique per command (unrolling
@@ -207,7 +214,7 @@ assert len({_label(c) for c in COMMANDS}) == len(COMMANDS), (
 )
 
 
-def _matches(label, pattern):
+def matches(label, pattern):
     """Does ``pattern`` select ``label`` (``network/scheme/unrolling``)?
 
     Matching is anchored at ``/`` segment boundaries, not raw substring: a
@@ -252,10 +259,20 @@ def _build(command, run_dir):
     return label, dest, argv
 
 
-def _programs(dest):
-    """The ``model.txt`` files a command wrote, relative to ``dest``: one for
-    inference, one per program (``gradient/``, ``update/``) for training."""
-    return sorted(p.relative_to(dest) for p in dest.rglob("model.txt"))
+def outputs(dest, names):
+    """Finds the files named one of ``names`` that a command wrote.
+
+    Args:
+        dest: The command's output folder.
+        names: The file names sought, e.g. ``model.txt``: one for inference,
+            one per program (``gradient/``, ``update/``) for training.
+
+    Returns:
+        Their paths relative to ``dest``, sorted.
+    """
+    return sorted(
+        p.relative_to(dest) for name in names for p in dest.rglob(name)
+    )
 
 
 def _run_one(label, dest, argv, env):
@@ -284,7 +301,7 @@ def _run_one(label, dest, argv, env):
 
     if proc.returncode != 0:
         return "error"
-    if not _programs(dest):
+    if not outputs(dest, OUTPUTS):
         return "no_output"
     log = log_path.read_text()
     if "Skipping output verification" in log:
@@ -304,19 +321,29 @@ def _find_previous_run(out_dir, current):
     return out_dir / runs[-1] if runs else None
 
 
-def _compare(label, status, run_dir, prev_run):
-    """Classify one label's model.txt files vs the previous run.
+def compare(label, failed, run_dir, prev_run, names):
+    """Classifies one label's output files against the previous run's.
 
-    Returns ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only
-    for a MISMATCH.
+    Args:
+        label: The command's label, its folder under each run.
+        failed: The command wrote no outputs to compare.
+        run_dir: This run's folder.
+        prev_run: The previous run's folder, or ``None``.
+        names: The names of the files compared (``outputs``).
+
+    Returns:
+        ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only for
+        a MISMATCH.
     """
-    if status in ("error", "no_output"):
+    if failed:
         return "FAILED", ""
-    previous = set() if prev_run is None else set(_programs(prev_run / label))
+    previous = (
+        set() if prev_run is None else set(outputs(prev_run / label, names))
+    )
     if not previous:
         return "NEW", ""
 
-    programs = set(_programs(run_dir / label))
+    programs = set(outputs(run_dir / label, names))
     diff = [
         f"only in {run.name}/{label}: {program}"
         for run, only in (
@@ -336,6 +363,63 @@ def _compare(label, status, run_dir, prev_run):
     if not diff:
         return "MATCH", ""
     return "MISMATCH", "\n".join(diff[:DIFF_EXCERPT_LINES])
+
+
+def open_run(output_dir, title, names):
+    """Makes this run's timestamped folder and prints what it compares.
+
+    Args:
+        output_dir: The folder holding every run (created if missing).
+        title: The CI's name, printed first.
+        names: The names of the files compared (``outputs``).
+
+    Returns:
+        ``(run_dir, prev_run)``: this run's folder and the newest earlier
+        run's, or ``None`` when there is none.
+    """
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime(TS_FORMAT)
+    run_dir = out_dir / timestamp
+    run_dir.mkdir()
+
+    prev_run = _find_previous_run(out_dir, timestamp)
+
+    print(f"{title} -> {run_dir}")
+    if prev_run is not None:
+        compared = ", ".join(names)
+        print(f"comparing {compared} against previous run: {prev_run.name}")
+    else:
+        print("no previous run found; this run is the baseline")
+    return run_dir, prev_run
+
+
+def run_all(items, run, jobs):
+    """Runs ``run`` on each of ``items``, ``jobs`` at a time.
+
+    Prints each item's verdict as it lands.
+
+    Args:
+        items: What is run, e.g. the commands.
+        run: Runs one item and returns its ``(label, status, verdict,
+            excerpt)``.
+        jobs: How many run at once.
+
+    Returns:
+        Each item's ``run`` result, in the order of ``items``.
+    """
+    print(f"running {len(items)} commands, {jobs} at a time\n")
+    results = [None] * len(items)
+    with ThreadPoolExecutor(jobs) as pool:
+        futures = {pool.submit(run, c): i for i, c in enumerate(items)}
+        for done, future in enumerate(as_completed(futures), 1):
+            label, status, verdict, excerpt = future.result()
+            results[futures[future]] = (label, status, verdict, excerpt)
+            suffix = "" if status == "ok" else f" ({status})"
+            print(f"[{done}/{len(items)}] {label} ... {verdict}{suffix}")
+            sys.stdout.flush()
+    return results
 
 
 def main():
@@ -374,9 +458,7 @@ def main():
     commands = COMMANDS
     if args.only:
         commands = [
-            c
-            for c in COMMANDS
-            if any(_matches(_label(c), p) for p in args.only)
+            c for c in COMMANDS if any(matches(_label(c), p) for p in args.only)
         ]
 
     if args.list:
@@ -390,21 +472,7 @@ def main():
     if not commands:
         parser.error(f"--only {args.only} matched no commands")
 
-    out_dir = Path(args.output_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime(TS_FORMAT)
-    run_dir = out_dir / timestamp
-    run_dir.mkdir()
-
-    prev_run = _find_previous_run(out_dir, timestamp)
-
-    print(f"voyager codegen CI -> {run_dir}")
-    if prev_run is not None:
-        print(f"comparing model.txt against previous run: {prev_run.name}")
-    else:
-        print("no previous run found; this run is the baseline")
-    print(f"running {len(commands)} commands, {args.jobs} at a time\n")
+    run_dir, prev_run = open_run(args.output_dir, TITLE, OUTPUTS)
 
     env = dict(os.environ)
     if args.threads is not None:
@@ -418,38 +486,44 @@ def main():
     def run(command):
         label, dest, argv = _build(command, run_dir)
         status = _run_one(label, dest, argv, env)
-        verdict, excerpt = _compare(label, status, run_dir, prev_run)
+        failed = status in ("error", "no_output")
+        verdict, excerpt = compare(label, failed, run_dir, prev_run, OUTPUTS)
         return label, status, verdict, excerpt
 
     # (label, status, verdict, diff_excerpt), in command order.
-    results = [None] * len(commands)
-    with ThreadPoolExecutor(args.jobs) as pool:
-        futures = {pool.submit(run, c): i for i, c in enumerate(commands)}
-        for done, future in enumerate(as_completed(futures), 1):
-            label, status, verdict, excerpt = future.result()
-            results[futures[future]] = (label, status, verdict, excerpt)
-            suffix = "" if status == "ok" else f" ({status})"
-            print(f"[{done}/{len(commands)}] {label} ... {verdict}{suffix}")
-            sys.stdout.flush()
+    results = run_all(commands, run, args.jobs)
 
-    report = _build_report(results, run_dir, prev_run)
+    report = build_report(results, run_dir, prev_run, TITLE)
     (run_dir / "report.txt").write_text(report)
     print("\n" + report)
 
     # Gate: fail on any compile failure or model.txt mismatch.
-    bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]
-    return 1 if bad else 0
+    return 1 if any(r[2] in GATED for r in results) else 0
 
 
-def _build_report(results, run_dir, prev_run):
-    """Render the human-readable summary written to report.txt + stdout."""
+def build_report(results, run_dir, prev_run, title):
+    """Renders the summary written to ``report.txt`` and stdout.
+
+    A label in the previous run that is absent from ``results`` is reported
+    MISSING; it is found as the first three path segments of a ``model.txt``
+    there, so every label must be three segments and write one.
+
+    Args:
+        results: Each command's ``(label, status, verdict, excerpt)``.
+        run_dir: This run's folder.
+        prev_run: The previous run's folder, or ``None``.
+        title: The CI's name, heading the report.
+
+    Returns:
+        The report's text, ending in ``RESULT: PASS`` or ``RESULT: FAIL``.
+    """
     counts = {}
     for _, _, verdict, _ in results:
         counts[verdict] = counts.get(verdict, 0) + 1
 
     lines = []
     lines.append("=" * 70)
-    lines.append(f"voyager codegen CI report  ({run_dir.name})")
+    lines.append(f"{title} report  ({run_dir.name})")
     if prev_run is not None:
         lines.append(f"compared against: {prev_run.name}")
     else:
@@ -493,7 +567,7 @@ def _build_report(results, run_dir, prev_run):
         for label in sorted(previous - current_labels):
             lines.append(f"  - MISSING: {label} (in {prev_run.name})")
 
-    bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]
+    bad = any(r[2] in GATED for r in results)
     lines.append("")
     lines.append("RESULT: FAIL" if bad else "RESULT: PASS")
     return "\n".join(lines)

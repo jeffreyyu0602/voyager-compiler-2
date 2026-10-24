@@ -15,8 +15,10 @@ op of the kernel touching it reads or writes whole, element for element, in
 an elementwise chain (or, one row, an RMS norm alone), and TensorE never
 reads -- is cut in row-major order across the partitions, each op on it
 running there (``Layout.spread``): HBM still holds it as rows.  Any other
-one-row tile read as an elementwise operand is copied onto each partition
-the op reading it takes when it is loaded.
+tile read only as an elementwise operand, of one row or of fewer rows than
+an elementwise or row-wise op reading it, is copied onto each partition the
+op takes when it is loaded, row ``p % rows`` onto partition ``p``
+(``Layout.replicated``).
 Every access is an ``.ap()`` access pattern, found by mapping each element's
 logical coordinates to its offset and factoring the offsets into one nesting
 per instruction (``fit``), so views and relayouts fused into a kernel need
@@ -277,10 +279,10 @@ class Layout:
     """A box's slot on chip: ``parts`` partitions by ``blocks`` row blocks of
     room for ``cols`` columns (at least the box's), row ``r`` on partition
     ``r % span`` of block ``r // span``, its elements ``spacing`` apart; a
-    ``replicated`` one-row box on each of its ``parts`` partitions.  A box
-    with ``span`` 1 is all on one partition.  A ``spread`` box is its
-    elements cut in row-major order across the partitions, ``cols`` to each,
-    element ``e`` on partition ``e // cols``."""
+    ``replicated`` box's row ``p % rows`` on each partition ``p`` of its
+    ``parts``.  A box with ``span`` 1 is all on one partition.  A ``spread``
+    box is its elements cut in row-major order across the partitions,
+    ``cols`` to each, element ``e`` on partition ``e // cols``."""
 
     parts: int
     blocks: int
@@ -310,6 +312,8 @@ class OpUse:
         rows: The boxes it holds as rows of its result: its result and
             the operands of its result's size.
         touched: Every on-chip box it reads or writes.
+        broadcast: The boxes an elementwise or row-wise op reads with fewer
+            rows than its ``parts``, each copied onto its partitions.
     """
 
     flat: bool
@@ -317,6 +321,7 @@ class OpUse:
     cols: int
     rows: frozenset
     touched: frozenset
+    broadcast: frozenset
 
 
 @dataclass
@@ -677,6 +682,8 @@ class Kernel:
         boxes: Every box the kernel touches, by name.
         reads: The HBM boxes it reads, its arguments, in order.
         writes: The HBM boxes it writes, its results, in order.
+        stored: Each box of ``writes`` -> which of its elements, row-major,
+            the kernel stores.
         windows: Each pool input box -> ``(kH, sH, dH, out_rows, out_h)``:
             its kernel height, stride and dilation along H, and the rows and
             height of the pool's output tile.
@@ -709,6 +716,7 @@ class Kernel:
         # to an even number (a stationary operand's width must be even).
         self.mx_tiles = {}
         self.reads, self.writes = [], []
+        self.stored = {}
         self.windows = {}
         self.uses = {}
         self.op_uses = []
@@ -827,9 +835,11 @@ class Kernel:
 
     def _lay_out(self):
         """Every on-chip box's layout: rows on the partitions, a flat box cut
-        across them (``_spread_ops``), any other one-row box only ever
-        read as an elementwise operand copied onto each partition an op
-        reading it takes, and a pool input as its windows (``windows``).
+        across them (``_spread_ops``), any other box only ever read as an
+        elementwise operand, of one row or broadcast along an op's rows
+        (``OpUse.broadcast``), copied onto each partition an op reading it
+        takes (``replicated``), and a pool input as its windows
+        (``windows``).
         PSUM holds an 8-bit element in two bytes, the way TensorE writes an
         FP8 transpose, and starts each row block on a 4-byte boundary, where
         an instruction's PSUM access must start."""
@@ -857,7 +867,12 @@ class Kernel:
                 )
                 continue
             replicated = (
-                box.rows == 1 and "operand" in uses and "dst" not in uses
+                "operand" in uses
+                and "dst" not in uses
+                and (
+                    box.rows == 1
+                    or any(box.name in use.broadcast for use in self.op_uses)
+                )
             )
             if replicated:
                 parts = max(
@@ -974,6 +989,9 @@ class Kernel:
             return part * layout.free + col
         row, col = np.divmod(position, box.cols)
         if layout.replicated:
+            # Partition ``p`` holds row ``p % rows`` only.
+            if np.any(row != partitions % box.rows):
+                raise CrossesPartitions(box.name)
             return partitions * layout.free + col
         part, block = row % layout.span, row // layout.span
         return part * layout.free + (block * layout.cols + col) * layout.spacing
@@ -1026,15 +1044,20 @@ class Kernel:
         for i, index in enumerate(kw["indices"]):
             d = dims[i] if dims is not None else i
             offsets[d] = index * steps[d]
+        hbm_linear = _block_positions(offsets, sizes, hbm.shape)
+        if not load:
+            stored = self.stored.setdefault(
+                hbm.box.name, np.zeros(math.prod(hbm.box.shape), bool)
+            )
+            stored[self.flat(hbm, hbm_linear)] = True
         if (
             hbm.box.name not in self.mx
             and not kw.get("transposed")
             and sbuf.box.name not in self.windows
             and (hbm.covers_box() or hbm.shape == hbm.window)
         ):
-            self._shifted_transfer(hbm, offsets, sizes, sbuf, load)
+            self._shifted_transfer(hbm, offsets, sizes, hbm_linear, sbuf, load)
             return
-        hbm_linear = _block_positions(offsets, sizes, hbm.shape)
         if hbm.box.name in self.mx:
             if kw.get("transposed"):
                 raise NotImplementedError("a transposing MX transfer")
@@ -1050,9 +1073,10 @@ class Kernel:
         else:
             self._transfer(hbm, hbm_linear, sbuf, load)
 
-    def _shifted_transfer(self, hbm, offsets, sizes, sbuf, load):
-        """``_transfer`` of the ``sizes`` block of ``hbm`` at ``offsets``,
-        replayed from an earlier copy of the same shape when there is one.
+    def _shifted_transfer(self, hbm, offsets, sizes, hbm_linear, sbuf, load):
+        """``_transfer`` of the ``sizes`` block of ``hbm`` at ``offsets``
+        (its elements ``hbm_linear``), replayed from an earlier copy of the
+        same shape when there is one.
 
         ``hbm`` is its box reshaped or a window of it seen in the window's
         shape, so the HBM offsets of two such blocks differ by one constant,
@@ -1074,7 +1098,6 @@ class Kernel:
         base = int(self.flat(hbm, corners)[0])
         if key not in self.memo:
             self.dma_log = []
-            hbm_linear = _block_positions(offsets, sizes, hbm.shape)
             self._transfer(hbm, hbm_linear, sbuf, load)
             self.memo[key] = [
                 (on_chip, steps, offset - base)
@@ -1128,10 +1151,13 @@ class Kernel:
             return s, self.flat(hbm, hbm_linear[linear])
 
         if layout.replicated:
-            parts = layout.parts if load else 1
-            linear = np.broadcast_to(np.arange(cols), (parts, cols))
+            # A pattern repeats one row onto every partition, but not
+            # several: a tile of several rows is loaded once per copy.
+            parts = layout.parts if load else rows
+            linear = np.arange(parts)[:, None] % rows * cols + np.arange(cols)
             s, h = offsets(linear)
-            self._dma(sbuf_var, layout.free, s, hbm_var, h, load)
+            for a, b in _runs(parts, rows if rows > 1 else parts):
+                self._dma(sbuf_var, layout.free, s[a:b], hbm_var, h[a:b], load)
             return
         if layout.spread:
             linear = np.arange(rows * cols).reshape(layout.parts, -1)
@@ -1341,7 +1367,9 @@ class Kernel:
         or an RMS norm alone on one row, whose result is in SBUF and whose
         operands are each the result's size or one element.  An op's rows
         take ``min(rows, 128)`` partitions of its first result, a row op's
-        of its input; another op's, every partition."""
+        of its input; another op's, every partition.  An operand of fewer
+        rows than the partitions an elementwise or row op's rows take is
+        broadcast along them (``OpUse.broadcast``)."""
         operands = [
             self._view(arg.tensor_box)
             for prim in prims
@@ -1363,6 +1391,9 @@ class Kernel:
             parts = min(
                 _rows_cols(self._result_shape(prims[0], {}))[0], PARTITIONS
             )
+        broadcast = frozenset(
+            v.box.name for v in operands if flat and v.box.rows < parts
+        )
         cols = math.prod(dst.box.shape) if isinstance(dst, View) else 0
         rows = {dst.box.name} if isinstance(dst, View) else set()
         flat = (
@@ -1387,7 +1418,9 @@ class Kernel:
                 rows.add(view.box.name)
             else:
                 flat = False
-        return OpUse(flat, parts, cols, frozenset(rows), frozenset(touched))
+        return OpUse(
+            flat, parts, cols, frozenset(rows), frozenset(touched), broadcast
+        )
 
     def _gemm_extents(self, gemm, act, weight):
         """``(batch, batch_a, batch_w, m, k, n)`` of a GEMM step: its result's
@@ -3114,6 +3147,14 @@ def translate(model, out_dir, config, immediates):
                     "" if b in mx else _kernel_cast(kernel.boxes[b].dtype)
                     for b in kernel.reads
                 ]
+                # Each result the kernel writes only part of -> the runs
+                # ``[start, stop)`` of row-major positions it writes.
+                partial = {}
+                for i, b in enumerate(kernel.writes):
+                    stored = np.concatenate(([0], kernel.stored[b], [0]))
+                    if not stored[1:-1].all():
+                        edges = np.flatnonzero(np.diff(stored))
+                        partial[i] = edges.reshape(-1, 2).tolist()
                 translated[key] = (
                     name,
                     casts,
@@ -3121,10 +3162,12 @@ def translate(model, out_dir, config, immediates):
                         [names.index(b) for b in boxes]
                         for boxes in (kernel.reads, kernel.writes)
                     ],
+                    partial,
                 )
-            name, casts, indices = translated[key]
+            name, casts, indices, partial = translated[key]
             reads, writes = ([names[i] for i in group] for group in indices)
             step = {"kernel": name, "inputs": reads, "outputs": writes}
+            step["partial"] = {writes[i]: runs for i, runs in partial.items()}
             step["ops"] = [item[0].name, item[-1].name]
             args = ", ".join(f"t[{b!r}]{c}" for b, c in zip(reads, casts))
             outs = ", ".join(f"t[{b!r}]" for b in writes)
