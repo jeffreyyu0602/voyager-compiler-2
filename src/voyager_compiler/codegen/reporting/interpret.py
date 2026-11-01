@@ -291,7 +291,8 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
 
     An in-place write (``_INPLACE_SRC``) does not read the destination it
     overwrites, and one that scatters is sized by the tensor it scatters rather
-    than by its output.
+    than by its output.  A one-element constant goes by value and owns no DRAM
+    (``_passed_whole``), so it is not read.
     """
     src = _INPLACE_SRC.get(node.target)
     dest = node.args[0] if node.target in _INPLACE_SRC else None
@@ -302,6 +303,12 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
         if not _is_tensor(inp) or inp is dest:
             continue
         root = _root(inp, bind)
+        if (
+            isinstance(root, Node)
+            and root.op == "get_attr"
+            and _val(root).numel() == 1
+        ):
+            continue
         space = root.meta.get("space") if isinstance(root, Node) else None
         if space != "DRAM":
             raise ValueError(
