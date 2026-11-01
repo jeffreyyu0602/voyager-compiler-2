@@ -96,8 +96,6 @@ class Segment:
 
 voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
-_ZERO = voyager.zeros.default
-_FILL = voyager.fill.default
 _WHILE = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 # The regions over ``(subgraph, *operands)``.
@@ -106,8 +104,15 @@ _SUBGRAPH_REGIONS = (
     torch.ops.higher_order.with_scratch,
 )
 
-# Position of ``num_slots`` in each allocation primitive's schema:
-_SLOTS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
+# Position of ``num_slots`` in ``alloc``'s schema.
+_SLOTS_ARG = 3
+
+# The hardware's counters, ids ``0 .. NUM_COUNTERS - 1``.
+NUM_COUNTERS = 32
+# The id kept out of the compiler's assignment: the SoC emitter orders the
+# passes inside one op on it (pass ``n`` posts it, pass ``n + 1`` waits),
+# since only the mapper knows how an op splits into passes.
+INTRA_OP_COUNTER = NUM_COUNTERS - 1
 
 
 # ---------------------------------------------------------------------------
@@ -132,14 +137,26 @@ def _val(node) -> Optional[torch.Tensor]:
 
 
 def _slots(node) -> int:
-    """The software-pipeline depth of an ``alloc`` / ``zeros`` — how many slots
-    its leading dimension holds.  ``UNPIPELINED`` (0) for every other node."""
-    if not isinstance(node, Node) or node.op != "call_function":
+    """The software-pipeline depth of an ``alloc`` — how many slots its
+    leading dimension holds.  ``UNPIPELINED`` (0) for every other node."""
+    if (
+        not isinstance(node, Node)
+        or node.op != "call_function"
+        or node.target is not _ALLOC
+    ):
         return UNPIPELINED
-    index = _SLOTS_ARG.get(node.target)
-    if index is None:
-        return UNPIPELINED
-    return int(get_arg_value(node, index, "num_slots", UNPIPELINED))
+    return int(get_arg_value(node, _SLOTS_ARG, "num_slots", UNPIPELINED))
+
+
+def is_counter(node) -> bool:
+    """Whether ``node`` declares a hardware counter: a ``voyager.alloc`` at
+    the register level."""
+    return (
+        isinstance(node, Node)
+        and node.op == "call_function"
+        and node.target is _ALLOC
+        and node.meta.get("space") == "Register"
+    )
 
 
 def _store_lanes(node, config) -> Optional[int]:
@@ -261,7 +278,7 @@ def _materializes_dram(node: Node) -> bool:
     """
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZERO)
+        and node.target is not _ALLOC
         and node.meta.get("space") == "DRAM"
         and _val(node) is not None
         and _viewed_buffer(node) is None
@@ -594,6 +611,76 @@ def _buffer_lifetimes(model, buffer_of, order, config) -> Dict[Node, _Buf]:
     return bufs
 
 
+def _plan_counters(model: GraphModule, buffer_of, order) -> int:
+    """Give every counter a hardware id, by lifetime.
+
+    A counter (``is_counter``) lives from its ``alloc`` to its last reset,
+    wait or post, under every name a region binds it to.  Ids are handed
+    out in program order, each the lowest one whose last holder is dead, so
+    a kernel reuses the ids of the kernels before it once their epilogues
+    have waited every counter at its final count; ``INTRA_OP_COUNTER`` is
+    never handed out.  Stamps ``meta['counter']`` on each counter
+    ``alloc``.
+
+    Args:
+        model: The bufferized graph.
+        buffer_of: ``_buffer_identity``'s map from a name to its buffer.
+        order: ``_timestamps``' global execution order.
+
+    Returns:
+        How many ids were used.
+
+    Raises:
+        ValueError: A counter is not a 0-d int64, or more counters are
+            live at once than there are ids besides ``INTRA_OP_COUNTER``.
+    """
+    last_use: Dict[Node, int] = {}
+    for n in _walk(model):
+        root = buffer_of.get(n, n)
+        if not is_counter(root):
+            continue
+        uses = [order[u] for u in n.users if u in order]
+        last_use[root] = max(last_use.get(root, 0), order[n], *uses)
+
+    holders: Dict[int, int] = {}  # id -> last use of the counter holding it
+    for node in sorted(last_use, key=order.__getitem__):
+        value = _val(node)
+        if value is None or value.dim() != 0 or value.dtype != torch.int64:
+            raise ValueError(
+                f"{node.name}: a counter is a 0-d int64 alloc at the "
+                f"register level, not {value}"
+            )
+        free = next(
+            (
+                i
+                for i in range(NUM_COUNTERS)
+                if i != INTRA_OP_COUNTER and holders.get(i, -1) < order[node]
+            ),
+            None,
+        )
+        if free is None:
+            raise ValueError(
+                f"[plan_memory] more than {NUM_COUNTERS - 1} counters live "
+                f"at '{node.name}' (id {INTRA_OP_COUNTER} is reserved)"
+            )
+        holders[free] = last_use[node]
+        node.meta["counter"] = free
+    return len(holders)
+
+
+def plan_counters(model: GraphModule) -> int:
+    """Assign the counter ids of ``model`` afresh (``_plan_counters``), from
+    its current buffer identity and schedule.
+
+    Args:
+        model: The bufferized graph, after a pass that added counters.
+
+    Returns:
+        How many ids were used.
+    """
+    return _plan_counters(model, _buffer_identity(model), _timestamps(model))
+
+
 def _bank_group_key(buf: "_Buf"):
     """The ``(scope, group)`` key of a buffer's searched bank group, or
     ``None`` for one the search left loose.  ``scope`` is the per-splice nest
@@ -742,8 +829,8 @@ def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
 
 
 def _stamp_slots(model: GraphModule, config) -> None:
-    """Record each pipelined buffer's depth and slot pitch on its ``alloc`` /
-    ``zeros`` node, so the code generator can serialize the slot dimension as
+    """Record each pipelined buffer's depth and slot pitch on its ``alloc``
+    node, so the code generator can serialize the slot dimension as
     ``bank_count`` / ``bank_stride_bytes`` rather than as a tensor dimension.
     A slot is then addressed ``base + slot * meta['slot_stride']``, which is
     what lets a runtime slot index (``step % num_slots``) stay a runtime value.
@@ -849,6 +936,7 @@ def plan_memory(
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —
     plus ``meta['slot_count']`` / ``meta['slot_stride']`` on a pipelined one,
+    ``meta['counter']`` (the hardware counter id) on each counter ``alloc``,
     and returns the pool sizes.  Nothing is threaded onto the tile sites: a
     tile is named by the buffer it lives in (and, for a slot, a runtime
     slot index), so the address belongs to the buffer, not to every
@@ -870,8 +958,10 @@ def plan_memory(
     # them (a buffer dies at the last read of *any* of its names), so compute
     # them once.
     buffer_of = _buffer_identity(model)
+    order = _timestamps(model)
     dram_bytes = _plan_dram(model, buffer_of, config, dram_layout or {})
-    bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), config)
+    bufs = _buffer_lifetimes(model, buffer_of, order, config)
+    counters = _plan_counters(model, buffer_of, order)
 
     scratchpad_bytes = 0
     peak_region = None
@@ -905,10 +995,12 @@ def plan_memory(
         )
 
     logger.info(
-        "Memory plan: DRAM=%d bytes, Scratchpad=%d/%s bytes (peak region %s)",
+        "Memory plan: DRAM=%d bytes, Scratchpad=%d/%s bytes (peak region "
+        "%s), %d counters",
         dram_bytes,
         scratchpad_bytes,
         capacity,
         peak_region,
+        counters,
     )
     return MemoryPlan(dram_bytes, scratchpad_bytes)

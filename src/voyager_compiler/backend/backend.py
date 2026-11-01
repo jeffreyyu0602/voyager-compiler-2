@@ -17,6 +17,10 @@ class Backend:
         builders: The rules that pick each compute node's builder, tried in
             order; a rule ahead of ``SHARED_BUILDERS`` replaces the shared
             builder for the nodes it matches.
+        synchronizes: Whether ``compile()`` runs the sync pass, which wraps
+            every dispatch in a ``commit`` and derives the unit-counter
+            waits; off for a target whose own toolchain orders the work.
     """
 
     builders: tuple[BuilderRule, ...]
+    synchronizes: bool = True

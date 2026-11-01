@@ -14,7 +14,7 @@ this dialect directly and so *replaces* — rather than reuses — the legacy
 non-bufferized path).  Three ideas carry the whole translation:
 
   * **Every instruction stands alone.**  A ``TensorBox`` — a model input, a
-    weight, a ``voyager.alloc`` / ``voyager.zeros`` — declares an allocation.
+    weight, a ``voyager.alloc`` — declares an allocation.
     Every *use* of it is a ``TensorBoxRef`` repeating that declaration in full
     (name, dtype, memory level and address, pipelining) under the *windowed
     source's* shape, plus the window it reads — a ``voyager.subview``, which
@@ -63,7 +63,10 @@ from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _is_compute,
     _produces_tensor,
 )
-from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
+from voyager_compiler.codegen.transform.bufferize.ops import (
+    oracle_disabled,
+    race_check,
+)
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
@@ -99,14 +102,11 @@ COMMIT = torch.ops.higher_order.commit
 WITH_SCRATCH = torch.ops.higher_order.with_scratch
 _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
-_ZEROS = torch.ops.voyager.zeros.default
-_FILL = torch.ops.voyager.fill.default
+# The SpMM pass fetches before it starts: a dispatch of one waits on and
+# posts nothing.
+_SPMM = torch.ops.quantized_ops.spmm_csr.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
-
-# The ops that *declare* storage; every other tensor node refers to storage one
-# of these owns.
-_ALLOCATORS = (_ALLOC, _ZEROS, _FILL)
 
 # Operand names for the Python builtins the loop control uses (``operator.eq`` /
 # ``and_`` / ``add`` ...), which carry no ATen schema to normalize against.
@@ -263,9 +263,8 @@ def _build_tiling(node) -> Optional[Tiling]:
         ValueError: A level blocks a loop it assigns no order to.
     """
     result = node.meta.get("tile_result")
-    if (
-        result is None
-        or not isinstance(result.tiling, interstellar.MappingPoint)
+    if result is None or not isinstance(
+        result.tiling, interstellar.MappingPoint
     ):
         return None
     mapping, access_list = result.tiling, result.access_list
@@ -361,7 +360,7 @@ def _outputs_of(gm: GraphModule) -> List:
 
 def _owns_storage(node) -> bool:
     """``node`` *is* a buffer: a model input, a weight, an explicit
-    ``voyager.alloc`` / ``zeros``, or a tensor the host materializes outside the
+    ``voyager.alloc``, or a tensor the host materializes outside the
     accelerator (a ``pad`` to the hardware unrolling, a slice, a cast) — which
     the planner gives an address like any other DRAM buffer.  Everything else
     names storage one of these owns."""
@@ -369,7 +368,7 @@ def _owns_storage(node) -> bool:
         return True
     if node.op != "call_function":
         return False
-    return node.target in _ALLOCATORS or "memory" in node.meta
+    return node.target is _ALLOC or "memory" in node.meta
 
 
 def _component_names(node) -> List[str]:
@@ -781,7 +780,7 @@ class _Emitter:
             return [(node, index)]
         if node.op != "call_function":
             return None
-        if node.target in _ALLOCATORS or node.target is _SUBVIEW:
+        if node.target is _ALLOC or node.target is _SUBVIEW:
             return None  # a buffer handle
         if is_nop(node):
             return self._producers(node.args[0], gm, env, index)
@@ -922,6 +921,9 @@ class _Emitter:
         box.shape.extend(shape)
 
         box.memory.level = self._memory_level(node)
+        if node.meta.get("space") == "Register":
+            box.memory.address = int(node.meta["counter"])
+            return box
         segment = node.meta.get("scratchpad") or node.meta.get("memory")
         if segment is not None:
             box.memory.address = int(segment.start)
@@ -931,13 +933,13 @@ class _Emitter:
         """Where ``node``'s bytes live: the space bufferization annotated.  A
         Local buffer has no address: the target places it.
 
-        A semaphore (``voyager.zeros`` / a credit-seeded ``voyager.fill``) is a
-        counter the accelerator maps itself, so it is declared at register level
-        with no address.  Anything left unannotated is in no memory at all — a
-        codebook or a folded constant, programmed into the instruction that
-        reads it rather than fetched from an address.
+        A counter (an ``alloc`` at the register level) is a hardware
+        register, declared with its counter id as the address.  Anything left
+        unannotated is in no memory at all — a codebook or a folded constant,
+        programmed into the instruction that reads it rather than fetched
+        from an address.
         """
-        if node.op == "call_function" and node.target in (_ZEROS, _FILL):
+        if node.meta.get("space") == "Register":
             return MEMORY_LEVEL_REGISTER
         if node.meta.get("space") == "Scratchpad":
             return MEMORY_LEVEL_SCRATCHPAD
@@ -952,7 +954,7 @@ class _Emitter:
         a compute op's operand tiles and its result, and a DRAM buffer (which a
         whole loop is replayed against) — an ``alloc``, or a tensor the host
         materializes and the loop then loads tiles out of (a ``pad``, a slice).
-        The machinery in between — the DMA, the semaphores, the SRAM slots, the
+        The machinery in between — the DMA, the counters, the SRAM slots, the
         index vectors — the run drives itself, so it is not dumped."""
         if self.dump_dir is None:
             return
@@ -1047,8 +1049,12 @@ class _Emitter:
         builders emulate one with a step counter and a trip test.  The step is
         the induction variable; the remaining carried values are scalar
         iteration arguments (the software pipeline's producer / consumer
-        cursors).  Buffers are *not* carried — they are referenced by name — so
-        nothing but scalars is yielded."""
+        cursors).  When the enclosing region reads the step counter's exit
+        value (a kernel epilogue does: the steps actually run, which a
+        ``MAX_TILES`` cut lowers), the counter is also emitted as a last
+        iteration argument, since ``ForLoop`` gives the induction variable no
+        exit value.  Buffers are *not* carried — they are referenced by name —
+        so nothing but scalars is yielded."""
         extents = _loop_extents(node)
         if len(extents) != 1:
             raise ValueError(
@@ -1069,20 +1075,30 @@ class _Emitter:
         loop.end.int_value = end
         loop.step.int_value = step
 
-        for i in range(1, len(carried)):
+        reads_steps = any(
+            user.target is operator.getitem and user.args[1] == 0
+            for user in node.users
+        )
+        names = [phs[i].name for i in range(1, len(carried))]
+        indices = list(range(1, len(carried)))
+        if reads_steps:
+            names.append(f"{node.name}_steps")
+            indices.append(0)
+
+        for name, i in zip(names, indices):
             iter_arg = loop.iter_args.add()
-            iter_arg.name = phs[i].name
+            iter_arg.name = name
             iter_arg.type = _scalar_type(_value(phs[i]))
             iter_arg.initial.CopyFrom(self._scalar(carried[i], env))
 
         self.emit_region(body, loop.body.ops)
         body_env = self.envs[body]
-        for i in range(1, len(carried)):
+        for i in indices:
             loop.body.yields.append(self._scalar(results[i], body_env))
 
         # The final value of each iteration argument, named by the handle the
         # enclosing region reads it through.
-        for i in range(1, len(carried)):
+        for i in indices:
             out = op.outputs.add()
             out.name = self._result_name(node, i)
             out.scalar = _scalar_type(_value(phs[i]))
@@ -1122,18 +1138,42 @@ class _Emitter:
         return op
 
     def _async(self, node, named, env) -> Operation:
-        """A ``commit`` region: dispatched asynchronously — it waits every
-        semaphore in ``dependencies``, runs its body, then signals ``post`` on
-        retirement.  Emitted as an ``AsyncOp`` wrapping the body region (whose
-        ops keep destination-passing, exactly like a top-level op) plus the
-        dependency / post semaphore references."""
+        """A ``commit`` region: one dispatch.  Emitted as an ``AsyncOp``
+        wrapping the body region (whose ops keep destination-passing, exactly
+        like a top-level op), its waits -- per unit, the counter and the
+        threshold that unit's pass checks before it starts -- and the counter
+        its last pass posts.
+
+        Raises:
+            ValueError: The dispatch is an SpMM pass with a wait or a post;
+                SpMM fetches before it starts and cannot honour either.
+        """
         sub = named[str(node.args[0].target)]
         op = Operation(name=node.name)
         async_op = getattr(op, "async")  # ``async`` is a Python keyword
         self.emit_region(sub, async_op.body.ops)
-        for dep in node.kwargs.get("dependencies") or ():
-            async_op.dependencies.add().CopyFrom(self._ref(dep, env))
-        if (post := node.kwargs.get("post")) is not None:
+        dependencies = node.kwargs.get("dependencies") or {}
+        post = node.kwargs.get("post")
+        synchronized = post is not None or any(dependencies.values())
+        if synchronized and any(
+            n.target is _SPMM
+            for region in [sub, *sub.modules()]
+            if isinstance(region, GraphModule)
+            for n in region.graph.nodes
+        ):
+            scope = node.meta.get("scope")
+            layer = scope[0] if scope else node.name
+            raise ValueError(
+                f"{layer}: {node.name} waits on or posts a counter from an "
+                f"SpMM dispatch, which fetches before it starts"
+            )
+        for unit, waits in dependencies.items():
+            for counter, threshold in waits:
+                wait = async_op.waits.add()
+                wait.unit = unit
+                wait.counter.CopyFrom(self._ref(counter, env))
+                wait.threshold.CopyFrom(self._scalar(threshold, env))
+        if post is not None:
             async_op.post.CopyFrom(self._ref(post, env))
         return op
 
@@ -1215,7 +1255,7 @@ def print_layer_table(
     ``meta['scope']`` — the op bufferization replaced — and a splice lands them
     as one contiguous run, so the scope changing *is* the layer boundary, and
     naming the run's first and last op delimits the whole layer: the buffers it
-    allocates, the DMA and semaphores around them, and the tile loop holding
+    allocates, the DMA and counters around them, and the tile loop holding
     the compute.  Everything a layer needs is therefore inside its own range,
     and a nest lowered to several kernels is still one layer.  Ops between two
     ranges belong to none — they are host-side setup.
@@ -1310,9 +1350,11 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     # One iteration is all a tile needs, but it leaves the DRAM buffers holding
     # a single tile over ``alloc``'s random fill.  A non-recursive pass runs the
     # loop for real and re-stamps only the top level, so the buffers end up with
-    # the true tensors and the tiles keep theirs.
+    # the true tensors and the tiles keep theirs.  That run is the whole
+    # program, so it also audits every wait (the counter oracle and the race
+    # check).
     if output_dir is not None:
-        with materialized_values():
+        with materialized_values(), race_check():
             ShapeProp(model).propagate(*args)
 
     return _Emitter(model, output_dir).build()
@@ -1639,10 +1681,11 @@ def _print_region(
 ) -> None:
     """Print a ``voyager.commit`` or ``with_scratch`` in region form — the
     body descended into like a ``cond`` branch, its operands bound to the body
-    placeholders and the ``dependencies`` / ``post`` semaphores, or the
+    placeholders and the waits per unit and the ``post`` counter, or the
     scratch regions, shown on the header:
 
-        commit = commit deps=[..] post=.. (b_arg0 = src0, ...) {
+        commit = commit deps={matrix: [(c<i64>, thr), ..], vector: [..]}
+            post=c<i64> (b_arg0 = src0, ...) {
           <body>
           return <results>
         }
@@ -1666,7 +1709,14 @@ def _print_region(
     )
     if node.target is COMMIT:
         keyword = "commit"
-        tags = f"deps={_fmt_arg(node.kwargs.get('dependencies', ()))}"
+        groups = []
+        for unit, waits in (node.kwargs.get("dependencies") or {}).items():
+            if waits:
+                pairs = ", ".join(
+                    f"({_fmt_arg(c)}, {_fmt_arg(t)})" for c, t in waits
+                )
+                groups.append(f"{unit}: [{pairs}]")
+        tags = f"deps={{{', '.join(groups)}}}"
         post = node.kwargs.get("post", None)
         if post is not None:
             tags += f" post={_fmt_arg(post)}"

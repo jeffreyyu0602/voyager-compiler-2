@@ -109,14 +109,15 @@ def _produces_tensor(node: Node) -> bool:
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
 _ATEN_CLONE = torch.ops.aten.clone.default
 _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
-_VOYAGER_FILL = torch.ops.voyager.fill.default
+_VOYAGER_ONES = torch.ops.voyager.ones.default
 _SUBVIEW = torch.ops.voyager.subview.default
 
-# The space a ``voyager.alloc`` at each on-chip level lives in; an alloc at
-# any other level is in DRAM.
+# The space a ``voyager.alloc`` at each level lives in; an alloc at any other
+# level is in DRAM.  A Register alloc is a hardware counter.
 _ALLOC_SPACE = {
     int(MemoryLevel.SRAM): "Scratchpad",
     int(MemoryLevel.LOCAL): "Local",
+    int(MemoryLevel.REGISTER): "Register",
 }
 # The spaces the datapath reads its tiles from and stores its results to.
 _ON_CHIP = ("Scratchpad", "Local")
@@ -127,15 +128,15 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
     computation lands in one.
 
       * **Buffers** carry ``node.meta['space']``: a ``voyager.alloc`` is
-        Scratchpad (``MemoryLevel.SRAM``), Local (``MemoryLevel.LOCAL``) or
-        DRAM (any other level arg), a
-        ``voyager.zeros`` accumulator / semaphore buffer is Scratchpad, and a
-        top-level input placeholder or weight ``get_attr`` is DRAM.  A *view* of
+        Scratchpad (``MemoryLevel.SRAM``), Local (``MemoryLevel.LOCAL``),
+        Register (``MemoryLevel.REGISTER``, a counter) or DRAM (any other
+        level arg), and a top-level input placeholder or weight ``get_attr``
+        is DRAM.  A *view* of
         a buffer — a slot-slot ``select``, a reshape, a loop result — takes the
         space of what it views, threading through the loop / cond boundary.
         Codebooks / qmaps are *params* (passed to the accelerator, not memory) —
-        unmarked.  Everything else (DMA, semaphore waits, index arithmetic)
-        names no memory and so carries no space.
+        unmarked.  Everything else (DMA, counter waits and resets, index
+        arithmetic) names no memory and so carries no space.
       * **Compute** is *not* given a space; it is *validated*.  The array only
         reaches on-chip memory (Scratchpad or Local), so every tile a compute
         op reads must be there (bar codebooks and scalars, which it reads
@@ -155,11 +156,12 @@ def _is_compute(node: Node) -> bool:
     op.
 
     ``is_compute_op`` is an allowlist generated from the Core ATen IR, so the
-    memory / control-flow / semaphore primitives around a kernel — the buffer
-    producers (``alloc`` / ``zeros``), the ``insert`` store, the async DMA and
-    its ``async_wait``, the index arithmetic (``increment_indices`` /
-    ``delinearize_index``), the slot-read ``select`` and the multi-output
-    ``getitem`` — are all excluded by simply not being in it.
+    memory / control-flow / counter primitives around a kernel — the buffer
+    producer ``alloc``, the ``zeros`` / ``ones`` fills, the ``insert`` store,
+    the async DMA and its ``async_wait``, the index arithmetic
+    (``increment_indices`` / ``delinearize_index``), the slot-read ``select``
+    and the multi-output ``getitem`` — are all excluded by simply not being
+    in it.
     """
     if not _produces_tensor(node):
         return False
@@ -320,10 +322,6 @@ def _annotate_and_validate(
                 node.args[2] if len(node.args) > 2 else int(MemoryLevel.DRAM)
             )
             node.meta["space"] = _ALLOC_SPACE.get(level, "DRAM")
-        elif node.target in (_VOYAGER_ZEROS, _VOYAGER_FILL):
-            # A semaphore buffer (``zeros`` = 0, ``fill`` = a seed credit), not a
-            # tensor buffer: no space (and so not the DRAM default below either).
-            pass
         elif node.target is _WHILE_LOOP:
             operands = list(node.args[2])
             if len(node.args) > 3:
@@ -362,8 +360,8 @@ def _annotate_and_validate(
             # A tensor the accelerator does not compute — a host-side ``pad``,
             # a copy — materializes in DRAM.
             node.meta["space"] = "DRAM"
-        # Anything else — a DMA, a semaphore wait, index arithmetic — names no
-        # memory, so it carries no space.
+        # Anything else — a DMA, a counter wait or reset, a fill, index
+        # arithmetic — names no memory, so it carries no space.
 
 
 # ---------------------------------------------------------------------------
@@ -904,10 +902,10 @@ def bufferize_graph(
         pipelined: Emit software-pipelined (double-buffered) loop nests,
           reusing the tiler's decision that two L2 tiles fit.
         tiler: The ``Tiler`` supplying per-node tile factors.
-        async_pipeline: A pipelined GEMM (dense and sparse) / conv dispatches
-          each tile's compute asynchronously (``AsyncPipelinedKernel``,
-          prefetching ``num_slots - 2`` ahead); off => the synchronous
-          ``PipelinedKernel``, prefetching ``num_slots - 1`` ahead.  Ignored
+        async_pipeline: A pipelined GEMM (dense and sparse) / conv nest
+          stores each tile one step behind its compute (``lag`` 1,
+          prefetching ``num_slots - 2`` ahead), so two dispatches overlap;
+          off => ``lag`` 0, prefetching ``num_slots - 1`` ahead.  Ignored
           unless ``pipelined``.
         single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
           post-op operands (SRAM saved vs. prefetch); off => double-buffered.
@@ -924,7 +922,7 @@ def bufferize_graph(
     ctx = BuildContext(
         tiler=tiler,
         num_slots=2 if pipelined else 1,
-        async_pipeline=pipelined and async_pipeline,
+        lag=1 if pipelined and async_pipeline else 0,
         accumulate_fp32=tiler is not None and tiler.model.accumulate_fp32,
         single_buffer_tail=single_buffer_tail,
         flash_attention_v3=flash_attention_v3,
@@ -1105,14 +1103,14 @@ def bufferize_graph(
     return model
 
 
-# Never CSE these: an ``alloc`` / ``zeros`` / ``fill`` is a *distinct*
-# allocation even when byte-identical (a separate buffer / semaphore), and
-# the side-effecting ops / HOP regions carry effects a merge would drop.
+# Never CSE these: an ``alloc`` is a *distinct* allocation even when
+# byte-identical (a separate buffer / counter), and the side-effecting ops /
+# HOP regions carry effects a merge would drop.
 _DEDUP_SKIP = frozenset(
     {
         _VOYAGER_ALLOC,
         _VOYAGER_ZEROS,
-        _VOYAGER_FILL,
+        _VOYAGER_ONES,
         _VOYAGER_INSERT,
         _VOYAGER_ASYNC,
         torch.ops.voyager.async_wait.default,
@@ -1172,6 +1170,11 @@ def _dedup_regions(gm: GraphModule) -> None:
             _VOYAGER_ASYNC,
         ):
             evict(_buffer_root(node.args[1]))
+        elif node.op == "call_function" and node.target in (
+            _VOYAGER_ZEROS,
+            _VOYAGER_ONES,
+        ):
+            evict(_buffer_root(node.args[0]))
         elif node.op == "call_module" or (
             node.op == "call_function"
             and node.target in (_WHILE_LOOP, _COND, _COMMIT, _WITH_SCRATCH)

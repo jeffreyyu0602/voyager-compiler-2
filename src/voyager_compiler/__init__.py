@@ -64,6 +64,7 @@ from voyager_compiler.codegen.transform.bufferize import (
     print_bufferized_graph,
     print_layer_table,
     shared_dram_layout,
+    synchronize,
 )
 from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
@@ -495,10 +496,13 @@ def compile(
     accumulate_fp32=False,
     bool_mask=True,
 ):
-    """Bufferize ``model``, plan its memory and write its ``voyager`` IR.
+    """Bufferize ``model``, plan its memory, synchronize its dispatches
+    and write its ``voyager`` IR.
 
     Writes ``model.txt`` (the IR as text), ``layers.txt`` (a table of its
-    layers) and ``<output_file>.svg`` (the compute graph) to ``output_dir``.
+    layers), ``bufferized_pre_sync.log`` (the bufferized graph before the
+    sync pass) and ``<output_file>.svg`` (the compute graph) to
+    ``output_dir``.
 
     Args:
         model: A graph ``transform`` lowered, bufferized in place.
@@ -558,6 +562,17 @@ def compile(
         builders=backend.builders,
     )
     plan_memory(model, config, dram_layout)
+    # The builders' graph, as planned, goes to a file of its own; the log
+    # shows the graph the sync pass leaves, so the two read side by side.
+    with open(os.path.join(output_dir, "bufferized_pre_sync.log"), "w") as f:
+        f.write(print_bufferized_graph(model, to_string=True))
+    # The sync pass: every dispatch a commit, every cross-unit dependency a
+    # counter wait.  A target whose own toolchain orders the work skips it.
+    if backend.synchronizes:
+        synchronize(model)
+        print("Bufferized graph after synchronize:")
+    else:
+        print("Bufferized graph (no sync pass for this backend):")
     print_bufferized_graph(model)
 
     # Without a dump the emitter reads only shapes and dtypes, so it runs on

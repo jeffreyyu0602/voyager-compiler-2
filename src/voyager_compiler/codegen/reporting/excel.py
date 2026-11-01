@@ -105,7 +105,7 @@ def _summary(wb, result: ScheduleResult, rows: List[KernelRow]):
         ("events_walked", len(result.records)),
         # The Operations sheet, summed by lane.  The compute and DRAM rows
         # each close exactly on the busy figures above; the wait rows are the
-        # program clock blocked on a semaphore, which runs concurrently with
+        # program clock blocked on a counter, which runs concurrently with
         # the transfer it waits on and must not be added to either.
         ("operations_compute_cycles", _lane_cycles(result, "compute")),
         ("operations_dram_cycles", _lane_cycles(result, "dram")),

@@ -92,10 +92,7 @@ from voyager_compiler.codegen.transform import fuse_patterns
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _is_compute,
 )
-from voyager_compiler.codegen.transform.bufferize.ops import (
-    commit,
-    with_scratch,
-)
+from voyager_compiler.codegen.transform.bufferize.ops import with_scratch
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _apply_relayout,
     _gemm_plan,
@@ -1362,24 +1359,23 @@ def transposed_load_buffers(staging, psum):
     """The buffers ``load_transposed`` copies an operand's tile through
     (``_InputSpec.load_buffers``), as the placement places them
     (``_ScratchSpec``): the count and the ``staging`` slots of the tile as
-    stored, a semaphore each, and the ``psum`` box."""
+    stored, and the ``psum`` box."""
     return (
         staging.num_slots,
         alloc_placed(
             staging.shape, staging.dtype, staging.num_slots, staging.space
         ),
-        voyager.zeros([], torch.int64, num_slots=staging.num_slots),
         alloc_placed(psum.shape, psum.dtype, psum.num_slots, psum.space),
     )
 
 
-def load_transposed(buffers, slot, src, dst, indices, sizes, sem, **copy):
+def load_transposed(buffers, slot, src, dst, indices, sizes, counter, **copy):
     """Load an operand stored transposed into its slot ``dst``
     (``_InputSpec.load``): its tile as stored into staging slot ``slot``
-    by DMA, then TensorE transposing it into ``dst`` through the PSUM box
-    (``transpose_through``), a ``voyager.commit`` waiting for the DMA and
-    posting the operand's semaphore ``sem`` -- which then says ``dst``
-    holds the transposed tile.
+    by DMA, adding 1 to the operand's stream ``counter`` once landed, then
+    TensorE transposing it into ``dst`` through the PSUM box
+    (``transpose_through``).  NKI orders the transpose behind the DMA by
+    their dependence.
 
     Args:
         buffers: ``transposed_load_buffers``'.
@@ -1388,30 +1384,18 @@ def load_transposed(buffers, slot, src, dst, indices, sizes, sem, **copy):
         dst: The slot's tile.
         indices: The DMA's block indices, of the tile as stored.
         sizes: The tile as stored.
-        sem: The slot's load semaphore.
+        counter: The operand's stream counter.
         **copy: The rest of ``voyager.async_copy``'s arguments; its
             ``transposed`` is the contract's, true.
-
-    Raises:
-        NotImplementedError: The load posts more than once, as the async
-            pipeline's reused blocks do: a commit posts once.
     """
-    if copy.pop("post_count") != 1:
-        raise NotImplementedError("a transposed load posting more than once")
     copy.pop("transposed")
-    slots, staging, staged, psum = buffers
+    slots, staging, psum = buffers
     if slots > 1:
         stage = get_slot(staging.view(slots, *sizes), slot)
     else:
         stage = staging.view(sizes)
-    stage_sem = get_slot(staged, slot)
-    voyager.async_copy(src, stage, indices, sizes, stage_sem, **copy)
-    commit(
-        transpose_through,
-        [stage, dst, psum, slot],
-        dependencies=[stage_sem],
-        post=sem,
-    )
+    voyager.async_copy(src, stage, indices, sizes, counter, **copy)
+    transpose_through(stage, dst, psum, slot)
 
 
 @dataclass(frozen=True)

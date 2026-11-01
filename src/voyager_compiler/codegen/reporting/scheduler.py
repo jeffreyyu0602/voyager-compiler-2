@@ -9,15 +9,18 @@ depends on how it is dispatched:
   clock the waits reconcile against.
 * **asynchronous** (dispatched inside a ``voyager.commit``): occupies its
   unit(s) but does **not** advance the program clock, so it runs while the clock
-  moves on other units; the commit posts its completion onto the done-semaphore
-  FIFO, exactly as ``async_copy`` does.  Two ops on the same unit still
-  serialize (shared ``*_free`` counter); overlap appears only across different
-  units.
+  moves on other units; the commit adds its completion to its counter,
+  exactly as ``async_copy`` does.  Two ops on the same unit still serialize
+  (shared ``*_free`` counter); overlap appears only across different units.
 
 ``async_copy`` *is* asynchronous: it occupies DRAM for its transfer without
-advancing the program clock, so a prefetch overlaps compute; ``async_wait``
-blocks the program clock until the matching post (oldest into that semaphore
-slot — a per-slot FIFO), whether that post came from a DMA or an async compute.
+advancing the program clock, so a prefetch overlaps compute.  A counter is
+the list of completion cycles of what has been added to it, in order; a wait
+for ``counter >= threshold`` resolves at the ``threshold``-th of them,
+whether that post came from a DMA or an async compute.  ``async_wait``
+blocks the program clock until its wait resolves; a commit's passes wait
+per unit before they start; ``drain`` blocks the program clock until every
+unit is idle.
 
 Every timestamp the machine holds -- the clocks, the unit-free cycles, the
 posted completions and the parked commits' floors -- is exposed by
@@ -31,9 +34,8 @@ how the walker recognises a repeating iteration.
 """
 
 import copy
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from voyager_compiler.codegen.reporting.cost import dram_cycles, op_info
 from voyager_compiler.codegen.reporting.model import (
@@ -48,23 +50,27 @@ from voyager_compiler.hardware_config import AcceleratorConfig
 T_COMPUTE = 1
 T_DMA = 2
 T_POST = 3
-T_SEED = 4
 T_COMMIT = 5
 T_WAIT = 6
 T_LOOP = 7
 T_SKIP = 8
+T_DRAIN = 9
+
+# The unit an ``OpInfo`` names -> the unit its commit waits are listed under.
+_WAIT_UNIT = {"mma": "matrix", "vector": "vector"}
 
 
 @dataclass
 class _PendingCommit:
-    """A committed op parked until its dependency semaphores are all posted.
-    ``run`` walks its body (and signals its done-sem) once that happens;
-    ``floor`` is the running max of the cycle the program issued it at and
-    the resolved deps' completion cycles."""
+    """A committed op parked until every one of its ``waits`` -- ``(unit,
+    counter, threshold)`` -- holds.  ``run`` walks its body (and adds to its
+    counter) once that happens; ``floors[unit]`` is the running max of the
+    cycle the program issued it at and the completion cycles the unit's
+    resolved waits named, which that unit's passes start no earlier than."""
 
     node: object
-    deps: list
-    floor: int
+    waits: list
+    floors: dict
     run: object
 
 
@@ -73,7 +79,7 @@ class Checkpoint:
     """A copy of everything ``ResourceState.restore`` puts back."""
 
     clocks: tuple
-    fifos: dict
+    counter_posts: dict
     posts: dict
     commits: list
     flags: tuple
@@ -105,21 +111,23 @@ class ResourceState:
         self._op_names: set = set()
         # kernel -> how many of its ops get_op has numbered (the next slot)
         self._kernel_slots: Dict[str, int] = {}
-        # semaphore slot -> FIFO of completion cycles
-        self.sem_fifos: Dict[object, Deque[int]] = {}
+        # counter -> the completion cycles of its posts, in order
+        self.counter_posts: Dict[object, List[int]] = {}
         # id(async compute node) -> its end, handed to the following insert
-        # so it can post the semaphore
+        # so it can post the counter
         self.pending_post: Dict[int, int] = {}
-        # committed (async) ops parked until their dependency semaphores post;
-        # each runs (walks its body) only then.  See register_commit.
+        # committed (async) ops parked until their waits hold; each runs
+        # (walks its body) only then.  See register_commit.
         self.pending_commits: List[_PendingCommit] = []
         self._resolving = False
         # set while a committed body is being walked: its ops floor their
-        # start on commit_now (seeded to the dep-ready cycle, advanced by each
-        # body op) and occupy their unit(s) without advancing the program
-        # clock.
+        # start on commit_now (seeded to the issue cycle, advanced by each
+        # body op) and on commit_floors[unit] (the cycle the unit's waits
+        # resolved at), and occupy their unit(s) without advancing the
+        # program clock.
         self.in_commit = False
         self.commit_now = 0
+        self.commit_floors: Dict[str, int] = {}
         self.last_commit_node = None
         self.trace: Optional[list] = None
         self.trace_base = 0
@@ -173,10 +181,12 @@ class ResourceState:
         units_free = [self._unit_free(u) for u in op.units]
         if self.in_commit:
             # A committed op runs in program order on the datapath but off
-            # the program clock: its start floors on the dep-ready cycle
-            # (commit_now, advanced by each body op) and its unit(s), never on
+            # the program clock: its start floors on the issue cycle
+            # (commit_now, advanced by each body op), on the cycle its
+            # unit(s)' waits resolved at, and on its unit(s), never on
             # self.now.
-            start = max(self.commit_now, *units_free)
+            floors = [self.commit_floors[_WAIT_UNIT[u]] for u in op.units]
+            start = max(self.commit_now, *units_free, *floors)
         else:
             start = max(self.now, *units_free)
         end = start + op.effective_cycles
@@ -210,12 +220,11 @@ class ResourceState:
             )
         return rec
 
-    def post_semaphore(self, sem_key, src_node) -> None:
-        """Publish the async compute ``src_node``'s completion onto
-        ``sem_key``'s FIFO -- the compute-side twin of ``async_copy``'s post.
-        """
+    def post_counter(self, key, src_node) -> None:
+        """Add the async compute ``src_node``'s completion to counter
+        ``key`` -- the compute-side twin of ``async_copy``'s post."""
         end = self.pending_post.pop(id(src_node), self.now)
-        self.sem_fifos.setdefault(sem_key, deque()).append(end)
+        self.counter_posts.setdefault(key, []).append(end)
 
     def _dram_event(
         self, node, n_bytes: int, is_read: bool, category, path, sync: bool
@@ -255,101 +264,93 @@ class ResourceState:
         return rec
 
     def async_copy(
-        self,
-        node,
-        n_bytes: int,
-        is_load: bool,
-        sem_key,
-        path,
-        category="",
-        post_count: int = 1,
+        self, node, n_bytes: int, is_load: bool, key, path, category=""
     ) -> TimingRecord:
-        # A DMA occupies DRAM but does NOT advance the program clock: its
-        # matching async_wait is what reconciles it.  One load signals its
-        # semaphore ``post_count`` times -- a reused block feeds several
-        # per-step consumers off a single load -- so it clears that many waits.
+        # A DMA occupies DRAM but does NOT advance the program clock: the
+        # waits on its counter are what reconcile it.
         rec = self._dram_event(
             node, n_bytes, is_load, category, path, sync=False
         )
-        fifo = self.sem_fifos.setdefault(sem_key, deque())
-        for _ in range(int(post_count)):
-            fifo.append(rec.end)
+        self.counter_posts.setdefault(key, []).append(rec.end)
         if self.trace is not None:
-            self.trace.append((T_POST, sem_key, int(post_count)))
+            self.trace.append((T_POST, key))
         self._resolve_commits()
         return rec
 
-    def seed_semaphore(self, sem_key, count: int) -> None:
-        """Seed ``count`` initial credits onto a semaphore FIFO -- a
-        ``voyager.fill`` (an output store-sem starts with a credit so a slot's
-        first use waits nothing).  A credit is available from cycle 0 and has no
-        producer, so consuming it stalls nothing."""
-        fifo = self.sem_fifos.setdefault(sem_key, deque())
-        for _ in range(int(count)):
-            fifo.append(0)
-        if self.trace is not None:
-            self.trace.append((T_SEED, sem_key, int(count)))
-        self._resolve_commits()
+    def _resolved(self, key, threshold) -> Optional[int]:
+        """The cycle counter ``key`` reaches ``threshold``, or ``None`` while
+        it has not been posted that often yet."""
+        posts = self.counter_posts.get(key, ())
+        if threshold > len(posts):
+            return None
+        return posts[threshold - 1] if threshold >= 1 else 0
 
-    def register_commit(self, node, deps, run) -> None:
-        """Park a committed op: record its dependency semaphores and the ``run``
-        thunk that walks its body, then try to resolve it at once.  In the
-        common case every dep is already posted (the copy_in that feeds it ran
-        just before), so it runs immediately; otherwise it waits for the posts.
-        Either way it starts no earlier than the clock it is issued at.
+    def register_commit(self, node, waits, run) -> None:
+        """Park a committed op: record its waits (``(unit, counter,
+        threshold)`` each) and the ``run`` thunk that walks its body, then
+        try to resolve it at once.  In the common case every wait already
+        holds (the copy_in that feeds it ran just before), so it runs
+        immediately; otherwise it waits for the posts.  Either way it starts
+        no earlier than the clock it is issued at.
         """
+        issued = self.clock()
+        floors = {unit: issued for unit in _WAIT_UNIT.values()}
         self.pending_commits.append(
-            _PendingCommit(node, list(deps), self.clock(), run)
+            _PendingCommit(node, list(waits), floors, run)
         )
         if self.trace is not None:
-            self.trace.append((T_COMMIT, id(node), tuple(deps)))
+            self.trace.append(
+                (T_COMMIT, id(node), tuple((u, k) for u, k, _ in waits))
+            )
         self._resolve_commits()
 
     def _resolve_commits(self) -> None:
-        """Flush every committed op whose dependency semaphores are now all
-        posted: pop each dep's FIFO entry (its completion floors the body's
-        start), and once a commit's deps are empty, run its body off the program
-        clock.  A run signals its done-sem, which may in turn resolve a commit
-        that waited on it, so the scan repeats until it makes no progress."""
+        """Run every committed op whose waits now all hold, in dispatch
+        order: each resolved wait's completion floors the start of its
+        unit's passes, and once a commit has no wait left, its body runs off
+        the program clock.  A run adds to its counter, which may in turn
+        resolve the commit after it, so the scan repeats until it makes no
+        progress; a commit stays parked behind the ones dispatched before
+        it, as the units' queues keep it."""
         if self._resolving:
             return
         self._resolving = True
         try:
-            progress = True
-            while progress:
-                progress = False
-                for pc in list(self.pending_commits):
-                    unresolved = []
-                    for sk in pc.deps:
-                        fifo = self.sem_fifos.get(sk)
-                        if fifo:
-                            pc.floor = max(pc.floor, fifo.popleft())
-                        else:
-                            unresolved.append(sk)
-                    pc.deps = unresolved
-                    if unresolved:
-                        continue
-                    self.pending_commits.remove(pc)
-                    self.in_commit = True
-                    self.commit_now = pc.floor
-                    self.last_commit_node = None
-                    pc.run()
-                    self.in_commit = False
-                    progress = True
+            while self.pending_commits:
+                pc = self.pending_commits[0]
+                unresolved = []
+                for unit, key, threshold in pc.waits:
+                    ready = self._resolved(key, threshold)
+                    if ready is None:
+                        unresolved.append((unit, key, threshold))
+                    else:
+                        pc.floors[unit] = max(pc.floors[unit], ready)
+                pc.waits = unresolved
+                if unresolved:
+                    break
+                self.pending_commits.pop(0)
+                self.in_commit = True
+                self.commit_now = min(pc.floors.values())
+                self.commit_floors = pc.floors
+                self.last_commit_node = None
+                pc.run()
+                self.in_commit = False
         finally:
             self._resolving = False
 
     def assert_commits_drained(self, where: str) -> None:
         """At graph end every committed op must have resolved; one still parked
-        means its dependency semaphore is never posted -- a deadlock in the
-        emitted schedule.  This is *not* checked at each async_wait: a committed
-        tile legitimately stays in flight across the retire of another (an
-        async_wait blocks on its own semaphore, not on every commit)."""
+        means a counter it waits on never reaches its threshold -- a deadlock
+        in the emitted schedule.  This is *not* checked at each async_wait: a
+        committed tile legitimately stays in flight across the retire of
+        another (an async_wait blocks on its own counter, not on every
+        commit)."""
         self._resolve_commits()
         if self.pending_commits:
             raise ValueError(
-                f"unresolved committed op at {where}: a dependency semaphore "
-                f"is never posted -- the emitted schedule would deadlock"
+                f"unresolved committed op at {where}: a counter it waits on "
+                f"never reaches its threshold -- the emitted schedule would "
+                f"deadlock"
             )
 
     def dram_copy(self, node, reads, write, path) -> TimingRecord:
@@ -358,7 +359,7 @@ class ResourceState:
         sized from its own tensor, so a copy that reads a weight and writes an
         activation lands in both buckets.
 
-        It carries no semaphore, so nothing can wait on it and it cannot be
+        It carries no counter, so nothing can wait on it and it cannot be
         overlapped -- it is synchronous and stalls the program clock.
         """
         for n_bytes, category in reads:
@@ -366,14 +367,19 @@ class ResourceState:
         n_bytes, category = write
         return self._dram_event(node, n_bytes, False, category, path, sync=True)
 
-    def async_wait(self, node, sem_key, path) -> TimingRecord:
-        fifo = self.sem_fifos.get(sem_key)
-        if not fifo:
+    def async_wait(self, node, key, threshold, path) -> TimingRecord:
+        """The program clock blocks until counter ``key`` reaches
+        ``threshold``.  Every post that can still come is from a parked
+        commit, so those are resolved first; a threshold still out of reach
+        is a deadlock in the emitted schedule."""
+        self._resolve_commits()
+        completion = self._resolved(key, threshold)
+        if completion is None:
             raise ValueError(
-                f"async_wait {node.name} has no outstanding async_copy on "
-                f"its semaphore slot -- a copy / wait mismatch"
+                f"async_wait {node.name} waits for a counter to reach "
+                f"{threshold}, which nothing issued so far posts -- the "
+                f"emitted schedule would deadlock"
             )
-        completion = fifo.popleft()
         start = self.now
         end = max(self.now, completion)
         rec = TimingRecord(
@@ -391,9 +397,37 @@ class ResourceState:
         self.now = end
         if self.trace is not None:
             base = self.trace_base
-            self.trace.append(
-                (T_WAIT, id(node), sem_key, start - base, end - base)
+            self.trace.append((T_WAIT, id(node), key, start - base, end - base))
+        return rec
+
+    def drain(self, node, path) -> TimingRecord:
+        """The program clock blocks until no unit has a pass running or
+        queued: every parked commit must be able to run."""
+        self._resolve_commits()
+        if self.pending_commits:
+            raise ValueError(
+                f"drain {node.name} waits for a dispatch whose counter wait "
+                f"nothing issued so far satisfies -- the emitted schedule "
+                f"would deadlock"
             )
+        start = self.now
+        end = max(self.now, self.mma_free, self.vector_free)
+        rec = TimingRecord(
+            eid=self._eid(),
+            node_name=node.name,
+            kind="drain",
+            resource=("control",),
+            start=start,
+            end=end,
+            iteration_path=tuple(path),
+            loop_uid=self.cur_loop,
+            kernel=self.cur_kernel,
+        )
+        self.records.append(rec)
+        self.now = end
+        if self.trace is not None:
+            base = self.trace_base
+            self.trace.append((T_DRAIN, id(node), start - base, end - base))
         return rec
 
     def launch(self, kernel: str) -> None:
@@ -458,8 +492,9 @@ class ResourceState:
 
     def snapshot(self) -> tuple:
         """Every timestamp the state holds, as nested tuples that compare by
-        value: ``(in_commit, clocks, fifos, posts, commits)`` with the FIFOs
-        and posts sorted by key."""
+        value: ``(in_commit, clocks, counters, posts, commits)`` with the
+        counters and posts sorted by key; a parked commit's floors are
+        listed by unit."""
         return (
             self.in_commit,
             (
@@ -470,18 +505,23 @@ class ResourceState:
                 self.dram_free,
             ),
             tuple(
-                (k, tuple(self.sem_fifos[k])) for k in sorted(self.sem_fifos)
+                (k, tuple(self.counter_posts[k]))
+                for k in sorted(self.counter_posts)
             ),
             tuple((k, self.pending_post[k]) for k in sorted(self.pending_post)),
             tuple(
-                (id(pc.node), tuple(pc.deps), pc.floor)
+                (
+                    id(pc.node),
+                    tuple(pc.waits),
+                    tuple(pc.floors[u] for u in _WAIT_UNIT.values()),
+                )
                 for pc in self.pending_commits
             ),
         )
 
     def load_snapshot(self, snap: tuple) -> None:
         """Write a snapshot of the same shape as the current state back."""
-        in_commit, clocks, fifos, posts, commits = snap
+        in_commit, clocks, counters, posts, commits = snap
         self.in_commit = in_commit
         (
             self.now,
@@ -490,14 +530,12 @@ class ResourceState:
             self.vector_free,
             self.dram_free,
         ) = clocks
-        for k, values in fifos:
-            fifo = self.sem_fifos[k]
-            fifo.clear()
-            fifo.extend(values)
+        for k, values in counters:
+            self.counter_posts[k] = list(values)
         for k, value in posts:
             self.pending_post[k] = value
-        for pc, (_, _, floor) in zip(self.pending_commits, commits):
-            pc.floor = floor
+        for pc, (_, _, floors) in zip(self.pending_commits, commits):
+            pc.floors = dict(zip(_WAIT_UNIT.values(), floors))
 
     def checkpoint(self) -> Checkpoint:
         return Checkpoint(
@@ -508,10 +546,10 @@ class ResourceState:
                 self.vector_free,
                 self.dram_free,
             ),
-            fifos={k: deque(v) for k, v in self.sem_fifos.items()},
+            counter_posts={k: list(v) for k, v in self.counter_posts.items()},
             posts=dict(self.pending_post),
             commits=[
-                _PendingCommit(pc.node, list(pc.deps), pc.floor, pc.run)
+                _PendingCommit(pc.node, list(pc.waits), dict(pc.floors), pc.run)
                 for pc in self.pending_commits
             ],
             flags=(
@@ -535,10 +573,10 @@ class ResourceState:
             self.vector_free,
             self.dram_free,
         ) = cp.clocks
-        self.sem_fifos = {k: deque(v) for k, v in cp.fifos.items()}
+        self.counter_posts = {k: list(v) for k, v in cp.counter_posts.items()}
         self.pending_post = dict(cp.posts)
         self.pending_commits = [
-            _PendingCommit(pc.node, list(pc.deps), pc.floor, pc.run)
+            _PendingCommit(pc.node, list(pc.waits), dict(pc.floors), pc.run)
             for pc in cp.commits
         ]
         (
@@ -561,16 +599,17 @@ class ResourceState:
 @dataclass(frozen=True)
 class Recipe:
     """How one period advances the state: which timestamps move by
-    ``shift`` (the rest stay: an idle unit, an unconsumed credit), and how
-    many entries each semaphore FIFO consumes off its head -- a load that
-    posted one credit per iteration up front is drained one per iteration.
+    ``shift`` (the rest stay: an idle unit), and how many posts each
+    counter gains -- the period's posts are the previous period's, one
+    ``shift`` later, so a counter extends by its last ``added`` entries
+    shifted, period after period.
     """
 
     shift: int
     clocks: Tuple[bool, ...]
-    fifos: Tuple[Tuple[int, Tuple[bool, ...]], ...]  # (consumed, moving)
+    counters: Tuple[int, ...]  # posts added per period
     posts: Tuple[bool, ...]
-    commits: Tuple[bool, ...]
+    commits: Tuple[Tuple[bool, ...], ...]  # per commit, its floors
 
 
 def _moving(a: int, b: int, shift: int) -> Optional[bool]:
@@ -595,8 +634,9 @@ def snapshot_recipe(a: tuple, b: tuple, shift: int) -> Optional[Recipe]:
     """The recipe taking snapshot ``a`` to ``b`` one period of ``shift``
     cycles later, or ``None`` when ``b`` is not ``a`` advanced by a period.
 
-    A FIFO may be shorter in ``b`` than in ``a``: the period consumed the
-    difference off its head, and what remains must match ``a``'s tail.
+    A counter only grows: ``b`` keeps every post of ``a`` and adds the ones
+    the period made, each ``shift`` after the matching post of the period
+    before.
     """
     if a[0] != b[0]:
         return None
@@ -605,15 +645,15 @@ def snapshot_recipe(a: tuple, b: tuple, shift: int) -> Optional[Recipe]:
         return None
     if len(a[2]) != len(b[2]):
         return None
-    fifos = []
+    counters = []
     for (ka, va), (kb, vb) in zip(a[2], b[2]):
-        if ka != kb or len(vb) > len(va):
+        added = len(vb) - len(va)
+        if ka != kb or added < 0 or added > len(va) or vb[: len(va)] != va:
             return None
-        consumed = len(va) - len(vb)
-        moving = _moving_all(va[consumed:], vb, shift)
-        if moving is None:
+        previous = va[len(va) - added :] if added else ()
+        if any(y - x != shift for x, y in zip(previous, vb[len(va) :])):
             return None
-        fifos.append((consumed, moving))
+        counters.append(added)
     if [k for k, _ in a[3]] != [k for k, _ in b[3]]:
         return None
     posts = _moving_all([v for _, v in a[3]], [v for _, v in b[3]], shift)
@@ -621,36 +661,39 @@ def snapshot_recipe(a: tuple, b: tuple, shift: int) -> Optional[Recipe]:
         return None
     if [c[:2] for c in a[4]] != [c[:2] for c in b[4]]:
         return None
-    commits = _moving_all([c[2] for c in a[4]], [c[2] for c in b[4]], shift)
-    if commits is None:
-        return None
-    return Recipe(shift, clocks, tuple(fifos), posts, commits)
+    commits = []
+    for ca, cb in zip(a[4], b[4]):
+        moving = _moving_all(ca[2], cb[2], shift)
+        if moving is None:
+            return None
+        commits.append(moving)
+    return Recipe(shift, clocks, tuple(counters), posts, tuple(commits))
 
 
 def advance_snapshot(snap: tuple, recipe: Recipe, periods: int):
-    """``snap`` after ``periods`` more periods under ``recipe``, or ``None``
-    when a FIFO would run out of entries to consume."""
+    """``snap`` after ``periods`` more periods under ``recipe``."""
     total = periods * recipe.shift
 
     def move(values, flags):
         return tuple(v + total if m else v for v, m in zip(values, flags))
 
-    fifos = []
-    for (k, values), (consumed, moving) in zip(snap[2], recipe.fifos):
-        drop = consumed * periods
-        if drop > len(values):
-            return None
-        fifos.append((k, move(values[drop:], moving)))
+    counters = []
+    for (k, values), added in zip(snap[2], recipe.counters):
+        last = values[len(values) - added :] if added else ()
+        grown = list(values)
+        for period in range(1, periods + 1):
+            grown.extend(v + period * recipe.shift for v in last)
+        counters.append((k, tuple(grown)))
     return (
         snap[0],
         move(snap[1], recipe.clocks),
-        tuple(fifos),
+        tuple(counters),
         tuple(
             (k, v + total if m else v)
             for (k, v), m in zip(snap[3], recipe.posts)
         ),
         tuple(
-            (n, deps, floor + total if m else floor)
-            for (n, deps, floor), m in zip(snap[4], recipe.commits)
+            (n, waits, move(floors, m))
+            for (n, waits, floors), m in zip(snap[4], recipe.commits)
         ),
     )

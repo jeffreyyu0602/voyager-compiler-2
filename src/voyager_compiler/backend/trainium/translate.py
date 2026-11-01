@@ -6,7 +6,7 @@ program as ``voyager`` IR.  This module decides nothing.  It runs each
 kernel's loops and conditions at translation time, so an NKI kernel is the
 straight-line sequence of transfers and compute steps the schedule makes, on
 the tiles it names.  NKI places the buffers and orders the instructions by
-their dependences, so the semaphores and waits are dropped.
+their dependences, so the counters, waits and drains are dropped.
 
 A tile in SBUF has its rows -- every dim but the last, flattened -- on the
 partitions, 128 at a time, and its last dim free: a slot of ``B`` row blocks
@@ -155,7 +155,10 @@ SCALAR_OPS = {
     "and_": lambda a, b: bool(a and b),
     "or_": lambda a, b: bool(a or b),
 }
-ALLOCATIONS = ("voyager::alloc", "voyager::zeros", "voyager::fill")
+ALLOCATIONS = ("voyager::alloc",)
+# The CPU's synchronization, which NKI's own dependence order replaces: the
+# waits, the drains and the counter resets.
+SYNC_OPS = ("voyager::async_wait", "voyager::drain", "voyager::zeros")
 
 # Elementwise ops: target -> NKI ALU op, or activation.
 BINARY_OPS = {
@@ -818,7 +821,7 @@ class Kernel:
         elif prim.target in SCALAR_OPS:
             value = SCALAR_OPS[prim.target](kw["input"], kw["other"])
             self.env[op.outputs[0].name] = value
-        elif prim.target != "voyager::async_wait":
+        elif prim.target not in SYNC_OPS:
             raise NotImplementedError(f"{op.name}: cpu op {prim.target}")
 
     # Boxes, layouts and references.

@@ -5,7 +5,7 @@ attention (``TrainiumAttention``), and its builder,
 NeuronCore runs it, so the translator only translates.
 
 A K-major flash attention (``sdpa_kmajor``) keeps the shared walk, DMA streams
-and semaphores; ``TrainiumFlashAttention`` replaces its buffers and steps.  Its
+and counters; ``TrainiumFlashAttention`` replaces its buffers and steps.  Its
 query and key are stored ``[*batch, head_dim, tokens]``, so their tiles ``Qᵀ``
 and ``Kᵀ`` are plain DMAs of the blocks QKᵀ reads.  Under the GQA fold the query
 is viewed ``[*kv_batch, g_head·head_dim, tokens]``, a Q tile one head's
@@ -60,10 +60,7 @@ from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
     _FA3Pipeline,
     build_attention_fa3,
 )
-from voyager_compiler.codegen.transform.bufferize.ops import (
-    commit,
-    with_scratch,
-)
+from voyager_compiler.codegen.transform.bufferize.ops import with_scratch
 from voyager_compiler.codegen.transform.bufferize.pipeline import get_slot
 from voyager_compiler.codegen.transform.bufferize.utils import (
     BuildContext,
@@ -578,9 +575,8 @@ class TrainiumFlashAttention(_FA3Pipeline):
     def _alloc_state(self, b):
         """Allocate into ``b`` the buffers the tile search placed, each as
         the attribute its role names (``TrainiumAttention.buffers``) -- P is
-        the scores themselves unless it has a buffer of its own -- the
-        regions the translator computes [E] and [F] in, by name, and the two
-        compute semaphores."""
+        the scores themselves unless it has a buffer of its own -- and the
+        regions the translator computes [E] and [F] in, by name."""
         for role, shape, dtype, _, slots, space in self.placement.buffers:
             setattr(b, role, alloc_placed(shape, dtype, slots, space))
         if "p_buf" not in self.shapes:
@@ -590,8 +586,6 @@ class TrainiumFlashAttention(_FA3Pipeline):
             name: alloc_placed(*placed)
             for name, *placed in self.placement.scratch
         }
-        b.sem_scores = voyager.zeros([1], torch.int64)
-        b.sem_pv = voyager.zeros([1], torch.int64)
 
     def _query_address(self, coords, kmajor):
         """The block address of the query tile at ``coords`` in the folded
@@ -611,20 +605,18 @@ class TrainiumFlashAttention(_FA3Pipeline):
             idx.append(q % per_head if self.g_head > 1 else q)
         return dims, idx
 
-    def _load_query(self, src, slots, slot, sem, coords, tile, waits=0):
+    def _load_query(self, src, slots, slot, counter, coords, tile):
         """DMA the query ``src``'s ``tile`` at ``coords`` into
-        ``slots[slot]``, as stored.  As in ``_FA3Pipeline._load_sweep``,
-        its semaphore posts once per live step of the sweep, and once more
-        for each of the ``waits`` the kernel makes on it itself."""
+        ``slots[slot]``, as stored, adding 1 to the stream's ``counter``
+        once landed (``_FA3Pipeline._load_sweep``)."""
         dims, idx = self._query_address(coords, self.query_kmajor)
         voyager.async_copy(
             src,
             get_slot(slots, slot),
             idx,
             (1,) * self.nb + tuple(tile),
-            get_slot(sem, slot),
+            counter,
             dims,
-            post_count=self._kv_last(coords[self.gq]) + (1 + waits),
         )
 
     def _load_key(self, b, slot, coords):
@@ -639,21 +631,22 @@ class TrainiumFlashAttention(_FA3Pipeline):
             get_slot(b.k_slots, slot),
             idx,
             (1,) * self.nb + (self.d, self.tkv),
-            get_slot(b.k_sem, slot),
+            b.k_counter,
             dims,
         )
 
-    def _store_out(self, tile, out, sem, coords):
+    def _store_out(self, tile, out, counter, coords):
         """DMA the finished output ``tile`` of the sweep at ``coords`` into
         ``out``, cut like the query when stored transposed
-        (``_query_address``)."""
+        (``_query_address``), adding 1 to the output stream's ``counter``
+        once landed."""
         dims, idx = self._query_address(coords, self.transpose_output)
         voyager.async_copy(
             tile,
             out,
             idx,
             (1,) * self.nb + tuple(tile.shape[-2:]),
-            get_slot(sem, 0),
+            counter,
             dims,
         )
 
@@ -664,17 +657,21 @@ class TrainiumFlashAttention(_FA3Pipeline):
         into PSUM and copied out into Qᵀ."""
         tq, d = self.tq, self.d
         if self.query_kmajor:
-            self._load_query(b.q, b.q_slots, slot, b.q_sem, coords, (d, tq))
+            self._load_query(b.q, b.q_slots, slot, b.q_counter, coords, (d, tq))
             return
-        self._load_query(b.q, b.q_rows, slot, b.q_sem, coords, (tq, d), 1)
-        voyager.async_wait(get_slot(b.q_sem, slot))
+        self._load_query(b.q, b.q_rows, slot, b.q_counter, coords, (tq, d))
+        # The tile of sweep ``s`` is the query stream's copy ``s + 1``.
+        sweep = 0
+        for dim in range(self.gq + 1):
+            sweep = sweep * self.grid[dim] + coords[dim]
+        voyager.async_wait(b.q_counter, sweep + 1)
         stored = _block(get_slot(b.q_rows, slot), (0, 0), (tq, d))
         transposed = get_slot(b.query_t, slot)
         voyager.insert(torch.transpose(stored, 0, 1), transposed)
         q_t = _block(get_slot(b.q_slots, slot), (0, 0), (d, tq))
         voyager.insert(transposed.clone(), q_t)
 
-    def _matmul_qk(self, b, operands, slot, deps, masked=True):
+    def _matmul_qk(self, b, operands, slot, waits, masked=True):
         """[A]: per block and bank, QKᵀ into the scores' bank of step
         parity ``slot``, then, when the step adds a mask, the mask added
         onto it there by a matmul through an identity of ``1 / scale``
@@ -687,8 +684,8 @@ class TrainiumFlashAttention(_FA3Pipeline):
             b: The buffers (``_alloc_state``).
             operands: The Qᵀ and Kᵀ tiles, then the mask tile if any.
             slot: The step's parity.
-            deps: The load semaphores the commit waits on; it posts
-                ``sem_scores``.
+            waits: The streams' copies that have to have landed first
+                (``_FA3Pipeline._wait_landed``).
             masked: The step adds the mask (``_FA3Pipeline._crosses``).
         """
         adds_mask = masked and self.has_mask
@@ -719,19 +716,14 @@ class TrainiumFlashAttention(_FA3Pipeline):
                     )
                     voyager.insert(bank + added, bank)
 
-        commit(
-            body,
-            [*operands, *identity, b.scores, slot],
-            dependencies=deps,
-            post=b.sem_scores,
-        )
+        self._wait_landed(waits)
+        body(*operands, *identity, b.scores, slot)
 
     def _softmax_step(self, b, slot, sweep_slot, probs):
         """[D] on the scores of step parity ``slot`` (module docstring),
         into the running sum of sweep parity ``sweep_slot``.  ``b`` holds
         the buffers (``_alloc_state``); ``probs`` is the contract's, ``None``: P
         is not quantized."""
-        voyager.async_wait(b.sem_scores)
         scores, probs_tile = get_slot(b.s_buf, slot), get_slot(b.p_buf, slot)
         bias = get_slot(b.bias, slot)
         for block in range(self.blocks):
@@ -777,12 +769,12 @@ class TrainiumFlashAttention(_FA3Pipeline):
         voyager.insert(b.alpha * total, decayed)
         voyager.insert(decayed + b.row_tmp, total)
 
-    def _matmul_pv(self, b, operands, deps, slot):
+    def _matmul_pv(self, b, operands, waits, slot):
         """[B]: per block, P transposed on TensorE into PSUM a group of keys at
         a time, each group copied out into Pᵀ, then P·V into the block's PSUM
         slot of step parity ``slot``.  ``b`` holds the buffers
-        (``_alloc_state``), ``operands`` are the P and V tiles and ``deps`` the
-        V load semaphores the commit waits on; it posts ``sem_pv``."""
+        (``_alloc_state``), ``operands`` are the P and V tiles and ``waits``
+        the V stream's copies that have to have landed first."""
         rows, d, tkv = self.rows, self.d, self.tkv
         groups = len(self.groups)
 
@@ -805,12 +797,8 @@ class TrainiumFlashAttention(_FA3Pipeline):
                 result = self._context(context, slot, block)
                 voyager.insert(KMAJOR_MATMUL(kmajor, values), result)
 
-        commit(
-            body,
-            [*operands, b.probs_t, b.transposes, b.context, slot],
-            dependencies=deps,
-            post=b.sem_pv,
-        )
+        self._wait_landed(waits)
+        body(*operands, b.probs_t, b.transposes, b.context, slot)
 
     def _bank(self, scores, slot, block, i):
         """Block ``block``'s bank ``i`` of the PSUM ``scores``, of step
@@ -824,10 +812,9 @@ class TrainiumFlashAttention(_FA3Pipeline):
         return get_slot(context, slot * self.blocks + block)
 
     def _land_pv(self, b, slot):
-        """[E]'s first part: wait for a Q tile's last P·V and add each block's
-        into ``o`` from PSUM.  ``b`` holds the buffers (``_alloc_state``);
+        """[E]'s first part: add each block of a Q tile's last P·V into
+        ``o`` from PSUM.  ``b`` holds the buffers (``_alloc_state``);
         ``slot`` is the parity of the step whose P it multiplied."""
-        voyager.async_wait(b.sem_pv)
         for block in range(self.blocks):
             o = self._rows_of(b.o, block, self.d)
             voyager.insert(o + self._context(b.context, slot, block), o)
@@ -837,7 +824,6 @@ class TrainiumFlashAttention(_FA3Pipeline):
         beside its ``rescale`` scratch.  ``b`` holds the buffers
         (``_alloc_state``); ``slot`` is the parity of the step whose P it
         multiplied."""
-        voyager.async_wait(b.sem_pv)
         scratch = group_regions(b.scratch, RESCALE_GROUP)
         for block in range(self.blocks):
             o = self._rows_of(b.o, block, self.d)

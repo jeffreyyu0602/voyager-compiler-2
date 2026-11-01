@@ -2,27 +2,34 @@
 ``voyager`` torch.library namespace: explicit bufferization / memory primitives.
 
 These are intentionally distinct from ``quantized_ops`` so that compiler memory
-semantics (logical storage objects, DMA tile loads/stores, accumulator init) are
-not confused with model tensor semantics.  They are emitted by the bufferization
-lowering pass and consumed by the loop-aware code generator.
+semantics (logical storage objects, DMA tile loads/stores, accumulator init,
+counters) are not confused with model tensor semantics.  They are emitted by
+the bufferization lowering pass and consumed by the loop-aware code generator.
 
 Primitives
 ----------
-``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
-``voyager.zeros(size, dtype)``       zero-initialised buffer (accumulator, semaphore).
-``voyager.fill(size, dtype, v)``     value-initialised buffer (seed a semaphore credit).
+``voyager.alloc(size, dtype)``       the one op that declares storage: a DRAM
+                                     buffer, an on-chip tile, or (0-d int64
+                                     at the register level) a counter.
+``voyager.zeros(t)`` / ``ones(t)``   fill an existing tensor in place; on a
+                                     counter, ``zeros`` is its reset.
 ``voyager.subview(src, o, s, st)``   strided window onto a buffer (a slot).
 ``voyager.insert(src, dst)``         destination-passing compute-result write.
-``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
-``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
+``voyager.async_copy(..., c)``       async tile DMA; adds 1 to counter ``c``
+                                     when the tile has landed.
+``voyager.async_wait(c, thr)``       the CPU blocks until ``c >= thr``.
+``voyager.drain()``                  the CPU blocks until every unit is idle.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
 ``voyager.delinearize_index(...)``   linear loop counter -> multi-dim index.
-``commit(subgraph, operands, ...)``  async compute region (a higher-order op):
-                                     wait on every semaphore in ``deps``, run
-                                     ``subgraph(*operands)``, then signal
-                                     ``post``.
+``commit(subgraph, operands, ...)``  one asynchronous dispatch (a higher-order
+                                     op): each unit starts its pass once the
+                                     waits listed for it hold, and the last
+                                     pass adds 1 to ``post``.
 ``with_scratch(subgraph, ...)``      an op beside the on-chip regions its
                                      kernel keeps (a higher-order op).
+
+Counters only count up.  A wait holds once the counter has reached its
+threshold, so a wait is idempotent and never consumes anything.
 """
 
 from contextlib import contextmanager
@@ -38,6 +45,10 @@ from torch.library import Library, impl
 
 # "DEF" creates/owns the namespace.  Keep a module-level handle alive.
 voyager_lib = Library("voyager", "DEF")
+
+# The units a dispatch's waits are grouped by: the matrix-class unit of the
+# dispatch (systolic array or MVM) and the vector unit.
+UNITS = ("matrix", "vector")
 
 
 class MemoryLevel(IntEnum):
@@ -56,7 +67,7 @@ class MemoryLevel(IntEnum):
 # ---------------------------------------------------------------------------
 # Software pipelining.
 #
-# ``alloc`` / ``zeros`` take a ``num_slots`` count.  ``num_slots == 0`` is an
+# ``alloc`` takes a ``num_slots`` count.  ``num_slots == 0`` is an
 # unpipelined storage object: the tensor has exactly ``size``.  ``num_slots >=
 # 1`` prepends a slot dimension (``[num_slots, *size]``), so ``size`` stays the
 # payload of *one* slot and ``buf[slot]`` reads/writes a slot.  The distinction
@@ -74,12 +85,14 @@ def _pipelined_size(size, num_slots: int):
 
 
 # ---------------------------------------------------------------------------
-# voyager.alloc — logical storage object (output / staging buffer or on-chip
-# tile).  ``space`` is a ``MemoryLevel`` (int): which level of the hierarchy
-# it lives in — ``DRAM`` (default: output / staging) or ``SRAM`` (an on-chip
-# scratchpad tile, e.g. a software-pipeline ping-pong slot filled by
-# ``voyager.memcpy``).  Eager allocation is space-agnostic (a plain tensor);
-# the level is metadata the planner / codegen read.
+# voyager.alloc — logical storage object (output / staging buffer, on-chip
+# tile, or counter).  ``space`` is a ``MemoryLevel`` (int): which level of
+# the hierarchy it lives in — ``DRAM`` (default: output / staging), ``SRAM``
+# (an on-chip scratchpad tile, e.g. a software-pipeline ping-pong slot the
+# DMA fills) or ``REGISTER`` (a hardware counter: ``alloc([], torch.int64,
+# MemoryLevel.REGISTER)``, reset by ``voyager.zeros``).  Eager allocation is
+# space-agnostic (a plain tensor); the level is metadata the planner /
+# codegen read.
 # ---------------------------------------------------------------------------
 # ``space`` default 3 == ``MemoryLevel.DRAM``.
 voyager_lib.define(
@@ -112,60 +125,168 @@ def _alloc_fake(
 
 
 # ---------------------------------------------------------------------------
-# voyager.zeros — zero-initialised on-chip tile (e.g. a reduction
-# accumulator or a per-slot DMA semaphore).  A ``voyager`` op (not
-# ``aten.zeros``) so the bufferizer can tell a control/semaphore zero-init from
-# a genuine ``aten.zeros`` compute op.
+# The race check: a happens-before audit of one eager run, independent of the
+# order it runs in.  Every dispatch and copy is a producer, named by the
+# counter it adds to and the count it brings it to.  Per storage range the
+# check keeps the last writer and the readers since; an access must be
+# covered against each producer it depends on -- by a wait of the commit on
+# that counter at or above the count, a CPU wait already made at or above
+# it, or a drain since -- or the run raises.  A sequential run satisfies
+# every wait however few there are; this checks that the waits are there.
+# Only contiguous views are audited (every on-chip slot and tile): a strided
+# DRAM tile's byte span runs across its neighbours.
 # ---------------------------------------------------------------------------
-voyager_lib.define(
-    "zeros(SymInt[] size, ScalarType dtype, int num_slots=0) -> Tensor"
-)
+class _RaceCheck:
+    def __init__(self):
+        self.cpu = {}  # counter key -> highest threshold the CPU waited
+        self.ranges = {}  # storage -> {(start, end): [writer, readers]}
+        self.seq = 0  # dispatches and copies issued so far
+        self.kind = {}  # seq -> "a commit" / "an async_copy"
+        # Per counter key: its resets so far, and the highest count posted
+        # on it since the last.  A reset closes what posted before it.
+        self.generation = {}
+        self.posted = {}
+        self.drained = 0  # every producer at or below this seq is done
+
+    @staticmethod
+    def key(counter):
+        return counter.untyped_storage().data_ptr()
+
+    @staticmethod
+    def span(t):
+        """``(storage, start, end)`` in bytes of the memory ``t`` views."""
+        size = t.element_size()
+        start = t.storage_offset() * size
+        if t.numel() == 0:
+            return t.untyped_storage().data_ptr(), start, start
+        last = sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
+        return t.untyped_storage().data_ptr(), start, start + (last + 1) * size
+
+    def covered(self, producer, waits):
+        seq, key, count, _, generation = producer
+        if seq <= self.drained or self.cpu.get(key, 0) >= count:
+            return True
+        if generation < self.generation.get(key, 0):
+            return True
+        return any(k == key and thr >= count for k, thr in waits)
+
+    def producer(self, counter, unit_key):
+        """The producer that just brought ``counter`` to its count."""
+        key, count = self.key(counter), int(counter.item())
+        self.posted[key] = max(self.posted.get(key, 0), count)
+        return (self.seq, key, count, unit_key, self.generation.get(key, 0))
+
+    def _entries(self, t):
+        storage, start, end = self.span(t)
+        table = self.ranges.setdefault(storage, {})
+        hits = [v for (a, b), v in table.items() if a < end and start < b]
+        return table.setdefault((start, end), [None, []]), hits
+
+    def access(self, what, t, write, waits, unit_key, stream=None):
+        """Check one access against the producers it depends on: the last
+        writer (RAW, WAW) and, for a write, the readers since on another
+        unit (WAR; ``unit_key`` is the posting counter, ``None`` for a
+        copy, which every unit's readers bind).  A copy on counter
+        ``stream`` is ordered behind the earlier copies on it: copies on
+        one counter land in issue order."""
+        if not t.is_contiguous():
+            return
+        _, hits = self._entries(t)
+        for writer, readers in hits:
+            needed = [writer] if writer is not None else []
+            if write:
+                needed += [
+                    r for r in readers if unit_key is None or r[3] != unit_key
+                ]
+            for producer in needed:
+                same_stream = producer[3] is None and producer[1] == stream
+                if (stream is not None and same_stream) or self.covered(
+                    producer, waits
+                ):
+                    continue
+                verb = "wrote" if producer is writer else "read"
+                raise AssertionError(
+                    f"race check: {what} (#{self.seq + 1}) accesses memory "
+                    f"{self.kind[producer[0]]} #{producer[0]} {verb}, with "
+                    f"no wait on its counter reaching {producer[2]}"
+                )
+
+    def record(self, t, write, producer):
+        if not t.is_contiguous():
+            return
+        entry, hits = self._entries(t)
+        if write:
+            for hit in hits:
+                hit[0], hit[1] = producer, []
+        else:
+            for hit in hits:
+                hit[1].append(producer)
+
+    def reset(self, counter):
+        """A counter reset: whatever counted on it -- on this storage,
+        which a later counter may reuse -- must have been waited at its
+        final count (every kernel ends quiescent); it then closes them."""
+        key = self.key(counter)
+        final = max(int(counter.item()), self.posted.get(key, 0))
+        if final and self.cpu.get(key, 0) < final:
+            raise AssertionError(
+                f"race check: a counter that reached {final} is reset with "
+                f"the CPU having waited it only to {self.cpu.get(key, 0)}"
+            )
+        self.cpu.pop(key, None)
+        self.posted.pop(key, None)
+        self.generation[key] = self.generation.get(key, 0) + 1
+
+
+_race_check: Optional[_RaceCheck] = None
+
+
+@contextmanager
+def race_check():
+    """Audit every dispatch, copy and counter reset run in this scope
+    (``_RaceCheck``); raise on the first access not covered by a wait."""
+    global _race_check
+    prev, _race_check = _race_check, _RaceCheck()
+    try:
+        yield
+    finally:
+        _race_check = prev
+
+
+# ---------------------------------------------------------------------------
+# voyager.zeros / voyager.ones — fill an existing tensor in place.  Neither
+# allocates: the tensor is an ``alloc`` (or a view of one).  ``zeros`` on an
+# on-chip tile is a zero fill (a reduction accumulator's init); on a counter
+# (a 0-d int64 ``alloc`` at ``MemoryLevel.REGISTER``) it is the reset to 0.
+# They are ``voyager`` ops (not ``aten.zero_`` / ``fill_``) so the bufferizer
+# can tell a buffer fill from a genuine compute op.
+# ---------------------------------------------------------------------------
+voyager_lib.define("zeros(Tensor(a!) self) -> ()")
 
 
 @impl(voyager_lib, "zeros", "CompositeExplicitAutograd")
-def zeros(
-    size: Tuple[int, ...], dtype: torch.dtype, num_slots: int = UNPIPELINED
-) -> torch.Tensor:
-    return torch.zeros(_pipelined_size(size, num_slots), dtype=dtype)
+def zeros(self: torch.Tensor) -> None:
+    if _race_check is not None and self.dim() == 0:
+        _race_check.reset(self)
+    self.zero_()
 
 
 @torch.library.register_fake("voyager::zeros")
-def _zeros_fake(
-    size: Tuple[int, ...], dtype: torch.dtype, num_slots: int = UNPIPELINED
-) -> torch.Tensor:
-    return torch.zeros(_pipelined_size(size, num_slots), dtype=dtype)
+def _zeros_fake(self: torch.Tensor) -> None:
+    return None
 
 
-# ---------------------------------------------------------------------------
-# voyager.fill — like ``zeros`` but with a constant value: a storage-declaring
-# primitive (an owned buffer), used to seed a counting semaphore with an
-# initial credit (an output store-sem starts at 1 so its slot's first use has
-# a token to consume, sparing a warm-up guard).
-# ---------------------------------------------------------------------------
-voyager_lib.define(
-    "fill(SymInt[] size, ScalarType dtype, Scalar value, int num_slots=0) "
-    "-> Tensor"
-)
+voyager_lib.define("ones(Tensor(a!) self) -> ()")
 
 
-@impl(voyager_lib, "fill", "CompositeExplicitAutograd")
-def fill(
-    size: Tuple[int, ...],
-    dtype: torch.dtype,
-    value,
-    num_slots: int = UNPIPELINED,
-) -> torch.Tensor:
-    return torch.full(_pipelined_size(size, num_slots), value, dtype=dtype)
+@impl(voyager_lib, "ones", "CompositeExplicitAutograd")
+def ones(self: torch.Tensor) -> None:
+    self.fill_(1)
 
 
-@torch.library.register_fake("voyager::fill")
-def _fill_fake(
-    size: Tuple[int, ...],
-    dtype: torch.dtype,
-    value,
-    num_slots: int = UNPIPELINED,
-) -> torch.Tensor:
-    return torch.full(_pipelined_size(size, num_slots), value, dtype=dtype)
+@torch.library.register_fake("voyager::ones")
+def _ones_fake(self: torch.Tensor) -> None:
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,20 +348,20 @@ def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# voyager.async_copy / voyager.async_wait — the asynchronous DMA pair.
+# voyager.async_copy / voyager.async_wait / voyager.drain — the asynchronous
+# DMA and the CPU's waits.
 #
-# ``async_copy(..., semaphore)`` copies a tile then "signals" a semaphore;
-# ``async_wait(semaphore)`` "waits on" it. Both take an int64 ``semaphore``
-# scalar, **return nothing**, and declare it **mutable** (``Tensor(a!)`` /
-# ``Tensor(b!)``). The eager impls emulate a counting semaphore: ``async_copy``
-# increments it (post / V), ``async_wait`` asserts ``> 0`` and decrements it
-# (wait / P) — so a *correct* pipeline keeps every wait matched by a prior copy
-# into the same slot (a stray wait trips the assert).
+# ``async_copy(..., counter)`` copies a tile and adds 1 to ``counter`` once
+# the tile has landed; the copies on one counter land in issue order.
+# ``async_wait(counter, threshold)`` blocks the CPU until ``counter >=
+# threshold``.  Both take a 0-d int64 ``counter``, **return nothing**, and
+# declare it **mutable** (``Tensor(a!)`` / ``Tensor(b!)``) so the graph keeps
+# their order.  ``drain()`` blocks the CPU until no unit has a pass running
+# or queued; it says nothing about copies, which counters cover.
 #
-# ``post_count`` (default 1) is how much the transfer signals: a tile loaded
-# once but consumed by ``R`` per-step ``commit``s posts ``+R``, so a reused
-# input balances a per-step consume against a once-per-block load without being
-# re-fetched (see ``AsyncPipelinedKernel``).
+# The eager impls are the counter oracle: ``async_copy`` adds its 1 at once
+# and ``async_wait`` asserts the threshold is already met, so running the
+# bufferized graph in program order proves every wait holds when it runs.
 #
 # ``count`` (default: the whole tile) is how much of the block actually moves,
 # and may be a runtime scalar. It never moves the transfer: ``sizes`` still
@@ -250,9 +371,9 @@ def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
-    "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? strides=None, "
+    "Tensor(b!) counter, SymInt[]? dims=None, SymInt[]? strides=None, "
     "bool transposed=False, SymInt[]? pad=None, float? pad_value=None, "
-    "SymInt post_count=1, SymInt[]? count=None) -> ()"
+    "SymInt[]? count=None) -> ()"
 )
 
 
@@ -262,13 +383,12 @@ def async_copy(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
-    semaphore: torch.Tensor,
+    counter: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
-    post_count: int = 1,
     count: Optional[Tuple[int, ...]] = None,
 ) -> None:
     if strides is None:
@@ -313,7 +433,18 @@ def async_copy(
         else:
             dst[block][payload] = src[payload]
 
-    semaphore.add_(post_count)
+    if _race_check is not None:
+        rc = _race_check
+        key = rc.key(counter)
+        rc.access("an async_copy's source", src, False, (), None, key)
+        rc.access("an async_copy's destination", dst, True, (), None, key)
+    counter.add_(1)
+    if _race_check is not None:
+        rc.seq += 1
+        rc.kind[rc.seq] = "an async_copy"
+        producer = rc.producer(counter, None)
+        rc.record(src, False, producer)
+        rc.record(dst, True, producer)
 
 
 @torch.library.register_fake("voyager::async_copy")
@@ -322,34 +453,34 @@ def _async_copy_fake(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
-    semaphore: torch.Tensor,
+    counter: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
-    post_count: int = 1,
     count: Optional[Tuple[int, ...]] = None,
 ) -> None:
     return None
 
 
-voyager_lib.define("async_wait(Tensor(a!) semaphore) -> ()")
+voyager_lib.define("async_wait(Tensor(a!) counter, SymInt threshold) -> ()")
 
 
-# The counting-semaphore check in ``async_wait`` is a runtime *oracle*: it
-# verifies that a real pipeline run keeps every wait matched by a prior copy
-# into the same slot.  It is only meaningful when the whole loop executes in
+# The counter check in ``async_wait`` and ``commit`` is a runtime *oracle*: it
+# verifies that a real run of the pipeline meets every wait by the time the
+# program reaches it.  It is only meaningful when the whole loop executes in
 # sequence.  Codegen's ShapeProp re-runs a single loop-body iteration in
-# isolation — where a wait legitimately precedes its matching copy (which lives
-# in an earlier iteration) — so it disables the oracle via ``oracle_disabled()``
-# (it needs only shapes/values, not the balance invariant).
+# isolation — where a wait legitimately precedes the copies and dispatches of
+# earlier iterations — so it disables the oracle via ``oracle_disabled()``
+# (it needs only shapes/values, not the counts).
 _oracle_enabled = True
 
 
 @contextmanager
 def oracle_disabled():
-    """Suspend the ``async_wait`` counting-semaphore oracle in this scope."""
+    """Suspend the counter oracle of ``async_wait`` / ``commit`` in this
+    scope."""
     global _oracle_enabled
     prev = _oracle_enabled
     _oracle_enabled = False
@@ -359,30 +490,51 @@ def oracle_disabled():
         _oracle_enabled = prev
 
 
-def _consume_semaphore(semaphore: torch.Tensor) -> None:
-    """Wait on (decrement) a counting semaphore, honoring the oracle.
-
-    Shared by ``async_wait`` and every ``commit`` dependency: assert a prior
-    signal is pending, then consume one.  A no-op when the oracle is disabled
-    (codegen ShapeProp runs a single loop body in isolation, where a wait may
-    legitimately precede its matching signal — see ``oracle_disabled``)."""
+def _check_wait(counter: torch.Tensor, threshold, what: str) -> None:
+    """The oracle of one wait: ``counter`` has reached ``threshold``."""
     if not _oracle_enabled:
         return
-    assert semaphore.item() > 0, "wait on a semaphore with no pending signal"
-    semaphore.sub_(1)
+    reached = int(counter.item())
+    if reached < int(threshold):
+        raise AssertionError(
+            f"{what} waits for a counter at {reached} to reach {threshold}"
+        )
 
 
 @impl(voyager_lib, "async_wait", "CompositeExplicitAutograd")
-def async_wait(semaphore: torch.Tensor) -> None:
-    # A synchronous transfer (already done): this only checks the invariant
-    # that a matching ``async_copy`` signalled first, then consumes it.
-    _consume_semaphore(semaphore)
+def async_wait(counter: torch.Tensor, threshold: int) -> None:
+    _check_wait(counter, threshold, "async_wait")
+    if _race_check is not None:
+        key = _race_check.key(counter)
+        cpu = _race_check.cpu
+        cpu[key] = max(cpu.get(key, 0), int(threshold))
     return None
 
 
 @torch.library.register_fake("voyager::async_wait")
-def _async_wait_fake(semaphore: torch.Tensor) -> None:
+def _async_wait_fake(counter: torch.Tensor, threshold: int) -> None:
     return None
+
+
+voyager_lib.define("drain() -> ()")
+
+
+@impl(voyager_lib, "drain", "CompositeExplicitAutograd")
+def drain() -> None:
+    # Dispatches run to completion in the eager model: nothing to wait for.
+    if _race_check is not None:
+        _race_check.drained = _race_check.seq
+    return None
+
+
+@torch.library.register_fake("voyager::drain")
+def _drain_fake() -> None:
+    return None
+
+
+# A drain reads and writes nothing the graph names; keep it through dead
+# code elimination.
+torch.fx.node._side_effectful_functions.add(torch.ops.voyager.drain.default)
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +616,7 @@ def _delinearize_index_fake(
 
 
 # ---------------------------------------------------------------------------
-# voyager.commit — an async committed compute region (a higher-order op).
+# voyager.commit — one asynchronous dispatch (a higher-order op).
 #
 # Unlike the primitives above, ``commit`` takes a *subgraph* (a traceable
 # callable / ``GraphModule``), so it is a ``HigherOrderOperator`` (via
@@ -474,13 +626,13 @@ def _delinearize_index_fake(
 # calls; it therefore lives in the ``higher_order`` namespace
 # (``torch.ops.higher_order.commit``), not the ``voyager`` one.
 #
-# Semantics wrap ``subgraph(*operands)`` with the counting-semaphore model of
-# the async DMA pair: before running it *waits on* (decrements) every
-# semaphore in ``dependencies`` — the region may not start until each producer
-# it depends on has signalled — and after running it *signals* (increments)
-# ``post``, unblocking downstream waiters.  Each holds int64 semaphore tensors
-# (from ``voyager.zeros``), mutated in place.  The waits honor the
-# ``async_wait`` oracle, so codegen ShapeProp can disable it.
+# ``dependencies`` maps a unit (``UNITS``) to the ``(counter, threshold)``
+# waits that unit's pass of the region checks before it starts; passes of one
+# unit start in dispatch order, so a wait names only a cross-unit or copy
+# dependency.  ``post`` is the counter the region's last pass adds 1 to.  The
+# eager implementation runs the region at once: it asserts every wait holds
+# (the ``async_wait`` oracle, which ShapeProp can disable), runs the
+# subgraph, then adds the post.
 #
 # Public entry is the ``commit(subgraph, operands, dependencies, post)``
 # wrapper below: ``operands`` is an explicit list (like ``torch.cond`` /
@@ -493,7 +645,7 @@ class AsyncOp(BaseHOP):
     def __init__(self) -> None:
         super().__init__("commit")
 
-    def __call__(self, subgraph, *operands, dependencies=(), post=None):
+    def __call__(self, subgraph, *operands, dependencies=None, post=None):
         if not isinstance(
             subgraph, (torch.fx.GraphModule, FunctionWithNoFreeVars)
         ):
@@ -503,31 +655,94 @@ class AsyncOp(BaseHOP):
         )
 
     def _call_CompositeExplicitAutograd(
-        self, subgraph, *operands, dependencies=(), post=None
+        self, subgraph, *operands, dependencies=None, post=None
     ):
-        # Eager / ShapeProp execution: wait on every dependency, run the
-        # region, then signal completion.  Tracing (Fake / Proxy modes) runs
-        # the subgraph for shapes only and leaves the semaphores untouched —
-        # BaseHOP's mode impls ignore these kwargs.
-        for semaphore in dependencies:
-            _consume_semaphore(semaphore)
+        # Eager / ShapeProp execution: check every wait, run the region,
+        # then post.  Tracing (Fake / Proxy modes) runs the subgraph for
+        # shapes only and leaves the counters untouched — BaseHOP's mode
+        # impls ignore these kwargs.
+        for unit, waits in (dependencies or {}).items():
+            for counter, threshold in waits:
+                _check_wait(counter, threshold, f"the {unit} pass")
+        accesses = []
+        if _race_check is not None and isinstance(
+            subgraph, torch.fx.GraphModule
+        ):
+            accesses = _commit_accesses(subgraph, operands)
+            waits = [
+                (_race_check.key(c), int(t))
+                for pairs in (dependencies or {}).values()
+                for c, t in pairs
+            ]
+            unit = _race_check.key(post) if post is not None else None
+            name = f"a commit ({type(subgraph).__name__})"
+            for t, write in accesses:
+                _race_check.access(name, t, write, waits, unit)
         out = subgraph(*operands)
         if post is not None:
             post.add_(1)
+        if accesses:
+            rc = _race_check
+            rc.seq += 1
+            rc.kind[rc.seq] = f"a commit ({type(subgraph).__name__})"
+            if post is None:
+                # Nothing can wait on a dispatch that posts nothing: what
+                # depends on it has to drain.
+                producer = (rc.seq, None, 1, None, 0)
+            else:
+                producer = rc.producer(post, rc.key(post))
+            for t, write in accesses:
+                rc.record(t, write, producer)
         return out
 
 
 commit_hop = AsyncOp()
 
 
-def commit(subgraph, operands, dependencies=(), post=None):
-    """Run ``subgraph(*operands)`` as an async committed compute region.
+def _commit_accesses(subgraph, operands):
+    """``[(tensor, writes)]`` for a commit's tensor operands: the ones its
+    body stores into (an ``insert`` destination, a ``with_scratch``
+    region) are written, the rest read."""
+    phs = [n for n in subgraph.graph.nodes if n.op == "placeholder"]
+    written = set()
+    for n in subgraph.graph.nodes:
+        if n.op != "call_function":
+            continue
+        if n.target is torch.ops.voyager.insert.default:
+            written.add(n.args[1])
+        elif n.target is scratch_hop:
+            written.update(n.kwargs["scratch"].values())
+    return [
+        (t, ph in written)
+        for ph, t in zip(phs, operands)
+        if isinstance(t, torch.Tensor) and t.dim() > 0
+    ]
 
-    Waits on (decrements) every semaphore in ``dependencies`` before running,
-    then signals (increments) ``post`` on completion.  ``operands`` is an
-    explicit list (cond/while_loop style); it is splatted into the underlying
-    ``commit_hop`` HOP, which survives tracing as a single ``call_function``
-    node over the traced subgraph ``GraphModule``."""
+
+def commit(subgraph, operands, dependencies=None, post=None):
+    """Dispatch ``subgraph(*operands)`` as one asynchronous region.
+
+    Args:
+        subgraph: The region's computation, a callable or ``GraphModule``.
+        operands: Its tensor operands, an explicit list, splatted into the
+            underlying ``commit_hop`` HOP (which survives tracing as a
+            single ``call_function`` node over the traced subgraph).
+        dependencies: ``{unit: [(counter, threshold), ...]}`` over
+            ``UNITS``; a unit absent or empty waits nothing.
+        post: The counter the region's last pass adds 1 to, or ``None``.
+
+    Returns:
+        ``subgraph(*operands)``.
+
+    Raises:
+        ValueError: ``dependencies`` names a unit outside ``UNITS``.
+    """
+    dependencies = {
+        unit: list(waits) for unit, waits in (dependencies or {}).items()
+    }
+    unknown = set(dependencies) - set(UNITS)
+    if unknown:
+        raise ValueError(f"commit waits on unknown units {sorted(unknown)}")
     return commit_hop(subgraph, *operands, dependencies=dependencies, post=post)
 
 

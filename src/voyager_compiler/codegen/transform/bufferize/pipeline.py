@@ -47,7 +47,6 @@ from voyager_compiler.codegen.node_info import (
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
-    commit,
     oracle_disabled,
     with_scratch,
 )
@@ -62,6 +61,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _tag_loop_extents,
     effect_cond,
+    new_counter,
     outline_dps_ops,
     voyager,
 )
@@ -176,26 +176,15 @@ def get_slot(buf, slot):
     return voyager.subview(buf, offsets, sizes, strides, squeeze_dim=[0])
 
 
-def _guarded_wait(sem, pred=None):
-    """``async_wait(sem)`` guarded by ``pred``, so each slot's semaphore is
-    waited exactly once per signaling copy (a counting semaphore underflows on a
-    stray wait).  ``pred=None`` waits unconditionally — an operand whose block
-    changes every step is already once-per-block.
-    """
-    if pred is None:
-        voyager.async_wait(sem)
-        return
-    effect_cond(pred, lambda: voyager.async_wait(sem))
-
-
 class _BufferedRef:
     """Per-operand software-pipeline scheduler (Pallas ``BufferedRef``).
 
     Owns one tiled input's or one output's *window* — its ``num_slots``-deep
-    SRAM ``slots`` and per-slot DMA ``sem`` (Pallas's ``window_ref`` +
-    ``sem_recvs`` / ``sem_sends``) — plus the state machine that drives it: slot
-    selection, copy / wait predicates, prologue priming, and producer /
-    consumer / store cursor advancement.
+    SRAM ``slots`` and the stream's ``counter`` (every copy of the operand
+    adds 1 to it when it has landed) — plus the state machine that drives
+    it: slot selection, copy predicates, the CPU waits that gate the loop on
+    the stream, prologue priming, and producer / consumer / store cursor
+    advancement.
 
     It holds **no mutable runtime state**: each method takes the loop-carried
     counter as a plain argument and returns the updated SymInt (the live cursors
@@ -206,14 +195,7 @@ class _BufferedRef:
     _OUT = "out"
 
     def __init__(
-        self,
-        kind,
-        spec,
-        grid,
-        num_slots,
-        slots,
-        async_pipeline=False,
-        load_buffers=None,
+        self, kind, spec, grid, num_slots, slots, lag, load_buffers=None
     ):
         self.kind = kind
         self.spec = spec
@@ -221,19 +203,15 @@ class _BufferedRef:
         self.ndim = len(grid)
         self.num_steps = math.prod(grid)
         self.num_slots = num_slots
-        # Prefetch distance (blocks ahead).
-        self.D = max(0, num_slots - 2) if async_pipeline else num_slots - 1
+        # Prefetch distance (blocks ahead): one slot holds the block in use,
+        # and a lagged kernel keeps one more for the dispatch still in flight.
+        self.D = max(0, num_slots - 1 - lag)
         self.slots = slots  # SRAM window: [num_slots, *tile_sizes]
         # What ``spec.load_buffers`` made for ``spec.load``, if anything.
         self.load_buffers = load_buffers
-        # Per-slot async-DMA semaphore ([num_slots] int64).  An async
-        # output store-sem starts with one credit per slot (``fill(1)``) so each
-        # slot's first use has a token to consume — the commit always waits the
-        # slot free, no warm-up guard needed.
-        if kind == self._OUT and async_pipeline:
-            self.sem = voyager.fill([], torch.int64, 1, num_slots=num_slots)
-        else:
-            self.sem = voyager.zeros([], torch.int64, num_slots=num_slots)
+        # The stream's counter: the n-th copy issued on this operand adds the
+        # n-th 1, so "block n has landed" is ``counter >= n + 1``.
+        self.counter = new_counter()
 
     # --- addressing (shared by both kinds) ----------------------------------
 
@@ -316,16 +294,13 @@ class _BufferedRef:
 
     # --- DMA (input loads / output stores) ----------------------------------
 
-    def _load_tile(self, src, slot, grid_idx, post_count=1):
+    def _load_tile(self, src, slot, grid_idx):
         """Async-DMA ``src``'s tile at ``grid_idx`` into SRAM slot ``slot``,
         carrying the input halo (``strides`` / ``pad`` / ``pad_value``) and
-        signaling the slot's load semaphore ``post_count`` times (a reused
-        block posts once per per-step consumer — see
-        ``AsyncPipelinedKernel``).  A spec with a ``load`` issues the copy
-        itself.
+        adding 1 to the stream's counter when it has landed.  A spec with a
+        ``load`` issues the copy itself.
         """
         dst = get_slot(self.slots, slot)
-        sem = get_slot(self.sem, slot)
         spec = self.spec
         dims, indices = self._block_address(grid_idx)
         sizes, strides = spec.tile_sizes, spec.strides
@@ -354,57 +329,32 @@ class _BufferedRef:
             dst,
             indices,
             sizes,
-            sem,
+            self.counter,
             dims=dims,
             strides=strides,
             transposed=spec.transposed,
             pad=spec.pad,
             pad_value=spec.pad_value,
-            post_count=post_count,
         )
 
-    def _store_tile(self, src, dst, grid_idx, sem):
+    def _store_tile(self, src, dst, grid_idx):
         """Async-DMA SRAM tile ``src`` -> ``dst``'s block at ``grid_idx``,
-        signaling ``sem``.
+        adding 1 to the stream's counter when it has landed.
         """
         dims, indices = self._block_address(grid_idx)
         voyager.async_copy(
-            src,
-            dst,
-            indices,
-            self.spec.tile_sizes,
-            sem,
-            dims=dims,
+            src, dst, indices, self.spec.tile_sizes, self.counter, dims=dims
         )
 
     # --- input phases (kind == _IN) -----------------------------------------
 
-    def reuse_count(self):
-        """Steps that consecutively read the same block: the innermost tiled
-        grid dim's own repeat (``r`` consecutive steps re-read one block when
-        the operand repeats over it, e.g. a GQA head) times the grid extents
-        inner to it (1 when it advances every step).  A reused block's load
-        posts this many times so a per-step ``commit`` consume balances a
-        once-per-block load.
-        """
-        tiled = list(spec_tiled_dims(self.spec, self.grid))
-        if not tiled:
-            return self.num_steps
-        inner = max(g for _, g, _ in tiled)
-        count = next(r for _, g, r in tiled if g == inner)
-        for g in range(inner + 1, self.ndim):
-            count *= self.grid[g]
-        return count
-
-    def prime_prologue(self, src, post_count=1):
+    def prime_prologue(self, src):
         """Prime the first ``D`` logical positions from DRAM ``src``,
         deduplicating reused blocks (positions are static concrete coords, so
         the dedup is a Python ``if``).  A single-block operand primes its one
         block even at ``D == 0`` — the slot is never overwritten, and priming
-        here keeps the load off the loop body's critical path.  Each block's
-        load signals ``post_count`` times.  Return the seed producer count
-        for a guarded input, or ``None`` for an always-advance input (no
-        cursor).
+        here keeps the load off the loop body's critical path.  Return the
+        number of copies issued, the seed of the input's copy cursor.
         """
         num_copies = 0
         prev_idx = None
@@ -412,21 +362,19 @@ class _BufferedRef:
             idx = self._unravel(p)
             if p == 0 or self._indices_differ(prev_idx, idx):
                 slot = num_copies % self.num_slots
-                self._load_tile(src, slot, idx, post_count)
+                self._load_tile(src, slot, idx)
                 num_copies += 1
             prev_idx = idx
-        if self._advances_every_step():
-            return None
         return num_copies
 
-    def copy_in(self, ctx, src, load_count, post_count=1):
+    def copy_in(self, ctx, src, load_count):
         """Phase 1 — prefetch the block ``D`` steps ahead of DRAM ``src`` into
-        ``copy_slot``, signaling its load semaphore ``post_count`` times.  An
-        always-advance input copies unconditionally (gated only by
-        ``has_fetch``) and carries no cursor; a guarded one copies only when a
-        new block enters the window edge and advances its producer cursor.
-        Returns the advanced producer count (guarded) or ``None``
-        (always-advance).
+        ``copy_slot``.  An always-advance input copies on every step that has
+        a block left to fetch (``has_fetch``), its slot following the step; a
+        guarded one copies only when a new block enters the window edge, its
+        slot following its cursor.  Returns the copy cursor ``load_count``
+        advanced by this step's copy, or ``None`` for an input that carries
+        none (always-advance at ``D == 0``, which copies on every step).
         """
         if self.D == 0 and self._single_block():
             # The prologue primed the operand's only block.
@@ -438,12 +386,16 @@ class _BufferedRef:
             copy_slot = (ctx.step + self.D) % nb
             should_copy = has_fetch
             next_count = None
+            if load_count is not None:
+                next_count = torch.sym_ite(
+                    should_copy, load_count + 1, load_count
+                )
         else:
             copy_slot = load_count % nb
             differ = self._indices_differ(w.prev_edge, w.fetch_idx)
-            # No prefetch-ahead (``D == 0``: base single-buffer, or the async
-            # kernel's num_slots == 2): copy on the first step or a block change
-            # (no prologue primes the first block).  Otherwise prefetch-gated.
+            # No prefetch-ahead (``D == 0``): copy on the first step or a
+            # block change (no prologue primes the first block).  Otherwise
+            # prefetch-gated.
             should_copy = (
                 (w.first | differ) if self.D == 0 else (has_fetch & differ)
             )
@@ -453,31 +405,32 @@ class _BufferedRef:
         torch._check(copy_slot < self.slots.size(0))
         effect_cond(
             should_copy,
-            lambda: self._load_tile(src, copy_slot, w.fetch_idx, post_count),
+            lambda: self._load_tile(src, copy_slot, w.fetch_idx),
         )
         return next_count
 
     def wait_in(self, ctx, wait_count):
-        """Phase 2 — wait on the read-slot load semaphore once per consumed
-        block, then return the tile.  An always-advance input waits
-        unconditionally (changes block every step); a reused input waits on
-        entering a new block, or — with ``spec.first_use_at_exit`` — on
-        completing one (so a single-buffered late-consumed operand's load
-        overlaps the whole sweep).
+        """Phase 2 — the CPU waits until the block this step reads has
+        landed, then returns its tile.  An always-advance input reads block
+        ``step``; a reused input reads the block its consumer cursor names.
+        With ``spec.first_use_at_exit`` the wait is deferred to block-exit
+        (the ``finished`` predicate), so a single-buffered late-consumed
+        operand's load overlaps the whole sweep.
         """
         if self._advances_every_step():
             rs = ctx.windows[self.num_slots].cur_slot
-            pred = None
+            landed = ctx.step + 1
         else:
             rs = wait_count % self.num_slots
-            if self.spec.first_use_at_exit:
-                # First read is the sweep's last step: defer the wait to
-                # block-exit (the ``finished`` predicate).
-                pred = ctx.last | self._indices_differ(ctx.cur, ctx.next)
-            else:
-                pred = (ctx.step == 0) | self._indices_differ(ctx.prev, ctx.cur)
+            landed = wait_count + 1
         torch._check(rs < self.slots.size(0))
-        _guarded_wait(get_slot(self.sem, rs), pred)
+        if self.spec.first_use_at_exit:
+            finished = ctx.last | self._indices_differ(ctx.cur, ctx.next)
+            effect_cond(
+                finished, lambda: voyager.async_wait(self.counter, landed)
+            )
+        else:
+            voyager.async_wait(self.counter, landed)
         return get_slot(self.slots, rs)
 
     def advance_consumer(self, ctx, wait_count):
@@ -490,103 +443,91 @@ class _BufferedRef:
     # --- output phases (kind == _OUT) ---------------------------------------
 
     def wait_out(self, ctx, store_count):
-        """Phase 3 — before reusing an output slot, wait on its previous store
-        (once per tile, and only when the slot already holds a prior store —
-        ``store_count >= nb``; the first ``nb`` uses have nothing to drain).
-        With ``spec.first_use_at_exit`` the drain is deferred to block-exit (the
-        write step) instead of block-entry, so a single-buffered output's store
-        overlaps the next tile's sweep.  Returns ``(out_slot, slot_index)``.
+        """Phase 3 — the CPU waits until the slot this tile is written into
+        is free: the store of the tile that last used it, ``num_slots``
+        tiles back, has landed.  With ``spec.first_use_at_exit`` the wait is
+        deferred to block-exit (the write step), so a single-buffered
+        output's store overlaps the next tile's sweep.  Returns the slot.
         """
-        if self._advances_every_step():
-            slot = ctx.windows[self.num_slots].cur_slot
-        else:
-            slot = store_count % self.num_slots
+        slot = store_count % self.num_slots
         torch._check(slot < self.slots.size(0))
+        free = store_count - (self.num_slots - 1)
         if self.spec.first_use_at_exit:
-            # Drain at block-exit (the write step): the ``finished`` predicate,
-            # whose ``last`` term catches the final tile (``next`` is OOB).
-            changed = ctx.last | self._indices_differ(ctx.cur, ctx.next)
+            finished = ctx.last | self._indices_differ(ctx.cur, ctx.next)
+            effect_cond(
+                finished, lambda: voyager.async_wait(self.counter, free)
+            )
         else:
-            changed = self._indices_differ(ctx.prev, ctx.cur)
-        pred = changed & (store_count >= self.num_slots)
-        _guarded_wait(get_slot(self.sem, slot), pred)
-        return get_slot(self.slots, slot), slot
+            voyager.async_wait(self.counter, free)
+        return get_slot(self.slots, slot)
 
-    def copy_out(self, ctx, dst, store_count, out_slot, slot_idx):
-        """Phase 5 — store the completed output tile ``out_slot`` to DRAM
-        ``dst``, signaling its store semaphore, and return the advanced store
-        counter.  Unconditional when the output advances every step; otherwise
-        store-in-cond so a reduction writes once per output tile (when its block
-        completes or on the last step).
+    def copy_out(self, ctx, dst, store_count, out_slot):
+        """Phase 5 (``lag == 0``) — store the completed output tile
+        ``out_slot`` to DRAM ``dst`` and return the advanced store counter.
+        Unconditional when the output advances every step; otherwise
+        store-in-cond so a reduction writes once per output tile (when its
+        block completes or on the last step).
         """
-        sem = get_slot(self.sem, slot_idx)
         if self._advances_every_step():
-            self._store_tile(out_slot, dst, ctx.cur, sem)
+            self._store_tile(out_slot, dst, ctx.cur)
             return store_count + 1
         should_store = self._indices_differ(ctx.cur, ctx.next) | ctx.last
         effect_cond(
-            should_store,
-            lambda: self._store_tile(out_slot, dst, ctx.cur, sem),
+            should_store, lambda: self._store_tile(out_slot, dst, ctx.cur)
         )
         return torch.sym_ite(should_store, store_count + 1, store_count)
 
-    def drain(self, final_store_count):
-        """Finalize — drain each slot's last (un-reused) store so the DRAM
-        result is complete.  Slot ``j`` holds a pending store iff ``j <
-        final_store_count`` (a small grid leaves the rest un-signaled).
+    def store_lagged(self, ctx, dst, store_count):
+        """Phase 5 (``lag == 1``) — store the tile that finished on the
+        previous step, from the slot one behind the tile being computed
+        (``(store_count - 1) % num_slots``), and return the advanced count.
+        Nothing is stored on step 0; a held output stores only on its own
+        block boundary.  Flat conds — a ``SymBool`` predicate cannot be
+        captured into an outer cond's operands, so ``step >= 1`` folds into
+        the store predicate.
         """
-        for j in range(self.num_slots):
-            _guarded_wait(get_slot(self.sem, j), j < final_store_count)
-
-    # --- async-kernel input protocol (AsyncPipelinedKernel) ------------------
-    #
-    # Reuses the base ``copy_in`` / ``prime_prologue`` / ``advance_consumer``
-    # prefetch, but emits no input ``async_wait``: a tile's load semaphore
-    # feeds ``commit.dependencies`` instead (``read_advancing`` /
-    # ``read_reused`` are ``wait_in`` without the blocking wait).  Prefetch
-    # distance is one less than the base (``D = num_slots - 2``): a tile is
-    # consumed an iteration later, so a slot a prefetch overwrites was already
-    # retired — reuse-WAR-safe.  An advancing input posts ``+1`` per load; a
-    # reused one (held across an inner sweep) loads once per block and posts
-    # ``+R`` (``reuse_count``), balancing a per-step consume.
-
-    def read_advancing(self, ctx):
-        """The current read slot's tile and its load semaphore (no wait) — the
-        semaphore is handed to ``commit.dependencies``."""
-        slot = ctx.windows[self.num_slots].cur_slot
-        torch._check(slot < self.slots.size(0))
-        return get_slot(self.slots, slot), get_slot(self.sem, slot)
-
-    def read_reused(self, ctx, wait_count):
-        """A reused input's current read slot (consumer cursor ``wait_count``)
-        and its load semaphore, no wait — like ``wait_in`` without the blocking
-        ``async_wait`` (the wait moves into ``commit.dependencies``)."""
-        slot = wait_count % self.num_slots
-        torch._check(slot < self.slots.size(0))
-        return get_slot(self.slots, slot), get_slot(self.sem, slot)
+        slot = (store_count - 1) % self.num_slots
+        if self._advances_every_step():
+            should_store = ctx.step >= 1
+            next_count = store_count + 1
+        else:
+            should_store = (ctx.step >= 1) & self._indices_differ(
+                ctx.prev, ctx.cur
+            )
+            next_count = torch.sym_ite(
+                self._indices_differ(ctx.cur, ctx.next) | ctx.last,
+                store_count + 1,
+                store_count,
+            )
+        effect_cond(
+            should_store,
+            lambda: self._store_tile(get_slot(self.slots, slot), dst, ctx.prev),
+        )
+        return next_count
 
 
 class PipelinedKernel(torch.nn.Module):
     """Spec-driven, mutate-style kernel scheduler (see module docstring).
 
-    ``kernel(grid_index, *in_slots, *out_slots)`` is the per-tile compute; it
-    writes each output SRAM slot (via ``voyager.insert``) rather than
-    returning a value.  A ``None`` input spec is a whole / scalar / codebook
-    operand, passed through un-tiled.  ``num_slots`` is the software-pipeline
-    depth (2 = double buffering).
+    ``kernel(grid_index, *in_slots, *out_slots, *scratch)`` is the per-tile
+    compute; it writes each output SRAM slot (via ``voyager.insert``) rather
+    than returning a value.  A ``None`` input spec is a whole / scalar /
+    codebook operand, passed through un-tiled.  ``num_slots`` is the
+    software-pipeline depth (2 = double buffering).
 
-    This class owns orchestration only — buffer / semaphore allocation, the FX
+    ``lag`` is how many steps a tile's store trails its compute.  At ``lag ==
+    0`` each step loads, computes and stores its own tile.  At ``lag == 1``
+    step ``i`` issues tile ``i``'s compute and then stores tile ``i - 1``, so
+    two dispatches overlap; the inputs prefetch one slot less to leave room
+    for the dispatch still in flight, and an epilogue stores the last tile.
+    Every compute op is emitted inline; the sync pass dispatches it.
+
+    This class owns orchestration only — buffer / counter allocation, the FX
     ``while_loop`` construction, the compute-kernel invocation, and global grid
     traversal (the per-step delinearized indices).  Each operand's per-reference
     state machine lives in a ``_BufferedRef``; ``forward`` drives them in phase
     order, threading each operand's DRAM buffer in per call (Pallas style).
     """
-
-    # The synchronous scheduler; :class:`AsyncPipelinedKernel` sets this True.
-    # It selects the prefetch distance (``count - 1`` vs ``count - 2``) in
-    # ``_step_ctx`` and the ``_BufferedRef`` ``async_pipeline`` flag, so the
-    # two stay consistent from one source.
-    _async_pipeline = False
 
     def __init__(
         self,
@@ -596,10 +537,13 @@ class PipelinedKernel(torch.nn.Module):
         out_specs: List[_OutputSpec],
         scratch_specs: Sequence[_ScratchSpec] = (),
         num_slots: int = _DEFAULT_NUM_SLOTS,
+        lag: int = 0,
     ):
         super().__init__()
         if num_slots < 1:
             raise ValueError("num_slots must be >= 1")
+        if lag not in (0, 1):
+            raise ValueError("lag must be 0 or 1")
         self.kernel = kernel
         self.grid = grid
         self.in_specs = in_specs
@@ -608,6 +552,7 @@ class PipelinedKernel(torch.nn.Module):
         # accumulator); appended after the input/output refs in the kernel call.
         self.scratch_specs = tuple(scratch_specs)
         self.num_slots = num_slots
+        self.lag = lag
         self.ndim = len(self.grid)
         self.num_steps = math.prod(self.grid)
 
@@ -634,11 +579,9 @@ class PipelinedKernel(torch.nn.Module):
         ``prev`` / ``last`` plus one prefetch window per distinct buffer count.
         An operand of depth ``count`` reads slot ``step % count`` and prefetches
         ``d`` blocks ahead (``prev_edge`` is the block one before the window
-        edge).  ``d`` is ``count - 1`` for the synchronous kernel and
-        ``count - 2`` for the async one (``_async_pipeline``) — one less,
-        because the async commit consumes a tile an iteration later, so it
-        prefetches one fewer block to keep slot reuse WAR-safe.  ``d``
-        therefore matches each input ref's ``self.D``.
+        edge).  ``d`` is ``count - 1 - lag``: a lagged kernel consumes a tile
+        a step later, so it prefetches one fewer block to keep slot reuse
+        WAR-safe.  ``d`` therefore matches each input ref's ``self.D``.
         """
         cur = voyager.delinearize_index(step, self.grid)
         nxt = voyager.delinearize_index(step + 1, self.grid)
@@ -646,7 +589,7 @@ class PipelinedKernel(torch.nn.Module):
         last = step + 1 >= self.num_steps
         windows = {}
         for count in distinct_counts:
-            d = max(0, count - 2) if self._async_pipeline else count - 1
+            d = max(0, count - 1 - self.lag)
             cur_slot = step % count
             fetch_step = step + d
             has_fetch = fetch_step < self.num_steps
@@ -670,10 +613,7 @@ class PipelinedKernel(torch.nn.Module):
         tiled ``(input, spec)`` pairs, each input/output operand's buffer count,
         and one pipelined ``_BufferedRef`` scheduler per operand, plus scratch
         SRAM.  Returns them as a tuple ``(out_bufs, tiled, in_counts,
-        out_counts, in_refs, out_refs, scratch_bufs)``.  Each input ref's
-        prefetch distance
-        follows ``self._async_pipeline`` (``num_slots - 2`` when async,
-        ``num_slots - 1`` otherwise)."""
+        out_counts, in_refs, out_refs, scratch_bufs)``."""
         out_bufs = [voyager.alloc(s.shape, s.dtype) for s in self.out_specs]
         tiled = [
             (inp, s) for inp, s in zip(inputs, self.in_specs) if s is not None
@@ -684,7 +624,7 @@ class PipelinedKernel(torch.nn.Module):
         in_counts = [self._num_slots(s) for _, s in tiled]
         out_counts = [self._num_slots(s) for s in self.out_specs]
         # One SRAM slot per operand; separate pass so all slot ``alloc``s
-        # precede the refs' semaphore ``zeros`` in graph order.
+        # precede the refs' counters in graph order.
         in_slots = [
             voyager.alloc(s.tile_sizes, inp.dtype, _SRAM, num_slots=c)
             for (inp, s), c in zip(tiled, in_counts)
@@ -699,7 +639,7 @@ class PipelinedKernel(torch.nn.Module):
             for _, s in tiled
         ]
         # Per-operand schedulers: each owns its SRAM window (slot) and
-        # allocates its own per-slot semaphore.
+        # allocates its own stream counter.
         in_refs = [
             _BufferedRef(
                 _BufferedRef._IN,
@@ -707,7 +647,7 @@ class PipelinedKernel(torch.nn.Module):
                 self.grid,
                 c,
                 slots,
-                async_pipeline=self._async_pipeline,
+                self.lag,
                 load_buffers=buffers,
             )
             for (inp, s), c, slots, buffers in zip(
@@ -715,14 +655,7 @@ class PipelinedKernel(torch.nn.Module):
             )
         ]
         out_refs = [
-            _BufferedRef(
-                _BufferedRef._OUT,
-                s,
-                self.grid,
-                c,
-                slots,
-                async_pipeline=self._async_pipeline,
-            )
+            _BufferedRef(_BufferedRef._OUT, s, self.grid, c, slots, self.lag)
             for s, c, slots in zip(self.out_specs, out_counts, out_slots)
         ]
         # Scratch refs, captured like ``out_slots``.  A scratch of several
@@ -761,36 +694,44 @@ class PipelinedKernel(torch.nn.Module):
         distinct_counts = list(dict.fromkeys(in_counts + out_counts))
 
         # Prologue: prime the first ``D`` logical positions per input,
-        # deduplicating reused blocks.  A guarded input's prologue copy count
-        # seeds its producer cursor (always-advance inputs return ``None``).
-        init_copy_in = []
+        # deduplicating reused blocks.  Its copy count seeds the input's copy
+        # cursor: a guarded input's producer cursor, and the fetch cursor of
+        # an always-advance input that prefetches (``D > 0``), which the
+        # loop returns so the epilogue knows how many copies were issued.
+        init_copy_in, init_fetch = [], []
         for i, (inp, spec) in enumerate(tiled):
-            c = in_refs[i].prime_prologue(inp)
-            if c is not None:
+            ref = in_refs[i]
+            c = ref.prime_prologue(inp)
+            if not ref._advances_every_step():
                 init_copy_in.append(c)
+            elif ref.D > 0:
+                init_fetch.append(c)
 
-        def cond_fn(step, load_counts, wait_counts, store_counts):
+        def cond_fn(step, load_counts, wait_counts, store_counts, fetches):
             return step < self.num_steps
 
-        def body_fn(step, load_counts, wait_counts, store_counts):
+        def body_fn(step, load_counts, wait_counts, store_counts, fetches):
             ctx = self._step_ctx(step, distinct_counts)
 
-            # 1. COPY-IN: prefetch each input; a guarded input advances its
-            #    producer cursor (appended in ``tiled`` order), an
-            #    always-advance one carries none.
-            next_load_counts = []
-            g = 0
+            # 1. COPY-IN: prefetch each input, advancing its copy cursor (in
+            #    ``tiled`` order): a guarded input's producer cursor, a
+            #    prefetching always-advance input's fetch cursor.
+            next_load_counts, next_fetches = [], []
+            g = f = 0
             for i, (inp, _) in enumerate(tiled):
                 ref = in_refs[i]
-                if ref._advances_every_step():
-                    ref.copy_in(ctx, inp, None)
-                else:
+                if not ref._advances_every_step():
                     next_load_counts.append(
                         ref.copy_in(ctx, inp, load_counts[g])
                     )
                     g += 1
+                elif ref.D > 0:
+                    next_fetches.append(ref.copy_in(ctx, inp, fetches[f]))
+                    f += 1
+                else:
+                    ref.copy_in(ctx, inp, None)
 
-            # 2. WAIT-IN: wait on each input's read-slot load semaphore, then
+            # 2. WAIT-IN: wait until each input's block has landed, then
             #    read it.  ``None``-spec operands pass through in kernel order.
             in_slots, i, g = [], 0, 0
             for inp, spec in zip(inputs, self.in_specs):
@@ -805,32 +746,44 @@ class PipelinedKernel(torch.nn.Module):
                     g += 1
                 i += 1
 
-            # 3. WAIT-OUT (reuse): drain each output slot's prior store before
-            #    the kernel overwrites it.
-            out_slots, out_slot_idxs = [], []
-            for i in range(num_outputs):
-                slot_ref, slot = out_refs[i].wait_out(ctx, store_counts[i])
-                out_slots.append(slot_ref)
-                out_slot_idxs.append(slot)
+            # 3. WAIT-OUT: wait until each output's slot is free (its previous
+            #    tile's store has landed) before the kernel overwrites it.
+            out_slots = [
+                out_refs[i].wait_out(ctx, store_counts[i])
+                for i in range(num_outputs)
+            ]
+
+            # In a lagged kernel a multi-slot scratch rotates with the
+            # output tile's ordinal, like the out slots; otherwise the
+            # kernel is handed every slot and picks the one each of its ops
+            # uses (``_ScratchSpec``).
+            scratch_slots = [
+                (
+                    get_slot(buf, store_counts[0] % spec.num_slots)
+                    if spec.num_slots > 1 and self.lag
+                    else buf
+                )
+                for buf, spec in zip(scratch_bufs, self.scratch_specs)
+            ]
 
             # 4. KERNEL (mutate-style: writes the output slots).  Scratch
             #    refs follow the input/output args (Pallas's *index, *inputs,
             #    *outputs, *scratch convention).
-            self.kernel(ctx.cur, *in_slots, *out_slots, *scratch_bufs)
+            self.kernel(ctx.cur, *in_slots, *out_slots, *scratch_slots)
 
-            # 5. COPY-OUT: store each completed output tile (guarded), signaling
-            #    its store semaphore; advance the store counter.
+            # 5. STORE: this step's completed tile (``lag == 0``), or the
+            #    tile that finished on the previous step (``lag == 1``);
+            #    advance the store counter.
             next_store_counts = []
             for i in range(num_outputs):
-                next_store_counts.append(
-                    out_refs[i].copy_out(
-                        ctx,
-                        out_bufs[i],
-                        store_counts[i],
-                        out_slots[i],
-                        out_slot_idxs[i],
+                ref = out_refs[i]
+                if self.lag:
+                    count = ref.store_lagged(ctx, out_bufs[i], store_counts[i])
+                else:
+                    count = ref.copy_out(
+                        ctx, out_bufs[i], store_counts[i], out_slots[i]
                     )
-                )
+                next_store_counts.append(count)
 
             # 6. Consumer advance (guarded inputs), in ``tiled`` order.
             next_wait_counts, g = [], 0
@@ -847,6 +800,7 @@ class PipelinedKernel(torch.nn.Module):
                 tuple(next_load_counts),
                 tuple(next_wait_counts),
                 tuple(next_store_counts),
+                tuple(next_fetches),
             )
 
         init = (
@@ -857,237 +811,46 @@ class PipelinedKernel(torch.nn.Module):
             (0,) * len(init_copy_in),
             # store counters
             (0,) * num_outputs,
+            # fetch cursors, one per prefetching always-advance input
+            tuple(init_fetch),
         )
         final = while_loop(cond_fn, body_fn, init)
+        # The epilogue reads only what the loop returns, so it is right for
+        # however many steps ran: all of them, or the first few of a run cut
+        # short (``MAX_TILES``).
+        steps = final[0]
+        # Kept for a wrapping nest whose own epilogue counts what the loop
+        # issued (the sparse and outlier nests' stores).
+        self.steps_run = steps
+        final_load_counts, final_store_counts = final[1], final[3]
+        final_fetches = final[4]
 
-        # Finalize: drain each output slot's last (un-reused) store so the DRAM
-        # result is complete.
-        final_store_counts = final[3]
-        for i in range(num_outputs):
-            out_refs[i].drain(final_store_counts[i])
-
-        return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
-
-
-# Compute-done semaphore depth: two slots so tile ``s`` and ``s+1`` post to
-# different slots (a lagged retire waits ``s`` while the body commits ``s+1``).
-_DONE_DEPTH = 2
-
-
-class AsyncPipelinedKernel(PipelinedKernel):
-    """:class:`PipelinedKernel` that overlaps consecutive tiles via ``commit``.
-
-    Each step *dispatches* its compute with ``voyager.commit`` (send the params,
-    don't wait), so the next tile's array ramp-up overlaps the current tile's
-    ramp-down.  The retire (wait compute-done, then store) lags one tile: the
-    body commits tile ``s`` and retires ``s - 1`` (``s >= 1``); an epilogue
-    retires the last.
-
-    ``self.kernel`` (the ``async_pipeline`` kernel template) issues the
-    ``commit`` itself, waiting the input load semaphores and — on the round it
-    writes the output — that slot's store semaphore (seeded with a credit, so
-    a slot's first use never underflows).  Inputs are never ``async_wait``-ed
-    in the loop; the only loop-level wait is the lagged retire on compute-done.
-    Inputs prefetch ``num_slots - 2`` ahead (one less than the base), so a slot
-    a load overwrites was already retired — reuse-WAR-safe.
-    """
-
-    _async_pipeline = True
-
-    def forward(self, *inputs):
-        (
-            out_bufs,
-            tiled,
-            in_counts,
-            out_counts,
-            in_refs,
-            out_refs,
-            scratch_bufs,
-        ) = self._allocate(inputs)
-        num_outputs = len(out_refs)
-        distinct_counts = list(dict.fromkeys(in_counts + out_counts))
-
-        # Compute-done semaphore slot: commit(s) posts slot s % 2, the lagged
-        # retire of tile s waits it.
-        done_sem = voyager.zeros([], torch.int64, num_slots=_DONE_DEPTH)
-
-        # Per-operand reuse count: 1 = advancing (posts +1/step), R = reused
-        # (loaded once per block, posts +R so a per-step consume balances it).
-        reuse = [ref.reuse_count() for ref in in_refs]
-
-        # Prologue: prime the first ``D = num_slots - 2`` prefetch positions per
-        # input (deduped by block, posting the reuse count); a reused input
-        # seeds its producer cursor, an advancing one carries none.
-        init_load = []
-        for i, (inp, _) in enumerate(tiled):
-            c = in_refs[i].prime_prologue(inp, reuse[i])
-            if c is not None:
-                init_load.append(c)
-
-        def _store_out(i, coord, store_count):
-            """Store output ``i``'s tile to DRAM at grid ``coord`` from the slot
-            of the tile that just finished — ``(store_count - 1) % num_slots``,
-            one behind the tile the commit is on."""
-            ref = out_refs[i]
-            slot = (store_count - 1) % ref.num_slots
-            ref._store_tile(
-                get_slot(ref.slots, slot),
-                out_bufs[i],
-                coord,
-                get_slot(ref.sem, slot),
-            )
-
-        def cond_fn(step, load_counts, wait_counts, store_counts):
-            return step < self.num_steps
-
-        def body_fn(step, load_counts, wait_counts, store_counts):
-            ctx = self._step_ctx(step, distinct_counts)
-
-            # 1. Prefetch each input ``D`` blocks ahead (base ``copy_in``): an
-            #    advancing input copies every step (+1, no cursor); a reused one
-            #    copies once per block (+R) and advances its producer cursor.
-            next_load, g = [], 0
-            for i, (inp, _) in enumerate(tiled):
-                ref = in_refs[i]
-                if ref._advances_every_step():
-                    ref.copy_in(ctx, inp, None, reuse[i])
-                else:
-                    next_load.append(
-                        ref.copy_in(ctx, inp, load_counts[g], reuse[i])
-                    )
-                    g += 1
-
-            # 2. Read each input's current tile + its load semaphore — no wait,
-            #    the semaphore feeds commit.dependencies (the array ramp-up
-            #    waits it, not the loop).
-            in_slots, in_sems, i, g = [], [], 0, 0
-            for inp, spec in zip(inputs, self.in_specs):
-                if spec is None:
-                    in_slots.append(inp)
-                    continue
-                ref = in_refs[i]
-                if ref._advances_every_step():
-                    tile, sem = ref.read_advancing(ctx)
-                else:
-                    tile, sem = ref.read_reused(ctx, wait_counts[g])
-                    g += 1
-                in_slots.append(tile)
-                in_sems.append(sem)
-                i += 1
-
-            # The output tile's ordinal is ``store_counts`` (tiles finished so
-            # far); all its reduction rounds share slot ``ordinal % num_slots``
-            # (they accumulate into it), rotating per tile.
-            out_slots, out_sems = [], []
-            for i in range(num_outputs):
-                slot = store_counts[i] % out_refs[i].num_slots
-                out_slots.append(get_slot(out_refs[i].slots, slot))
-                out_sems.append(get_slot(out_refs[i].sem, slot))
-
-            # A double-buffered scratch rotates with the output tile's
-            # ordinal, like the out slots; the lagged retire alone orders a
-            # slot's reuse behind its last reader (see ``_ScratchSpec``).
-            scratch_slots = [
-                (
-                    get_slot(buf, store_counts[0] % spec.num_slots)
-                    if spec.num_slots > 1
-                    else buf
-                )
-                for buf, spec in zip(scratch_bufs, self.scratch_specs)
-            ]
-
-            post = get_slot(done_sem, step % _DONE_DEPTH)
-
-            # 3. Dispatch the tile's compute: the async kernel issues the
-            #    ``commit`` itself — waiting the input load semaphores and, on
-            #    the round it writes the output, that slot's store semaphore
-            #    free (seeded with a credit, so first uses never underflow).
-            self.kernel(
-                ctx.cur,
-                in_slots,
-                out_slots,
-                scratch_slots,
-                in_sems,
-                out_sems,
-                post,
-            )
-
-            # 4. Lagged retire of tile step-1 (nothing at step 0): wait its
-            #    compute-done every step, and store each output once its *own*
-            #    block has finished (slot ordinal one behind the tile committed
-            #    now).  Flat conds — a ``SymBool`` predicate cannot be captured
-            #    into an outer cond's operands, so ``step >= 1`` folds into the
-            #    store predicate.
-            effect_cond(
-                step >= 1,
-                lambda: voyager.async_wait(
-                    get_slot(done_sem, (step - 1) % _DONE_DEPTH)
-                ),
-            )
-
-            # 5. Retire (store) + advance the finished-tile count, per output.
-            #    An output that advances every step stores every step (guard
-            #    just ``step >= 1``) and its count ticks unconditionally — no
-            #    ``_indices_differ`` (always true), matching ``copy_out``'s fast
-            #    path.  A held output stores / ticks only on its own block
-            #    boundary.
-            next_store = []
+        # Epilogue.  A lagged kernel still has to store the last step's
+        # tile (the last step always completes one).
+        if self.lag and self.num_steps >= 1 and num_outputs:
+            coord = voyager.delinearize_index(steps - 1, self.grid)
             for i in range(num_outputs):
                 ref = out_refs[i]
-                if ref._advances_every_step():
-                    should_store = step >= 1
-                    nxt = store_counts[i] + 1
-                else:
-                    should_store = (step >= 1) & ref._indices_differ(
-                        ctx.prev, ctx.cur
-                    )
-                    nxt = torch.sym_ite(
-                        ref._indices_differ(ctx.cur, ctx.next) | ctx.last,
-                        store_counts[i] + 1,
-                        store_counts[i],
-                    )
-                effect_cond(
-                    should_store,
-                    lambda i=i: _store_out(i, ctx.prev, store_counts[i]),
-                )
-                next_store.append(nxt)
+                slot = (final_store_counts[i] - 1) % ref.num_slots
+                ref._store_tile(get_slot(ref.slots, slot), out_bufs[i], coord)
 
-            # 6. Advance each reused input's consumer cursor (block finished).
-            next_wait, g = [], 0
-            for in_ref in in_refs:
-                if in_ref._advances_every_step():
-                    continue
-                next_wait.append(in_ref.advance_consumer(ctx, wait_counts[g]))
+        # Then the kernel ends quiescent on its streams: every counter is
+        # waited at its final count, so the DRAM result is complete and the
+        # slots are free for whatever comes next.  An always-advance input
+        # without a prefetch copies once per step.
+        g = f = 0
+        for ref in in_refs:
+            if not ref._advances_every_step():
+                copies = final_load_counts[g]
                 g += 1
-
-            return (
-                step + 1,
-                tuple(next_load),
-                tuple(next_wait),
-                tuple(next_store),
-            )
-
-        init = (
-            0,
-            tuple(init_load),
-            (0,) * len(init_load),
-            (0,) * num_outputs,
-        )
-        final = while_loop(cond_fn, body_fn, init)
-
-        # Epilogue: retire the final step (its commit is never lagged-retired;
-        # the last step always completes a tile, so it stores), then drain every
-        # slot's last store (one per output tile).
-        final_store = final[3]
-        if self.num_steps >= 1:
-            last = self.num_steps - 1
-            voyager.async_wait(get_slot(done_sem, last % _DONE_DEPTH))
-            if num_outputs:
-                coord = out_refs[0]._unravel(last)
-                for i in range(num_outputs):
-                    _store_out(i, coord, final_store[i])
+            elif ref.D > 0:
+                copies = final_fetches[f]
+                f += 1
+            else:
+                copies = steps
+            voyager.async_wait(ref.counter, copies)
         for i in range(num_outputs):
-            out_refs[i].drain(final_store[i])
+            voyager.async_wait(out_refs[i].counter, final_store_counts[i])
 
         return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
 
@@ -1122,23 +885,24 @@ def build_pipelined_buffers(
     *,
     scratch_specs: Sequence[_ScratchSpec] = (),
     num_slots: int = _DEFAULT_NUM_SLOTS,
-    async_pipeline: bool = False,
+    lag: int = 0,
     kwargs: Optional[dict] = None,
     wrapper: Optional[Callable] = None,
     bank_groups: Optional[Sequence[Optional[int]]] = None,
 ) -> torch.fx.GraphModule:
     """Build the bufferized FX graph (a single rolled ``while_loop`` over
-    ``voyager.*`` primitives) for ``kernel`` over ``grid``.  Mirrors
+    ``voyager.*`` primitives) for ``kernel`` over ``grid``, its stores
+    ``lag`` steps behind its compute (``PipelinedKernel``).  Mirrors
     ``build_pointwise_buffers``'s export / finalize / extent-tag flow.
     """
-    cls = AsyncPipelinedKernel if async_pipeline else PipelinedKernel
-    pattern = cls(
+    pattern = PipelinedKernel(
         kernel,
         grid,
         in_specs,
         out_specs,
         scratch_specs=scratch_specs,
         num_slots=num_slots,
+        lag=lag,
     )
     num_steps = pattern.num_steps
     if wrapper is not None:
@@ -1403,10 +1167,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
 
 
 def _single_pass_kernel(
-    compute: Callable,
-    num_outputs: int,
-    num_scratch: int = 0,
-    async_pipeline: bool = False,
+    compute: Callable, num_outputs: int, num_scratch: int = 0
 ):
     """Map kernel (no cross-tile reduction): adapt a return-style
     ``compute(*in_slots) -> Tensor | tuple`` into the scheduler's mutate-style
@@ -1417,16 +1178,6 @@ def _single_pass_kernel(
     ``num_scratch`` trailing refs are handed to ``compute`` after the input
     tiles: a map computes nothing across tiles, so its scratch is space the
     backend's own passes write, which the op names but never reads.
-
-    ``async_pipeline=False`` returns the synchronous :class:`PipelinedKernel`
-    kernel (``kernel(grid_index, *in_slots, *out_slots)``, insert inline).
-    ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel`
-    counterpart: it *dispatches* the same compute with ``voyager.commit`` so
-    the next tile's systolic-array ramp-up overlaps this tile's ramp-down.  The
-    commit waits the input load semaphores and — every step, since a map writes
-    the output each step — that slot's store semaphore free ("wait on whatever
-    we write"; the store-sem is seeded with a credit so a slot's first use
-    never underflows).
     """
 
     def inner(grid_index, *args):
@@ -1443,16 +1194,7 @@ def _single_pass_kernel(
         for slot, value in zip(out_slots, results):
             voyager.insert(value, slot)
 
-    if not async_pipeline:
-        return inner
-
-    def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
-    ):
-        operands = [grid_index, *in_slots, *out_slots, *scratch]
-        commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
-
-    return kernel
+    return inner
 
 
 def _running_max_kernel(compute: Callable):
@@ -1472,22 +1214,17 @@ def _running_max_kernel(compute: Callable):
             first = first & (coord == 0)
 
         def init():
-            return tile_max.clone()
+            voyager.insert(tile_max.clone(), out_slot)
 
-        def fold(prev=out_slot):
-            return torch.maximum(tile_max, prev)
+        def fold():
+            voyager.insert(torch.maximum(tile_max, out_slot), out_slot)
 
-        voyager.insert(torch.cond(first, init, fold), out_slot)
+        effect_cond(first, init, fold)
 
     return inner
 
 
-def _inplace_tail_kernel(
-    compute: Callable,
-    fused_gm,
-    fused_operand_indices,
-    async_pipeline: bool = False,
-):
+def _inplace_tail_kernel(compute: Callable, fused_gm, fused_operand_indices):
     """Kernel for a single-round op whose tail the drain cannot hold in one
     pass but which keeps the tile's shape: the op writes its output slot,
     and the tail runs a second pass over that slot in place.  No scratch is
@@ -1496,9 +1233,7 @@ def _inplace_tail_kernel(
 
     ``compute(in_slots, first)`` is the bare op; ``fused_gm`` takes the
     tile and the operands ``fused_operand_indices`` name in the input
-    slots.  ``async_pipeline=True`` dispatches both passes as one commit,
-    waiting the input loads and the slot's store free, as
-    ``_single_pass_kernel`` does.
+    slots.
     """
 
     def inner(grid_index, *args):
@@ -1507,21 +1242,26 @@ def _inplace_tail_kernel(
         fused = [in_slots[i] for i in fused_operand_indices]
         voyager.insert(fused_gm(out_slot, *fused), out_slot)
 
-    if not async_pipeline:
-        return inner
-
-    def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
-    ):
-        operands = [grid_index, *in_slots, *out_slots]
-        commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
-
-    return kernel
+    return inner
 
 
-def _reduction_inplace_kernel(
-    compute: Callable, reduction_dim: int, async_pipeline: bool = False
-):
+def _accumulate_into(compute, in_slots, acc, first):
+    """Fold this round's partial into the accumulator ``acc``: the op with
+    bias on the first round (``first``), initializing it, the bare op plus
+    the running accumulator after.  Each branch writes ``acc`` itself, so
+    the op and its store sit in one region.
+    """
+
+    def init():
+        voyager.insert(compute(in_slots, True), acc)
+
+    def accumulate():
+        voyager.insert(compute(in_slots, False) + acc, acc)
+
+    effect_cond(first, init, accumulate)
+
+
+def _reduction_inplace_kernel(compute: Callable, reduction_dim: int):
     """Kernel for a reduction with nothing left to do once it completes — no
     cast (the accumulator's dtype is the output's) and no fused tail.  It
     accumulates straight into the output slot, so there is no scratch ref and no
@@ -1529,64 +1269,15 @@ def _reduction_inplace_kernel(
 
     ``_reduction_fused_kernel`` is the general case, where a cast or a tail must
     map the accumulator into the slot and so needs one of its own.
-
-    ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant:
-    the accumulator *is* the output slot, first written on the ``0`` reduction
-    coord, so the commit dispatch waits the slot free there.
     """
 
     def inner(grid_index, *args):
         *in_slots, out_slot = args
-
-        def init():
-            return compute(in_slots, True)
-
-        def accumulate(prev=out_slot):
-            return compute(in_slots, False) + prev
-
-        voyager.insert(
-            torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
-            out_slot,
+        _accumulate_into(
+            compute, in_slots, out_slot, grid_index[reduction_dim] == 0
         )
 
-    if not async_pipeline:
-        return inner
-
-    # ``init`` writes the output-slot accumulator fresh (waits the slot free),
-    # ``accumulate`` RMWs it in place (no output dep).  Split them across the
-    # round-0 predicate so neither commit body carries the now-redundant
-    # ``K == 0`` inner cond.
-    def init_body(grid_index, *args):
-        *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, True), out_slot)
-
-    def accumulate_body(grid_index, *args):
-        *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, False) + out_slot, out_slot)
-
-    def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
-    ):
-        operands = [grid_index, *in_slots, *out_slots, *scratch]
-
-        def on_first():
-            commit(
-                init_body,
-                operands,
-                dependencies=[*in_sems, *out_sems],
-                post=post,
-            )
-            return 0
-
-        def not_first():
-            commit(
-                accumulate_body, operands, dependencies=[*in_sems], post=post
-            )
-            return 0
-
-        torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
-
-    return kernel
+    return inner
 
 
 def _split_part(fused_gm, part_ops, root, name, result):
@@ -1787,8 +1478,6 @@ def _reduction_fused_kernel(
     chain_tail: bool,
     split,
     fused_operand_indices: List[int] = (),
-    scratch_slots: int = 1,
-    async_pipeline: bool = False,
 ):
     """Kernel for an op whose finished tile passes through scratch: a
     reduction over several K tiles, or a single round whose tail cannot ride
@@ -1806,8 +1495,9 @@ def _reduction_fused_kernel(
                             runs as a staged pass
 
     The bias rides the first round only, the one that initializes the
-    accumulator.  Both nests share this logic; the async variant dispatches
-    each round as a ``commit``.
+    accumulator.  Each round's ops are emitted inline, every op writing
+    its own destination, in the branch of the ``k == 0`` / ``k == K - 1``
+    conds that runs it; the sync pass dispatches them.
 
     Args:
         compute: ``compute(in_slots, first)``, the bare op on the current
@@ -1827,11 +1517,6 @@ def _reduction_fused_kernel(
             ``None`` when nothing in it breaks the stream.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
-        scratch_slots: Slots of the scratch accumulator, 1 or 2; with 2 the
-            staged pass stays inside the commit, with 1 it runs bare after
-            it (async variant only).
-        async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
-            instead of the synchronous body.
 
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
@@ -1847,22 +1532,6 @@ def _reduction_fused_kernel(
         # Round a finished accumulator to the op's output dtype, the value
         # every tail op reads.
         return acc if op_dtype is None else acc.to(op_dtype)
-
-    def _accumulate(grid_index, in_slots, scratch):
-        """Fold this round's partial into the scratch accumulator: the op with
-        bias on the first coord (initializing it), the bare op plus the running
-        accumulator after."""
-
-        def init():
-            return compute(in_slots, True)
-
-        def accumulate(prev=scratch):
-            return compute(in_slots, False) + prev
-
-        voyager.insert(
-            torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
-            scratch,
-        )
 
     def _finalize(in_slots, out_slots, scratch):
         """Cast the completed accumulator, apply the fused tail once, and store
@@ -1898,6 +1567,7 @@ def _reduction_fused_kernel(
             _finalize(in_slots, out_slots, scratch)
             return
 
+        k = grid_index[reduction_dim]
         if chain_tail:
 
             def on_last():
@@ -1909,86 +1579,23 @@ def _reduction_fused_kernel(
                     head = split[0](_to_out(total), *fused)
                     voyager.insert(head.reshape(scratch.shape), scratch)
                     _staged_quantize(in_slots, out_slots, scratch)
-                return 0
 
             def not_last():
-                _accumulate(grid_index, in_slots, scratch)
-                return 0
+                if last_idx == 1:
+                    # Two rounds: the one that is not last initializes.
+                    voyager.insert(compute(in_slots, True), scratch)
+                else:
+                    _accumulate_into(compute, in_slots, scratch, k == 0)
 
-            torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
+            effect_cond(k == last_idx, on_last, not_last)
             return
 
-        _accumulate(grid_index, in_slots, scratch)
+        _accumulate_into(compute, in_slots, scratch, k == 0)
         effect_cond(
-            grid_index[reduction_dim] == last_idx,
-            lambda: _finalize(in_slots, out_slots, scratch),
+            k == last_idx, lambda: _finalize(in_slots, out_slots, scratch)
         )
 
-    if not async_pipeline:
-        return inner
-
-    def accumulate_body(grid_index, *args):
-        in_slots, _out_slots, scratch = _split(args)
-        _accumulate(grid_index, in_slots, scratch)
-
-    def finalize_body(grid_index, *args):
-        in_slots, out_slots, scratch = _split(args)
-        if single_round:
-            # The only round: bias folds in, no prior partial to add.
-            total = compute(in_slots, True)
-        else:
-            total = compute(in_slots, False) + scratch
-        if split is None and chain_tail:
-            _finalize(in_slots, out_slots, total)
-        elif not chain_tail:
-            voyager.insert(total, scratch)
-            if scratch_slots > 1:
-                _finalize(in_slots, out_slots, scratch)
-        else:
-            # Layout-preserving chained head; the split-off relayout +
-            # quantize pass reads the staged tile.
-            fused = [in_slots[i] for i in fused_operand_indices]
-            head = split[0](_to_out(total), *fused)
-            voyager.insert(head.reshape(scratch.shape), scratch)
-            if scratch_slots > 1:
-                _staged_quantize(in_slots, out_slots, scratch)
-
-    def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
-    ):
-        operands = [grid_index, *in_slots, *out_slots, *scratch]
-
-        def on_last():
-            commit(
-                finalize_body,
-                operands,
-                dependencies=[*in_sems, *out_sems],
-                post=post,
-            )
-            # With one scratch slot the next sweep's round-0 accumulate
-            # would overwrite the tile this tail still reads, so the tail
-            # runs bare here — program order delays that commit (an array
-            # bubble).  With two slots the tail stays in ``finalize_body``.
-            if scratch_slots == 1:
-                if not chain_tail:
-                    _finalize(in_slots, out_slots, scratch[0])
-                elif split is not None:
-                    _staged_quantize(in_slots, out_slots, scratch[0])
-            return 0
-
-        def not_last():
-            commit(
-                accumulate_body, operands, dependencies=[*in_sems], post=post
-            )
-            return 0
-
-        if single_round:
-            # Every step completes its tile: skip the constant-predicate cond.
-            on_last()
-            return
-        torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
-
-    return kernel
+    return inner
 
 
 def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
@@ -2084,12 +1691,11 @@ def _gemm_scratch_and_kernel(
     fused_idx,
     anchor,
     accumulate_fp32,
-    async_pipeline,
+    lag,
     single_buffer_tail=False,
     split=_CLASSIFY,
     single_k_tail_fusible=True,
     split_k_tail_fusible=False,
-    single_scratch_slot=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -2108,8 +1714,10 @@ def _gemm_scratch_and_kernel(
             whose placement gives the scratch its slots.
         accumulate_fp32: Accumulate the reduction in fp32 rather than the
             output dtype.
-        async_pipeline: The async kernel variants, or the sync ones.
-        single_buffer_tail: Collapse a sync reduction's operand banks to one.
+        lag: Steps the nest's stores trail its compute
+            (``PipelinedKernel``).
+        single_buffer_tail: Collapse an unlagged reduction's operand banks
+            to one.
         split: The tail's ``_split_stream_break`` result, precomputed by a
             caller whose kernel is rebuilt under export tracing (the sparse
             GEMM), where the classification's graph walk cannot run; the
@@ -2120,9 +1728,6 @@ def _gemm_scratch_and_kernel(
             through scratch.
         split_k_tail_fusible: The tail chains into a split reduction's
             finalize pass.
-        single_scratch_slot: Hold the scratch to one slot, whatever the
-            search placed, for a tail that runs bare after the commit
-            (``_reduction_fused_kernel``'s bare-tail path).
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -2176,9 +1781,7 @@ def _gemm_scratch_and_kernel(
         split = _split_stream_break(fused_gm)
     if num_k == 1 and split is None and single_k_tail_fusible:
         scratch_specs = []
-        kernel = _single_pass_kernel(
-            compute, len(out_specs), async_pipeline=async_pipeline
-        )
+        kernel = _single_pass_kernel(compute, len(out_specs))
     elif (
         num_k == 1
         and split is None
@@ -2187,37 +1790,27 @@ def _gemm_scratch_and_kernel(
         and tuple(out_specs[0].tile_sizes) == tuple(acc_shape)
     ):
         scratch_specs = []
-        kernel = _inplace_tail_kernel(
-            gemm_kernel, fused_gm, fused_idx, async_pipeline=async_pipeline
-        )
+        kernel = _inplace_tail_kernel(gemm_kernel, fused_gm, fused_idx)
     elif fused_gm is None and acc_dtype == out_dtype:
         scratch_specs = []
         kernel = _reduction_inplace_kernel(
-            gemm_kernel,
-            reduction_dim=reduction_dim,
-            async_pipeline=async_pipeline,
+            gemm_kernel, reduction_dim=reduction_dim
         )
     else:
-        if single_buffer_tail and not async_pipeline and num_k > 1:
+        if single_buffer_tail and not lag and num_k > 1:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
         if num_k == 1:
             # A single round stages its finished tile, not a running
             # partial: the scratch holds the output's own dtype.
             acc_dtype = out_dtype
-        # Only an async tail that reads scratch after the streamed pass gains
+        # Only a lagged tail that reads scratch after the streamed pass gains
         # a second slot, which the scheduler rotates per tile; a
         # chained-whole tail never races and keeps one.  The count is the
-        # search's placement (the scratch ladder winner) unless the caller
-        # holds the scratch to one slot.
+        # search's placement (the scratch ladder winner).
         reads_scratch = not split_k_tail_fusible or split is not None
         tile_result = anchor.meta.get("tile_result")
         slots = 1
-        if (
-            async_pipeline
-            and reads_scratch
-            and not single_scratch_slot
-            and tile_result is not None
-        ):
+        if lag and reads_scratch and tile_result is not None:
             slots = tile_result.placement.scratch_slots
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(
@@ -2230,8 +1823,6 @@ def _gemm_scratch_and_kernel(
             chain_tail=split_k_tail_fusible,
             split=split,
             fused_operand_indices=fused_idx,
-            scratch_slots=slots,
-            async_pipeline=async_pipeline,
         )
     return scratch_specs, kernel
 
@@ -2478,7 +2069,7 @@ def build_conv2d(
         fused_idx=fused_idx,
         anchor=anchor,
         accumulate_fp32=ctx.accumulate_fp32,
-        async_pipeline=ctx.async_pipeline,
+        lag=ctx.lag,
         single_buffer_tail=ctx.single_buffer_tail,
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
         split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
@@ -2491,7 +2082,7 @@ def build_conv2d(
         tuple(inputs),
         scratch_specs=scratch_specs,
         num_slots=ctx.num_slots,
-        async_pipeline=ctx.async_pipeline,
+        lag=ctx.lag,
         bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
     )
     if num_k > 1 or info is not None:
@@ -2971,7 +2562,7 @@ def build_gemm(
         fused_idx=plan.fused_idx,
         anchor=plan.anchor,
         accumulate_fp32=ctx.accumulate_fp32,
-        async_pipeline=ctx.async_pipeline,
+        lag=ctx.lag,
         single_buffer_tail=ctx.single_buffer_tail,
         single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
         split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
@@ -2984,7 +2575,7 @@ def build_gemm(
         plan.inputs,
         scratch_specs=scratch_specs,
         num_slots=ctx.num_slots,
-        async_pipeline=ctx.async_pipeline,
+        lag=ctx.lag,
         bank_groups=_bank_group_list(
             node, plan.in_specs, plan.out_specs, scratch_specs
         ),

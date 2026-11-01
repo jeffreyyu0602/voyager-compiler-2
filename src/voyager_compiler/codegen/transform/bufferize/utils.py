@@ -48,9 +48,9 @@ class BuildContext:
     Attributes:
         tiler: The ``Tiler`` supplying per-node tile factors, or ``None``.
         num_slots: Buffer slots per pipelined operand (1: single-buffered).
-        async_pipeline: A pipelined GEMM (dense and sparse) / conv dispatches
-            each tile's compute asynchronously; off => the synchronous
-            ``PipelinedKernel``.
+        lag: Steps a pipelined GEMM (dense and sparse) / conv nest's stores
+            trail its compute (``PipelinedKernel``): 1 overlaps two
+            dispatches, 0 stores each tile on its own step.
         accumulate_fp32: A GEMM (dense and sparse) split along K accumulates
             in float32 rather than its output dtype.
         single_buffer_tail: Single-buffer a >1-tile reduction's output and
@@ -63,7 +63,7 @@ class BuildContext:
 
     tiler: Optional[Tiler]
     num_slots: int
-    async_pipeline: bool
+    lag: int
     accumulate_fp32: bool
     single_buffer_tail: bool
     flash_attention_v3: bool
@@ -73,15 +73,17 @@ class BuildContext:
 def effect_cond(
     pred: torch.Tensor | torch.SymBool | bool,
     action: Callable[[], None],
+    otherwise: Optional[Callable[[], None]] = None,
 ) -> None:
-    """Run the side-effecting ``action()`` when ``pred`` holds, else nothing —
-    a ``torch.cond`` guard whose two branches return the *same* constant.
+    """Run the side-effecting ``action()`` when ``pred`` holds, else
+    ``otherwise()`` (nothing by default) — a ``torch.cond`` whose two
+    branches return the *same* constant.
 
     Returning different ints from the branches (the ``do`` returns 1 / ``skip``
     returns 0 idiom) makes ``torch.cond`` mint an unbacked symint for the
     discarded result; inside a ``()``-returning ``voyager.commit`` that dangling
     symbol trips export's ``PendingUnbackedSymbolNotFound``.  Matched constants
-    mint none.  ``action``'s own return is ignored; ``has_side_effect(cond)``
+    mint none.  The branches' own returns are ignored; ``has_side_effect(cond)``
     keeps the guard.
     """
 
@@ -90,9 +92,22 @@ def effect_cond(
         return 0
 
     def false_branch():
+        if otherwise is not None:
+            otherwise()
         return 0
 
     torch.cond(pred, true_branch, false_branch)
+
+
+def new_counter() -> torch.Tensor:
+    """A fresh hardware counter at 0: a 0-d int64 ``voyager.alloc`` at the
+    register level, followed by the ``voyager.zeros`` that resets it.  Every
+    copy of a stream adds 1 to its counter when it has landed, and a CPU
+    ``voyager.async_wait(counter, threshold)`` blocks until it has reached
+    ``threshold``."""
+    counter = voyager.alloc([], torch.int64, int(MemoryLevel.REGISTER))
+    voyager.zeros(counter)
+    return counter
 
 
 def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
@@ -267,13 +282,11 @@ class _ScratchSpec:
     tiled-reduction accumulator).  Mirrors Pallas's ``scratch_shapes``
     appended after the normal input/output refs.
 
-    ``num_slots == 2`` double-buffers the scratch in the async pipeline: its
+    ``num_slots == 2`` double-buffers the scratch in a lagged pipeline: its
     lifetime is one output tile, so the scheduler hands the kernel the slot
     at the output tile's ordinal (``store_count % num_slots``), exactly how
-    the out slots rotate.  No synchronization is added — the lagged retire
-    already orders a slot's reuse (tile ``t + 2``) behind the finalize that
-    last read it (tile ``t``), because a commit is dispatched only after
-    every commit two steps back has been observed complete.  The synchronous
+    the out slots rotate.  The sync pass orders a slot's reuse (tile ``t +
+    2``) behind the dispatch that last read it (tile ``t``).  An unlagged
     pipeline hands the kernel all ``num_slots`` slots, and the kernel picks
     the one each of its ops uses.
 

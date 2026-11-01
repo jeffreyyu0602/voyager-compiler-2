@@ -168,8 +168,11 @@ class TrainiumConfig(AcceleratorConfig):
     def backend(self):
         """Trainium's hooks into ``compile()``: its GEMM and attention
         builders (``gemm.py``, ``attention.py``) ahead of the shared
-        builders."""
-        return Backend((GEMM_RULE, ATTENTION_RULE, *SHARED_BUILDERS))
+        builders, and no sync pass (NKI orders the work by its
+        dependences)."""
+        return Backend(
+            (GEMM_RULE, ATTENTION_RULE, *SHARED_BUILDERS), synchronizes=False
+        )
 
 
 def _core(target, sbuf_bytes, dram_bandwidth):

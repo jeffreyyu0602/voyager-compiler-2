@@ -2,17 +2,18 @@
 
 A lightweight interpreter (modeled on ``shape_prop.ShapeProp``'s node loop, but
 specialized) keeps an ``env`` of concrete **scalar** values and evaluates only
-the scalar / control sublanguage — index math, predicates, counters — which is
-all that is needed to thread the loop-carried state, resolve semaphore slots,
+the scalar / control sublanguage — index math, predicates, cursors, wait
+thresholds — which is all that is needed to thread the loop-carried state,
 and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 ``meta['val']`` already on the nodes, so no tensors are ever materialized.
 
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
-compute on the systolic array, ``async_copy`` on the DRAM interface, and waits
-as zero-time control. A DPS ``insert`` writes a compute result into its buffer
-and is pure bookkeeping (skipped). An asynchronous compute is dispatched by
-``voyager.commit``, which posts its done-semaphore when it finishes -- so
-``async_wait`` can reconcile compute the same way it does a DMA.
+compute on the systolic array, ``async_copy`` on the DRAM interface, and
+waits and drains as zero-time control. A DPS ``insert`` writes a compute
+result into its buffer and is pure bookkeeping (skipped). An asynchronous
+compute is dispatched by ``voyager.commit``, which adds to its counter when
+it finishes -- so ``async_wait`` can reconcile compute the same way it does
+a DMA.
 
 A ``while_loop`` is not walked iteration by iteration: once its steady
 state repeats, the remaining periods are folded in one step (``_Fold``),
@@ -30,7 +31,6 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     QUANTIZE_FAMILY_OPS,
-    get_arg_value,
     is_compute_op,
     is_nop,
 )
@@ -74,19 +74,20 @@ from voyager_compiler.shape_prop import run_op
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
+_ONES = torch.ops.voyager.ones.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
+_DRAIN = torch.ops.voyager.drain.default
 _INSERT = torch.ops.voyager.insert.default
-_FILL = torch.ops.voyager.fill.default
 
 
 @dataclass
 class _Ctx:
     rs: ResourceState
     cost: AcceleratorConfig
-    # placeholder -> the outer source node it is bound to (for semaphore-slot
-    # rooting across loop / cond boundaries).
+    # placeholder -> the outer source node it is bound to (for rooting a
+    # counter across loop / cond boundaries).
     bind: Dict[Node, Node]
     fold: bool = True  # fold each loop's steady state instead of walking it
     depth: int = 0  # control-flow nesting below the top-level graph
@@ -111,7 +112,7 @@ def _should_eval(node: Node) -> bool:
     tensor and not a pure buffer op)."""
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZEROS, _SUBVIEW)
+        and node.target not in (_ALLOC, _ZEROS, _ONES, _SUBVIEW)
         and not _is_tensor(node)
     )
 
@@ -321,29 +322,11 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
     return reads, write
 
 
-def _sem_key(sem_arg, env, bind):
-    """``(slots_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
-
-    The arg is a ``subview(slots, [slot], [1], [1])`` behind the NOP that
-    squeezes the slot dim off — possibly reached through a chain of
-    placeholder bindings when the pick sits outside a ``cond`` that the DMA
-    lives in.  ``slot`` is resolved against the shared ``env`` (the slot
-    index, e.g. ``step % num_slots``, was computed in that outer scope), so
-    an ``async_copy`` into a slot and its matching ``async_wait`` hash equal.
-    """
-    node = _defining(sem_arg, bind)
-    while (
-        isinstance(node, Node) and node.op == "call_function" and is_nop(node)
-    ):
-        node = _defining(node.args[0], bind)
-    if (
-        isinstance(node, Node)
-        and node.op == "call_function"
-        and node.target is _SUBVIEW
-    ):
-        slots = _defining(node.args[0], bind)
-        return (id(slots), _resolve(node.args[1][0], env))
-    return (id(node), 0)
+def _counter_key(counter_arg, bind):
+    """The identity of the counter an ``async_copy`` / ``async_wait`` /
+    ``commit`` names: its ``alloc`` node, reached through the placeholder
+    bindings of the loop / cond / commit regions between."""
+    return id(_defining(counter_arg, bind))
 
 
 def _num_steps(node: Node) -> int:
@@ -392,30 +375,19 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             fill = node.meta.get(CSR_FILL_META)
             if fill is not None:
                 n_bytes = math.ceil(n_bytes * fill)
-            key = _sem_key(node.args[4], env, ctx.bind)
-            post_count = _resolve(get_arg_value(node, 10, "post_count", 1), env)
+            key = _counter_key(node.args[4], ctx.bind)
             rs.async_copy(
-                node,
-                n_bytes,
-                is_load,
-                key,
-                path,
-                _buf_category(buf, ctx.bind),
-                post_count=post_count,
+                node, n_bytes, is_load, key, path, _buf_category(buf, ctx.bind)
             )
-        elif t is _FILL:
-            # A credit-seeded output store-sem: seed each slot's FIFO so
-            # the first commit that waits the slot free draws the credit.
-            value = int(get_arg_value(node, 2, "value", 0) or 0)
-            slots = int(get_arg_value(node, 3, "num_slots", 1) or 1)
-            for slot in range(slots):
-                rs.seed_semaphore((id(node), slot), value)
         elif t is _ASYNC_WAIT:
-            rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
+            key = _counter_key(node.args[0], ctx.bind)
+            rs.async_wait(node, key, _resolve(node.args[1], env), path)
+        elif t is _DRAIN:
+            rs.drain(node, path)
         elif t is _INSERT:
             # Destination-passing write: pure bookkeeping, zero-time -- the
             # producing compute already carries its destination.  (An async
-            # producer posts its completion via voyager.commit's ``post``, not
+            # producer adds its completion via voyager.commit's ``post``, not
             # the insert.)
             pass
         elif _produces_tensor(node) and is_compute_op(node):
@@ -433,7 +405,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
 def _bind(phs, sources, env, ctx, carried_vals=None):
     """Bind a body / branch's placeholders into the shared ``env``: carried
     indices take threaded scalar values; the rest resolve from their source.
-    Record each binding's source node so semaphore selects can be rooted across
+    Record each binding's source node so a counter can be rooted across
     the loop / cond boundary."""
     for i, (ph, src) in enumerate(zip(phs, sources)):
         if carried_vals is not None and i < len(carried_vals):
@@ -796,20 +768,21 @@ def _run_region(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
 
 
 def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
-    """A committed (async) region: it is parked until every semaphore in
-    ``dependencies`` is posted, then its body walks off the program clock (its
+    """A committed (async) region: it is parked until every wait in
+    ``dependencies`` holds, then its body walks off the program clock (its
     compute occupies the datapath without advancing the program clock) and
-    ``post`` is signalled with the last body op's completion.  See
-    ``ResourceState.register_commit``.  The dep / done-sem slots are resolved
-    now (their indices were computed before the commit); the body walk is
-    deferred into ``run``."""
+    ``post`` is added to with the last body op's completion.  See
+    ``ResourceState.register_commit``.  The waits' counters and thresholds
+    are resolved now (the thresholds were computed before the commit); the
+    body walk is deferred into ``run``."""
     sub = getattr(gm, str(node.args[0].target))
-    deps = [
-        _sem_key(d, env, ctx.bind)
-        for d in node.kwargs.get("dependencies") or ()
+    waits = [
+        (unit, _counter_key(counter, ctx.bind), _resolve(threshold, env))
+        for unit, pairs in (node.kwargs.get("dependencies") or {}).items()
+        for counter, threshold in pairs
     ]
     post = node.kwargs.get("post")
-    done_key = _sem_key(post, env, ctx.bind) if post is not None else None
+    post_key = _counter_key(post, ctx.bind) if post is not None else None
     result = {}
 
     def run():
@@ -819,10 +792,10 @@ def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
             result["out"] = _walk(sub, env, ctx, path)
         finally:
             ctx.depth -= 1
-        if done_key is not None:
-            ctx.rs.post_semaphore(done_key, ctx.rs.last_commit_node or node)
+        if post_key is not None:
+            ctx.rs.post_counter(post_key, ctx.rs.last_commit_node or node)
 
-    ctx.rs.register_commit(node, deps, run)
+    ctx.rs.register_commit(node, waits, run)
     return result.get("out")
 
 

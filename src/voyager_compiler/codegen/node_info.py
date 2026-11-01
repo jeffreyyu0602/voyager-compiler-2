@@ -325,6 +325,34 @@ def is_fully_connected(node: Node) -> bool:
     return False
 
 
+def runs_on_vector_unit(node: Node) -> bool:
+    """Whether the toolchain maps GEMM ``node``, a dispatched op on its
+    tiles, wholly onto the vector unit: its ``input`` operand holds one row
+    (every dim but the last 1, at the operand's own shape) and is stored as
+    bfloat16.  This is ``map_operation``'s rule (``is_fc_layer`` and a
+    bfloat16 input select ``map_matrix_vector_multiply``, which emits vector
+    params only); the dtype is the one the IR carries for the operand, its
+    logical dtype when it has one.  Any other GEMM runs on the matrix-class
+    unit.
+    """
+    if not is_gemm_op(node):
+        return False
+    operand = get_arg_value(node, 0, "input")
+    if not isinstance(operand, Node):
+        return False
+    value = getattr(operand, "value", None)
+    if not isinstance(value, torch.Tensor):
+        value = operand.meta.get("val")
+    if not isinstance(value, torch.Tensor):
+        return False
+    if math.prod(value.shape[:-1]) != 1:
+        return False
+    dtype = operand.meta.get("dtype")
+    if not isinstance(dtype, str):
+        dtype = str(value.dtype).split(".")[1]
+    return dtype == "bfloat16"
+
+
 def is_pooling(node: Node) -> bool:
     return node.target in [
         # Core Aten IR

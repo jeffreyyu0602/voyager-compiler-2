@@ -335,21 +335,36 @@ message CondOp {
 // -----------------------------------------------------------------------------
 
 // A region of compute dispatched asynchronously: send its params and do not
-// wait. The region starts once every semaphore in dependencies has been
-// signaled, and signals post once, when the whole region retires. This lets a
-// systolic-array tile's ramp-up (input / weight buffer load) overlap the
-// ramp-down of the previous tile.
+// wait. The region is one dispatch. Each unit it runs on checks the waits
+// listed for it before it starts its pass of the region, and the region's
+// last pass adds 1 to post when it completes. This lets a systolic-array
+// tile's ramp-up (input / weight buffer load) overlap the ramp-down of the
+// previous tile.
+//
+// A counter is a 0-d int64 TensorBox at MEMORY_LEVEL_REGISTER; its
+// memory.address is the hardware counter id. Counters only count up, and a
+// wait holds once counter >= threshold. Passes of one unit start in dispatch
+// order, so a wait names only cross-unit and copy dependencies.
 //
 // The body holds one or more ops (e.g. a GEMM plus a fused tail). Its ops write
 // their destinations destination-passing, exactly as at top level; only scalar
 // values are yielded.
 //
-// It is self-contained: dependencies (waited before start) and post (signaled
-// on completion) live here, not on Operation.semaphore.
+// It is self-contained: waits (checked before start) and post (added on
+// completion) live here and nowhere else.
+
+// One wait of a dispatch: `unit` is "matrix" (the matrix-class unit of the
+// dispatch, systolic array or MVM, resolved from the params) or "vector".
+message CounterWait {
+  string unit = 1;
+  TensorBoxRef counter = 2;
+  ScalarValue threshold = 3;
+}
+
 message AsyncOp {
   Region body = 1;
 
-  repeated TensorBoxRef dependencies = 2;
+  repeated CounterWait waits = 2;
   optional TensorBoxRef post = 3;
 }
 

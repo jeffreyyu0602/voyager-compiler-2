@@ -11,7 +11,8 @@ Modules: ``ops`` (voyager.* primitives), ``utils`` (shared builder helpers +
 layout projections), ``pipeline`` (the unified Pallas-style software-pipelining
 scheduler and its GEMM / conv2d / pointwise / pool builders), ``builders``
 (which builder lowers each node), ``bufferization`` (the rewrite pass),
-``codegen`` (loop-aware output).
+``memory_planning`` (addresses), ``sync`` (the dispatches' commits and
+counter waits), ``emit`` (loop-aware output).
 """
 
 import torch
@@ -41,6 +42,10 @@ from voyager_compiler.codegen.transform.bufferize.memory_planning import (
     planned_buffer_layout,
     shared_dram_layout,
 )
+from voyager_compiler.codegen.transform.bufferize.sync import (
+    SyncError,
+    synchronize,
+)
 from voyager_compiler.codegen.transform.bufferize.utils import BuildContext
 
 # Mark the in-place / DMA primitives side-effecting so DCE never drops them.
@@ -48,6 +53,8 @@ has_side_effect(torch.ops.higher_order.cond)
 has_side_effect(torch.ops.voyager.insert.default)
 has_side_effect(torch.ops.voyager.async_copy.default)
 has_side_effect(torch.ops.voyager.async_wait.default)
+has_side_effect(torch.ops.voyager.zeros.default)
+has_side_effect(torch.ops.voyager.ones.default)
 has_side_effect(torch.ops.higher_order.commit)
 has_side_effect(torch.ops.higher_order.with_scratch)
 
@@ -67,4 +74,6 @@ __all__ = [
     "MemoryLevel",
     "MemoryPlan",
     "shared_dram_layout",
+    "synchronize",
+    "SyncError",
 ]

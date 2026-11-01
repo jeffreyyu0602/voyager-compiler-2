@@ -4,12 +4,13 @@ Two matching periods say nothing about the iterations a fold then skips:
 from inside a period, a store every K-th step or an edge tile at the end
 of every row looks like any other step.  ``Structure`` settles that by
 evaluating the body's scalar sub-language -- index arithmetic,
-predicates, the counters the builders carry -- for every iteration at
+predicates, the cursors the builders carry -- for every iteration at
 once, as tensors over the trip count, and packing what decides an
-iteration's shape (each ``cond``'s predicate, each semaphore slot, each
-post count) into class words.  Two iterations with equal words run the
-same nodes on the same semaphores, so the walk folds only over iterations
-whose words repeat the template's, period for period.
+iteration's shape (each ``cond``'s predicate) into class words.  Two
+iterations with equal words run the same nodes on the same counters (a
+counter is a fixed node, and a wait's threshold only moves its time), so
+the walk folds only over iterations whose words repeat the template's,
+period for period.
 
 The loop-carried scalars are solved in closed form from the update the
 body computes for them: unchanged, ``x + c`` (affine in the step), or
@@ -25,7 +26,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.fx import GraphModule, Node
 
-from voyager_compiler.codegen.node_info import get_arg_value, is_nop
+from voyager_compiler.codegen.node_info import is_nop
 from voyager_compiler.codegen.reporting.cost import _val
 from voyager_compiler.codegen.transform.bufferize.emit import (
     COMMIT,
@@ -34,15 +35,13 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
 )
 
 _SUBVIEW = torch.ops.voyager.subview.default
-_ASYNC_COPY = torch.ops.voyager.async_copy.default
-_ASYNC_WAIT = torch.ops.voyager.async_wait.default
-_FILL = torch.ops.voyager.fill.default
 _DELINEARIZE = torch.ops.voyager.delinearize_index.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
+_ONES = torch.ops.voyager.ones.default
 
 _CHUNK = 1 << 20
-_SLOT_BITS = 16  # an int-valued sink (a semaphore slot, a post count)
+_SLOT_BITS = 16  # an int-valued sink
 _WORD_BITS = 62
 _MAX_CLASS_PERIOD = 1 << 16
 _PREFIX = 32  # iterations at the loop's start the class period need not fit
@@ -107,7 +106,7 @@ def _placeholders(gm: GraphModule) -> List[Node]:
 def _is_scalar_node(node: Node) -> bool:
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZEROS, _SUBVIEW)
+        and node.target not in (_ALLOC, _ZEROS, _ONES, _SUBVIEW)
         and not isinstance(_val(node), torch.Tensor)
     )
 
@@ -146,28 +145,6 @@ class Structure:
 
     # -- scanning the body ------------------------------------------------
 
-    def _slot_arg(self, sem_arg):
-        """The node (or literal) giving a semaphore arg's slot index, as
-        ``interpret._sem_key`` resolves it."""
-        node = sem_arg
-        while isinstance(node, Node) and node in self.bind:
-            node = self.bind[node]
-        while (
-            isinstance(node, Node)
-            and node.op == "call_function"
-            and is_nop(node)
-        ):
-            node = node.args[0]
-            while isinstance(node, Node) and node in self.bind:
-                node = self.bind[node]
-        if (
-            isinstance(node, Node)
-            and node.op == "call_function"
-            and node.target is _SUBVIEW
-        ):
-            return node.args[1][0]
-        return 0
-
     def _scan(self, gm: GraphModule) -> None:
         for node in gm.graph.nodes:
             if node.op == "output":
@@ -196,20 +173,7 @@ class Structure:
                 sub = getattr(gm, str(node.args[0].target))
                 for ph, src in zip(_placeholders(sub), node.args[1:]):
                     self.bind[ph] = src
-                for d in node.kwargs.get("dependencies") or ():
-                    self.sinks.append(self._slot_arg(d))
-                post = node.kwargs.get("post")
-                if post is not None:
-                    self.sinks.append(self._slot_arg(post))
                 self._scan_nested(sub)
-            elif t is _ASYNC_COPY:
-                self.sinks.append(self._slot_arg(node.args[4]))
-                self.sinks.append(get_arg_value(node, 10, "post_count", 1))
-            elif t is _ASYNC_WAIT:
-                self.sinks.append(self._slot_arg(node.args[0]))
-            elif t is _FILL:
-                self.sinks.append(get_arg_value(node, 2, "value", 0))
-                self.sinks.append(get_arg_value(node, 3, "num_slots", 1))
 
     def _scan_nested(self, gm: GraphModule) -> None:
         """A branch / commit region: its nodes matter, its output does not."""
