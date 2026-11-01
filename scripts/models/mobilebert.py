@@ -14,7 +14,7 @@ from voyager_compiler import (
     compile,
 )
 
-from .utils import (
+from .compile_steps import (
     get_transform_args,
     get_compile_args,
     single_cpu_thread,

@@ -1,7 +1,7 @@
 """Compile a causal LM's prefill or decode step for one Trainium NeuronCore.
 
 Voyager compiles the step as it would for its own accelerator -- exported,
-quantized and transformed the way ``test/test_codegen.py`` does, tiled under
+quantized and transformed the way ``scripts/compile_model.py`` does, tiled under
 ``TrainiumModel``, bufferized and planned -- and writes ``model.txt`` to
 ``--out``; ``translate`` turns it into NKI there, beside ``tensors.pt``, the
 value of every HBM box as the bufferized graph computes it (check the
@@ -39,11 +39,11 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../scripts")
 )
-from test_codegen import FUSION_PATTERNS  # noqa: E402
-from utils.models import llama  # noqa: E402
-from utils.models.utils import (  # noqa: E402
+from compile_model import FUSION_PATTERNS  # noqa: E402
+from models import llama  # noqa: E402
+from models.compile_steps import (  # noqa: E402
     get_compile_args,
     get_transform_args,
 )
@@ -84,7 +84,7 @@ ACCUMULATION = "fp32"
 
 
 def voyager_args(args, config):
-    """The ``test_codegen.py`` arguments the export helpers read: its
+    """The ``compile_model.py`` arguments the export helpers read: its
     defaults, the BF16 LLM flags ``run_ci.py`` compiles with, the layouts
     and the design point."""
     parser = argparse.ArgumentParser()

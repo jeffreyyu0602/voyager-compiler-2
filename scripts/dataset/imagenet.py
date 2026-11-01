@@ -4,8 +4,6 @@ from datasets import DownloadConfig, load_dataset
 from torchvision import transforms
 from tqdm import tqdm
 
-from .utils import write_tensor_to_file
-
 
 def get_transforms(model_type):
     if model_type == "resnet":
@@ -79,7 +77,7 @@ def dump_imagenet(output_dir, dataset, input_name, preprocess_fn, torch_dtype):
         preprocessed_dataset.append(
             {"image": image.to(torch_dtype), "label": label}
         )
-        write_tensor_to_file(
-            image, os.path.join(dir_name, f"{input_name}.bin")
+        image.float().numpy().tofile(
+            os.path.join(dir_name, f"{input_name}.bin")
         )
     return preprocessed_dataset

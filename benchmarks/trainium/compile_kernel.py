@@ -43,9 +43,9 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../test")
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../scripts")
 )
-from test_codegen import MXU_OPS, FUSION_PATTERNS, _can_fuse  # noqa: E402
+from compile_model import MXU_OPS, FUSION_PATTERNS, _can_fuse  # noqa: E402
 
 from voyager_compiler import (  # noqa: E402
     OpMatcher,

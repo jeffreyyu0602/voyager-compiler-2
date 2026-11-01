@@ -1,5 +1,5 @@
 """Llama prefill / decode / training quantization and lowering for
-``test_codegen.py``.
+``compile_model.py``.
 
 One ``QuantizedLM`` holds every graph: the prefill and decode graphs over a
 static KV cache, both keeping only the last position's logits
@@ -48,13 +48,17 @@ from voyager_compiler import (
 from voyager_compiler.codegen import match_and_fuse_rms_norm
 from voyager_compiler.hardware_config import AcceleratorConfig
 
-from .utils import get_compile_args, get_transform_args, single_cpu_thread
+from .compile_steps import (
+    get_compile_args,
+    get_transform_args,
+    single_cpu_thread,
+)
 
 # ``set_qconfig`` lives in the language-modeling example, not the package.
 sys.path.append(
     os.path.abspath(
         os.path.join(
-            os.path.dirname(__file__), "../../../examples/language_modeling"
+            os.path.dirname(__file__), "../../examples/language_modeling"
         )
     )
 )

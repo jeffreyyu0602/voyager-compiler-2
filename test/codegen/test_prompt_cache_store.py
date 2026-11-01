@@ -18,11 +18,14 @@ from torch.fx import GraphModule
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"
+    ),
 )
-from test_codegen import FUSION_PATTERNS  # noqa: E402
-from utils.models import llama  # noqa: E402
-from utils.models.utils import get_transform_args  # noqa: E402
+from compile_model import FUSION_PATTERNS  # noqa: E402
+from models import llama  # noqa: E402
+from models.compile_steps import get_transform_args  # noqa: E402
 
 from voyager_compiler import (  # noqa: E402
     add_compile_args,

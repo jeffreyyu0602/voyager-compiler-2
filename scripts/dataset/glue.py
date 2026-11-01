@@ -10,8 +10,6 @@ from transformers import (
     default_data_collator,
 )
 
-from .utils import write_tensor_to_file
-
 task_to_keys = {
     "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
@@ -80,8 +78,8 @@ def dump_dataset(output_dir, dataset, model):
             preprocessed_dataset.append(batch)
             for name, tensor in batch.items():
                 if name != "labels":
-                    write_tensor_to_file(
-                        tensor, os.path.join(folder, f"{name}.bin")
+                    tensor.float().numpy().tofile(
+                        os.path.join(folder, f"{name}.bin")
                     )
             continue
         embedding_output = embeddings(
@@ -94,9 +92,11 @@ def dump_dataset(output_dir, dataset, model):
             "attention_mask": attention_mask,
             "labels": batch["labels"]
         })
-        write_tensor_to_file(
-            embedding_output, os.path.join(folder, "hidden_states.bin")
+        embedding_output.float().numpy().tofile(
+            os.path.join(folder, "hidden_states.bin")
         )
-        write_tensor_to_file(attention_mask, os.path.join(folder, "attention_mask.bin"))
+        attention_mask.float().numpy().tofile(
+            os.path.join(folder, "attention_mask.bin")
+        )
 
     return preprocessed_dataset

@@ -12,13 +12,13 @@ linears. The Voyager backend is untouched and imports nothing from here.
 | GPU | `voyager_compiler.backend.gpu.lower()` on the graph `convert_pt2e` produces |
 
 `benchmarks/gpu/run_lm.py` drives the GPU backend for Llama.
-`test/test_codegen.py` is for Voyager compilation only.
+`scripts/compile_model.py` is for Voyager compilation only.
 
 ## What is shared and what is custom
 
 | Stage | GPU | Note |
 |---|---|---|
-| Model loading, export and quantization (`llama.load_model`, `llama.quantize_model` from `test/utils/models/llama.py`) | shared as is | run under `with torch.device(gpu):`, so the inputs it builds land on the GPU |
+| Model loading, export and quantization (`llama.load_model`, `llama.quantize_model` from `scripts/models/llama.py`) | shared as is | run under `with torch.device(gpu):`, so the inputs it builds land on the GPU |
 | Quantization specs, quantizer, `prepare_pt2e`, `convert_pt2e` | shared as is | |
 | `run_shared_passes`, `transform()`, `compile()` | not used | cuBLAS tiles each GEMM; PyTorch's allocator places memory |
 | FP8 GEMMs (`fp8.py`, `lower()`) | custom | |

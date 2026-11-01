@@ -8,7 +8,7 @@ After quantization, the compiler lowers models through hardware-aware operator f
 
 ## Getting Started
 
-End-to-end examples of using the Voyager Compiler can be found in test/test_codegen.py, which demonstrates model ingestion, quantization, compilation, and instruction generation.
+End-to-end examples of using the Voyager Compiler can be found in scripts/compile_model.py, which demonstrates model ingestion, quantization, compilation, and instruction generation.
 
 ## Verified Models
 

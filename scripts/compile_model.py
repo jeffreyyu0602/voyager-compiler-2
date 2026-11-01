@@ -6,10 +6,10 @@ import torch
 from torch.testing import assert_close
 from torch.utils._pytree import tree_flatten
 from torchvision import models
-from utils.dataset import glue, imagenet
-from utils.models import bert, llama, mobilebert, torchvision_models, vit
-from utils.models.llama import QUANTIZATION_CONFIGS
-from utils.models.utils import compile_training_step
+from dataset import glue, imagenet
+from models import bert, llama, mobilebert, torchvision_models, vit
+from models.llama import QUANTIZATION_CONFIGS
+from models.compile_steps import compile_training_step
 
 from voyager_compiler import (
     OpMatcher,

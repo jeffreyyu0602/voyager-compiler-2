@@ -37,17 +37,20 @@ from transformers import (
 )
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"
+    ),
 )
-from test_codegen import FUSION_PATTERNS  # noqa: E402
-from utils.models import llama  # noqa: E402
-from utils.models.utils import (  # noqa: E402
+from compile_model import FUSION_PATTERNS  # noqa: E402
+from models import llama  # noqa: E402
+from models.compile_steps import (  # noqa: E402
     get_compile_args,
     get_transform_args,
     single_cpu_thread,
 )
 
-# ``utils.models.llama`` puts examples/language_modeling on the path.
+# ``models.llama`` puts examples/language_modeling on the path.
 from quantization_configs import (  # noqa: E402
     annotate_kivi_cache,
     set_kivi_attention_qconfig,

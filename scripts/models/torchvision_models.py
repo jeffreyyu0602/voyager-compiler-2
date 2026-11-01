@@ -19,7 +19,7 @@ from voyager_compiler import (
 from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import (
+from .compile_steps import (
     get_transform_args,
     get_compile_args,
     single_cpu_thread,

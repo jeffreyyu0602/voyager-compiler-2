@@ -146,12 +146,12 @@ BASELINE_PROMPT_LEN = 1024
 
 # Max generation length added to the decode KV cache: the cache must hold the
 # ``kv_len`` context plus room for generation, so ``max_cache_len = kv_len +
-# DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).
+# DECODE_MAX_GEN`` (matching compile_model's ``context + 128``).
 DECODE_MAX_GEN = 128
 
 
 # -------------------------------------------------------------------------
-# Operator-fusion pipeline (the same as test_codegen.py's): fold each MXU op's
+# Operator-fusion pipeline (the same as compile_model.py's): fold each MXU op's
 # trailing dequant / activation / requantization into one fused kernel.
 # Stages that match no node are skipped.
 # -------------------------------------------------------------------------
@@ -234,7 +234,7 @@ class SweepConfig:
     dequant / activation / requantize tail becomes separate kernels and the
     GQA KV repeat is materialised in memory instead of folding into the
     block index.  ``bool_mask`` stores prefill's causal mask as int1, the
-    way ``test_codegen --quantize_attention_mask`` does: eager's mask
+    way ``compile_model --quantize_attention_mask`` does: eager's mask
     tensor, or under sdpa the flash-attention kernel's own causal table;
     decode rebuilds its mask every step and keeps bf16.
     ``double_buffered_accum_buffer`` gives the PE array a second accumulator
@@ -765,7 +765,7 @@ MASK_QSPEC = "int1,qs=per_tensor_symmetric,qmax=1"
 
 
 def _annotate_attention_mask(gm) -> int:
-    """Annotate prefill's causal mask int1, as ``test/utils/models/llama.py``
+    """Annotate prefill's causal mask int1, as ``scripts/models/llama.py``
     does: the HF export builds the mask in-graph as a ``where`` that the
     attention scores' ``add`` reads, and ``convert_pt2e`` then leaves an int1
     constant plus its dequantize.  Returns how many masks were annotated;

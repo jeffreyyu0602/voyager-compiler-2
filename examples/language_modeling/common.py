@@ -343,7 +343,7 @@ def build_generator(
     """Load the model and quantize it into a ``QuantizedLM`` with its
     prefill and decode graphs frozen.
 
-    The graphs are quantized the way ``test_codegen.py``'s ``llama_prefill``
+    The graphs are quantized the way ``compile_model.py``'s ``llama_prefill``
     / ``llama_decode_kivi`` paths quantize them, except that the softmax and
     RMS norm stay unquantized.  Both stay prepared, their observers on, and
     frozen (``QuantizedLM.freeze``): every weight is fake-quantized once,

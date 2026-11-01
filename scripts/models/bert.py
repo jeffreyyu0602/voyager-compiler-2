@@ -14,7 +14,11 @@ from voyager_compiler import (
     transform,
 )
 
-from .utils import get_transform_args, get_compile_args, single_cpu_thread
+from .compile_steps import (
+    get_transform_args,
+    get_compile_args,
+    single_cpu_thread,
+)
 
 
 def load_model(args):

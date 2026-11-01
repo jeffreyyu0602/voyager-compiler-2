@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Local pre-push CI for the voyager codegen commands.
 
-Runs every actively-used ``test_codegen.py`` invocation (the ones reached
+Runs every actively-used ``compile_model.py`` invocation (the ones reached
 through the accelerator's ``codegen.mk``) without dumping tensors, and drops
 each run's artifacts into a date+time folder under a user-supplied output
 location.  If a prior run exists in that location, the freshly produced
@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Repo root = parent of this file's directory (test/run_ci.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEST_CODEGEN = REPO_ROOT / "test" / "test_codegen.py"
+TEST_CODEGEN = REPO_ROOT / "scripts" / "compile_model.py"
 
 # Number of unified-diff lines shown in the report for a mismatch.
 DIFF_EXCERPT_LINES = 60
@@ -40,8 +40,8 @@ DIFF_EXCERPT_LINES = 60
 # ---------------------------------------------------------------------------
 # Command table.
 #
-# Each Command is expanded at runtime into a test_codegen.py argv:
-#     <python> test_codegen.py <model> <SCHEME_ARGS[scheme]>
+# Each Command is expanded at runtime into a compile_model.py argv:
+#     <python> compile_model.py <model> <SCHEME_ARGS[scheme]>
 #         --pe_array_size <unrolling> <extra>
 #         --model_output_dir <run_dir>/<label>
 # The shared per-scheme quantization/compile flags live once in SCHEME_ARGS
@@ -139,7 +139,7 @@ _LLM_TRAIN = (
 class Command:
     """One codegen invocation, expanded to argv via SCHEME_ARGS."""
 
-    model: str  # test_codegen.py positional argument
+    model: str  # compile_model.py positional argument
     scheme: str  # key into SCHEME_ARGS
     unrolling: str  # --pe_array_size value, e.g. "16,16"
     network: str = ""  # output/label name (defaults to model)
@@ -263,9 +263,9 @@ def matches(label, pattern):
 def _build(command, run_dir):
     """Expand a Command into ``(label, dest, argv)`` for this run.
 
-    The argv runs this repo's test_codegen.py with --model_output_dir pointed
+    The argv runs this repo's compile_model.py with --model_output_dir pointed
     into the timestamped run folder; --dump_tensors is never added.
-    ``--debug`` is always added: without it test_codegen never evaluates the
+    ``--debug`` is always added: without it compile_model never evaluates the
     lowered graph, so the run checks codegen only and no numeric comparison
     happens at all.
     """
@@ -309,8 +309,8 @@ def _run_one(label, dest, argv, env):
 
     Returns a status string: ``ok`` / ``error`` (nonzero exit) /
     ``no_output`` (exited 0 but no model.txt) / ``numeric_drift`` (the
-    lowered graph's output left test_codegen's tolerance) / ``unverified``
-    (the model ran no comparison despite --debug).  test_codegen only warns
+    lowered graph's output left compile_model's tolerance) / ``unverified``
+    (the model ran no comparison despite --debug).  compile_model only warns
     about the last two, so they have to be read back out of the log; neither
     fails the run.
     """
