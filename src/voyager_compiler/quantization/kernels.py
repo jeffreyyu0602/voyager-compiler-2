@@ -643,14 +643,19 @@ def _walk(input: torch.Tensor, axes: List[int]) -> Optional[_Walk]:
         stride = input.stride(d)
         return (stride == 0 or shape[d] == 1, stride, -d)
 
-    fastest = min(range(ndim), key=speed)
+    # Sorted rather than min or max with a key: torch.compile traces the
+    # former only, and a graph break here splits every fake-quant's forward.
+    fastest = sorted(range(ndim), key=speed)[0]
     if len(axes) == 2:
         col_axis, row_axis = sorted(axes, key=speed)
     elif fastest == axes[0]:
         # The rows need not be contiguous, only long enough to fill tiles.
         col_axis = fastest
-        others = [d for d in range(ndim) if d != fastest]
-        row_axis = max(others, key=lambda d: (shape[d], d), default=None)
+        others = sorted(
+            (d for d in range(ndim) if d != fastest),
+            key=lambda d: (shape[d], d),
+        )
+        row_axis = others[-1] if others else None
     else:
         col_axis, row_axis = fastest, axes[0]
     groups = {}

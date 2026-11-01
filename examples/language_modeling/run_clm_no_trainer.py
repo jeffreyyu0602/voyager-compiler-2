@@ -12,22 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pretrain a causal language model from scratch, optionally quantized.
+"""Pretrain a causal language model, optionally quantized.
 
 Adapted from Hugging Face's ``run_clm_no_trainer.py``, with the data loading
 and optimizer setup of Karpathy's build-nanogpt.  The model is built from
-``--config_name`` with random weights and trains on the shards
-``pretokenize.py`` writes, read in order in fixed-size batches, so every run
-sees the same tokens and a resumed run continues exactly.
+``--config_name`` with random weights, or loaded from the pretrained
+``--model_name_or_path`` to continue its training with a fresh optimizer,
+and trains on the shards ``pretokenize.py`` writes, read in order in
+fixed-size batches, so every run sees the same tokens and a resumed run
+continues exactly.
 
 The defaults follow SmolLM2-135M's pretraining recipe
 (``huggingface/smollm``, ``text/pretraining/smollm2/config_smollm2_135M.yaml``):
 2048-token sequences, 1M tokens per step (8 x 64 accumulation x 2048),
 AdamW at 3e-3 with betas (0.9, 0.95) and weight decay 0.01, gradients
 clipped to 1.0, and a warmup-stable-decay schedule that warms up linearly
-over 2000 steps and decays linearly to zero over the last 20%.  The model
-trains with the recipe's RoPE theta of 10000, not the 100000 of the
-released config, which was raised for long-context training afterwards.
+over 2000 steps and decays linearly to zero over the last 20%.  The recipe
+trains with a RoPE theta of 10000 (``--rope_theta 10000``), not the 100000
+of the released config, which was raised for long-context training
+afterwards.
 
 The quantization flags pick the mode::
 
@@ -108,7 +111,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Pretrain a causal language model from scratch."
+        description="Pretrain a causal language model."
     )
     parser.add_argument(
         "--data_dir",
@@ -121,9 +124,17 @@ def parse_args():
         help="Model config to build the model from, with random weights.",
     )
     parser.add_argument(
+        "--model_name_or_path",
+        default=None,
+        help=(
+            "Pretrained model to continue training, with its config in "
+            "place of --config_name."
+        ),
+    )
+    parser.add_argument(
         "--rope_theta",
         type=float,
-        default=10000.0,
+        default=None,
         help="RoPE base frequency, in place of the config's.",
     )
     parser.add_argument(
@@ -399,18 +410,28 @@ def main(args):
         logger.warning("CUDA not available; training on the CPU.")
         device = torch.device("cpu")
 
-    config = AutoConfig.from_pretrained(args.config_name)
+    config = AutoConfig.from_pretrained(
+        args.model_name_or_path or args.config_name
+    )
     if args.config_overrides is not None:
         config.update_from_string(args.config_overrides)
-    config.rope_parameters["rope_theta"] = args.rope_theta
+    if args.rope_theta is not None:
+        config.rope_parameters["rope_theta"] = args.rope_theta
     config.max_position_embeddings = args.block_size
     config.use_cache = False
     # Quantizing QK^T and PV needs them as matmuls; otherwise attention runs
     # fused, which never materializes the score matrix.
-    model = AutoModelForCausalLM.from_config(
-        config,
-        attn_implementation="eager" if args.quantize_attention else "sdpa",
-    )
+    attn_implementation = "eager" if args.quantize_attention else "sdpa"
+    if args.model_name_or_path is not None:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            config=config,
+            attn_implementation=attn_implementation,
+        )
+    else:
+        model = AutoModelForCausalLM.from_config(
+            config, attn_implementation=attn_implementation
+        )
     if args.bf16:
         model.bfloat16()
     model.to(device)
