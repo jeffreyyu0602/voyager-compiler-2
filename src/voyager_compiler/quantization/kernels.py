@@ -359,7 +359,7 @@ def _mx_fake_quant_kernel(
         t = _round(tl.load(global_scale).to(tl.float32), DTYPE)
     if POWER_OF_TWO:
         amax = _round(tl.where(amax == 0.0, _MIN_NORMAL, amax), DTYPE)
-        exponent = libdevice.floor(_round(libdevice.log2(amax), DTYPE))
+        exponent = libdevice.floor(libdevice.log2(amax))
         scale = _round(_exp2(exponent - quant_max_exponent), DTYPE)
     else:
         # torch.compile passes a float as float64.

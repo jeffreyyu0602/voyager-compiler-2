@@ -44,13 +44,11 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
             "Unrecognized shared exponent selection method %s" % (method)
         )
 
-    # log2(shared_exp) and truncate to integer
-    shared_exp = torch.floor(
-        torch.log2(
-            shared_exp
-            + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
-        )
-    )
+    # floor(log2(amax)), with the log taken in float32: a bfloat16 log2
+    # rounds a value just below an integer up to it, one exponent too high.
+    amax = shared_exp.float()
+    log2_amax = torch.log2(amax + FP32_MIN_NORMAL * (amax == 0).float())
+    shared_exp = torch.floor(log2_amax).to(shared_exp.dtype)
 
     # Restrict to [-emax, emax] range
     if ebits > 0:
