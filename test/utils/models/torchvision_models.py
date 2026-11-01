@@ -19,7 +19,11 @@ from voyager_compiler import (
 from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import get_transform_args, get_compile_args
+from .utils import (
+    get_transform_args,
+    get_compile_args,
+    single_cpu_thread,
+)
 
 
 def load_model(args):
@@ -145,7 +149,10 @@ def quantize_and_dump_model(
 
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args) if args.debug else None
+    new_output = None
+    if args.debug:
+        with single_cpu_thread():
+            new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn

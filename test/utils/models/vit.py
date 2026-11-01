@@ -25,7 +25,11 @@ from voyager_compiler.codegen import (
 from voyager_compiler.quantization import parse_codebook_dtype
 from voyager_compiler.export_utils import get_conv_bn_layers
 
-from .utils import get_compile_args, get_transform_args
+from .utils import (
+    get_compile_args,
+    get_transform_args,
+    single_cpu_thread,
+)
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -168,7 +172,10 @@ def quantize_and_dump_model(
     fuse_operator(gm, fusion_patterns)
     gm.graph.print_tabular()
 
-    new_output = get_logits(gm(*example_args)) if args.debug else None
+    new_output = None
+    if args.debug:
+        with single_cpu_thread():
+            new_output = get_logits(gm(*example_args))
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn
