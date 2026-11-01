@@ -134,20 +134,11 @@ per GEMM node, `"fp8"`, `"nvfp4"` or why it was left alone:
 Pick a GPU with no other job on it.
 
 ```
-CUDA_VISIBLE_DEVICES=<gpu> python -m pytest test/unit/test_gpu_fp8.py
-
-# NVFP4: the cast, packing, emulated lowering and device gates run on a
-# CPU; the real GEMM's tests need sm_100 or sm_120
-CUDA_VISIBLE_DEVICES=<gpu> python -m pytest test/unit/test_gpu_nvfp4.py
-
 # Llama-3.1-8B in BF16, per-tensor FP8 and NVFP4; --schemes also takes
 # fp8_channel, and --implementation te runs the same schemes on TE
 python benchmarks/gpu/run_lm.py --out_dir <dir> \
     --schemes bf16 fp8_tensor nvfp4 [--stages prefill decode ppl] \
     [--device cuda:<gpu>]
-
-# The training lowering: emulated on a CPU, the real GEMMs on a GPU
-CUDA_VISIBLE_DEVICES=<gpu> python -m pytest test/unit/test_gpu_training.py
 ```
 
 `run_lm.py` reports per scheme and stage: GEMMs lowered, codes that differ
@@ -167,22 +158,14 @@ codes; a weight in 16x16 NVFP4 blocks is cast once
 (`quantize_nvfp4_square`) and packed both ways, so the input gradient reads
 the forward's codes. Stochastic rounding keeps the program's seeds, and the
 random Hadamard transform's rotations stay in front of the casts.
-`test/unit/test_gpu_training.py` checks the lowered program against the
-fake-quant one; `benchmarks/gpu/train_lm.py` times it against TE.
+`benchmarks/gpu/train_lm.py` times the lowered program against TE.
 
 ## Status
 
-- `test/unit/test_gpu_fp8.py`: 15 pass on an H100 (2026-10-05).
 - `run_lm.py` on AMD-Llama-135m cut to 2 layers, per-tensor FP8, eager
   attention: prefill lowers all 15 linears and 4 attention matmuls, decode
   the 15 linears and the 2 main-cache QK^T matmuls; FP8 codes match the
   fake-quant graph's, worst site error 7.6e-3.
-- `test/unit/test_gpu_nvfp4.py` on the CPU (2026-10-13): every test that does
-  not run the real GEMM passes. A two-layer Llama with the `nvfp4`
-  config, its weights in 1x16 or 16x16 blocks, lowers all 15 linears, and
-  with the GEMM emulated gives the fake-quant graph's output exactly. Fake
-  CUDA tensors pass torch's argument checks for the NVFP4 GEMM at
-  Llama-3.1-8B's shapes, 1 and 1000 rows.
 - On an RTX PRO 6000 (sm_120, 2026-10-13): the real FP8 and NVFP4 GEMMs
   pass their checks against the emulators, and Llama-3.1-8B prefill and
   decode lower every linear (NVFP4: 0 codes differing from the fake-quant

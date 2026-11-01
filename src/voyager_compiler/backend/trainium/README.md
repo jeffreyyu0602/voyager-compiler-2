@@ -329,9 +329,7 @@ one `OpMatcher` per op with a predicate on that op's operands (the ones in
 `patterns.py`, or a new small one), marking a reduction the instruction
 makes of the tile it stores `keeps_input=True`; a form whose op is optional
 is two patterns of one name. Then add the `Kernel` method emitting it to
-`PATTERN_HANDLERS` in `translate.py` under the name, and a test in
-`test/unit/test_trainium.py` that `fuse_patterns` forms the group from plain ops
-and that it translates to the instruction.
+`PATTERN_HANDLERS` in `translate.py` under the name.
 
 A lone op writing a PSUM box is the instruction that writes PSUM: an
 `aten.transpose` one `nc_transpose` per 128 x 128 block, a K-major GEMM one
