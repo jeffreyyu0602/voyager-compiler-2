@@ -5,7 +5,16 @@ import os
 import types
 from collections import OrderedDict
 from dataclasses import asdict, replace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import Tensor
@@ -486,22 +495,32 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     orig_fq_users = list(node.users.keys())
     input_node = node.args[0]
     if _is_weight(model, input_node):
-        # Quantize weight and remove the fq module
+        # Quantize the weight once and remove the fq module, as
+        # ``_plan_weights`` decided; a "baked" weight was quantized in
+        # place through another fake-quant already.
         param = fetch_attr(model, input_node.target)
-        param.data = torch.ops.quantized_ops.quantize(
-            param.data, scale, qmap=activation_post_process.qmap
+        action = model.meta.get("weight_plan", {}).get(
+            input_node.target, "bake"
         )
+        if action == "bake":
+            param.data = torch.ops.quantized_ops.quantize(
+                param.data, scale, qmap=activation_post_process.qmap
+            )
+        elif action == "copy":
+            weight = torch.ops.quantized_ops.quantize(
+                param.data, scale, qmap=activation_post_process.qmap
+            )
+            with graph.inserting_before(node):
+                input_node = create_getattr_from_value(
+                    model,
+                    graph,
+                    input_node.name + "_" + activation_post_process.dtype,
+                    weight,
+                )
         node.replace_all_uses_with(input_node)
 
         # Annotate weight dtype
         input_node.meta["dtype"] = activation_post_process.dtype
-
-        # Reshape the scale to match the shape of the output tensor for
-        # per-channel weight quantization.
-        if scale.ndim == 4:
-            scale = scale.view(-1, 1, 1)
-        elif scale.ndim == 2:
-            scale = scale.view(-1)
     else:
         # Replace fake quant module with a quantize node
         with graph.inserting_before(node):
@@ -525,6 +544,13 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
         quantized_node.meta["dtype"] = activation_post_process.dtype
 
         node.replace_all_uses_with(quantized_node)
+    if input_node.op == "get_attr":
+        # A per-channel scale is a column for the quantize but a row for
+        # the GEMM's dequantize.
+        if scale.ndim == 4:
+            scale = scale.view(-1, 1, 1)
+        elif scale.ndim == 2:
+            scale = scale.view(-1)
     graph.erase_node(node)
 
     # A bias, and a cast with no scale, get no dequantize node.
@@ -650,6 +676,9 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     is_weight = _is_weight(model, input_node)
     input_dtype = activation_post_process.dtype
     node_to_quantize = input_node
+    # A fake-quant shared by several graphs is converted once per graph, so
+    # the converted table and dtype stay local rather than overwrite it.
+    qmap, dtype = activation_post_process.qmap, input_dtype
 
     if isinstance(activation_post_process.ch_axis, int):
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
@@ -671,21 +700,19 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     dequant_code, quant_code = None, None
     if activation_post_process.is_codebook_quantization:
-        table = activation_post_process.qmap
+        table = qmap
         # A codebook is already the levels, one row per attention head; a
         # lookup table holds them once per bfloat16 bit pattern.
         per_head = table.dim() > 1
         values = table if per_head else torch.unique(table)
 
-        activation_post_process.dtype = (
-            f"int{activation_post_process.index_bits}"
-        )
+        dtype = f"int{activation_post_process.index_bits}"
         # A lookup table answers with the index directly, since it is
         # indexed by the value itself.  A codebook stays the levels, and
         # the midpoints it is compared against travel beside it as the
         # quantize's ``output_code``, which is what turns a value into an
         # index there.
-        activation_post_process.qmap = (
+        qmap = (
             values
             if per_head
             else torch.searchsorted(values, table).to(torch.int64)
@@ -739,7 +766,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
         scale, weight = torch.ops.quantized_ops.quantize_mx(
             param.data,
-            activation_post_process.qmap,
+            qmap,
             activation_post_process.ch_axis,
             activation_post_process.block_size,
             activation_post_process.quant_max,
@@ -765,7 +792,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     else:
         with graph.inserting_before(node):
             get_attr_node = create_getattr_from_value(
-                model, graph, "qmap", activation_post_process.qmap
+                model, graph, "qmap", qmap
             )
 
             scale_qmap = None
@@ -847,16 +874,16 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 None,
                 None,
                 scale_dtype,
-                activation_post_process.dtype,
+                dtype,
             )
             quantize_mx_node.meta["outlier_rate"] = observed
         else:
             scale_node, quantized_node = output_nodes
-            dtype_tuple = (scale_dtype, activation_post_process.dtype)
+            dtype_tuple = (scale_dtype, dtype)
 
         quantize_mx_node.meta["dtype"] = dtype_tuple
 
-    quantized_node.meta["dtype"] = activation_post_process.dtype
+    quantized_node.meta["dtype"] = dtype
 
     if activation_post_process.power_2_scale:
         scale_node.meta["dtype"] = "fp8_e8m0"
@@ -1070,8 +1097,13 @@ def _is_written_buffer(model: GraphModule, node: Node) -> bool:
 
 def _is_weight(model: GraphModule, node: Node) -> bool:
     """Whether ``node`` reads a tensor that is quantized once, at convert: a
-    ``get_attr`` the graph never writes (see ``_is_written_buffer``)."""
-    return node.op == "get_attr" and not _is_written_buffer(model, node)
+    ``get_attr`` the graph never writes (see ``_is_written_buffer``) and
+    that ``_plan_weights`` did not leave to run time."""
+    return (
+        node.op == "get_attr"
+        and not _is_written_buffer(model, node)
+        and model.meta.get("weight_plan", {}).get(node.target) != "dynamic"
+    )
 
 
 def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
@@ -1088,9 +1120,7 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
 
     input_node = node.args[0]
 
-    if input_node.op == "get_attr" and not _is_written_buffer(
-        model, input_node
-    ):
+    if _is_weight(model, input_node):
         param = fetch_attr(model, input_node.target)
         _, scale, zero_point = ops.group_wise_affine_fake_quant(
             param.data,
@@ -1283,8 +1313,58 @@ def _finish_freezing(model: GraphModule) -> None:
     model.delete_all_unused_submodules()
 
 
+def _weight_readers(models: Sequence[GraphModule]) -> Dict[tuple, tuple]:
+    """Collect every parameter's readers across ``models``.
+
+    Graphs exported from one model hold the same tensors, so a parameter
+    is keyed by its memory, ``(data_ptr, shape)``.
+
+    Args:
+        models: Prepared graph modules.
+
+    Returns:
+        ``{key: (param, fake_quants, others)}``: the parameter, the
+        ``(model, node, module)`` of each fake-quant reading it, and the
+        other nodes reading it.
+    """
+    readers = {}
+    for model in models:
+        modules = dict(model.named_modules())
+        params = dict(model.named_parameters(remove_duplicate=False))
+        for node in model.graph.nodes:
+            if node.op != "get_attr" or node.target not in params:
+                continue
+            param = params[node.target]
+            key = (param.data_ptr(), tuple(param.shape))
+            _, fake_quants, others = readers.setdefault(key, (param, [], []))
+            for user in node.users:
+                module = _get_module(user, modules)
+                if isinstance(module, FakeQuantizeBase):
+                    fake_quants.append((model, user, module))
+                else:
+                    others.append(user)
+    return readers
+
+
+def _weight_values(
+    param: torch.Tensor, modules: Sequence[FakeQuantizeBase]
+) -> List[torch.Tensor]:
+    """Quantize ``param`` through each of ``modules`` with the scale it
+    holds now: fake-quant on and observer off for the call, whatever the
+    module's flags say, as ``convert_pt2e`` bakes a weight."""
+    values = []
+    for module in modules:
+        flags = module.fake_quant_enabled, module.observer_enabled
+        module.enable_fake_quant(True)
+        module.enable_observer(False)
+        values.append(module(param))
+        module.enable_fake_quant(flags[0])
+        module.enable_observer(flags[1])
+    return values
+
+
 @torch.no_grad()
-def freeze_weights(*models: GraphModule) -> None:
+def freeze_weights(*models: GraphModule) -> List[FakeQuantizeBase]:
     """Bake each weight's fake-quantization into the weight.
 
     Every fake-quant reading a parameter runs once and is removed; its users
@@ -1304,35 +1384,23 @@ def freeze_weights(*models: GraphModule) -> None:
 
     Args:
         *models: Prepared graph modules, rewritten in place.
-    """
-    # Each tensor's fake-quants and other readers across the graphs, keyed
-    # by its memory: graphs exported from one model hold the same tensors.
-    readers = {}
-    for model in models:
-        modules = dict(model.named_modules())
-        params = dict(model.named_parameters(remove_duplicate=False))
-        for node in model.graph.nodes:
-            if node.op != "get_attr" or node.target not in params:
-                continue
-            param = params[node.target]
-            key = (param.data_ptr(), tuple(param.shape))
-            _, fake_quants, others = readers.setdefault(key, (param, [], []))
-            for user in node.users:
-                module = _get_module(user, modules)
-                if isinstance(module, FakeQuantizeBase):
-                    fake_quants.append((model, user, module))
-                else:
-                    others.append(user)
 
-    for param, fake_quants, others in readers.values():
+    Returns:
+        The fake-quants whose weight was written in place: any other graph
+        holding one of them now reads a quantized weight and must not run
+        it again.
+    """
+    baked = []
+    for param, fake_quants, others in _weight_readers(models).values():
         if not fake_quants:
             continue
-        values = [module(param) for _, _, module in fake_quants]
+        values = _weight_values(param, [m for _, _, m in fake_quants])
         if not others and all(torch.equal(values[0], v) for v in values):
             param.copy_(values[0])
-            for _, node, _ in fake_quants:
+            for _, node, module in fake_quants:
                 node.replace_all_uses_with(node.args[0])
                 node.graph.erase_node(node)
+                baked.append(module)
             continue
         for (model, node, _), value in zip(fake_quants, values):
             with model.graph.inserting_before(node):
@@ -1344,6 +1412,7 @@ def freeze_weights(*models: GraphModule) -> None:
 
     for model in models:
         _finish_freezing(model)
+    return baked
 
 
 @torch.no_grad()
@@ -1586,22 +1655,103 @@ def fold_conv_bn_qat(model: GraphModule) -> None:
     model.recompile()
 
 
+@torch.no_grad()
+def _plan_weights(
+    models: Sequence[GraphModule], mismatched_weights: str
+) -> None:
+    """Decide how ``convert_pt2e`` quantizes each parameter of ``models``.
+
+    The decision is written per graph into ``meta["weight_plan"]``, keyed
+    by the parameter's ``get_attr`` target.  A parameter read by one
+    fake-quant per graph, all giving the same value, and by no other node,
+    is quantized in place through one of them (``"bake"``); the others
+    just drop their fake-quant (``"baked"``).  Otherwise every fake-quant
+    gets ``mismatched_weights``: its graph's own quantized buffer
+    (``"copy"``) or a quantize node run every forward (``"dynamic"``).  A
+    ``get_attr`` absent from the plan is baked.  A block-quantized weight
+    (microscaling, group-wise affine) has no in-place form and gets its
+    graph's own buffers whatever the plan says.
+
+    Args:
+        models: Prepared graph modules, which may share parameters.
+        mismatched_weights: ``"copy"`` or ``"dynamic"``.
+    """
+    for model in models:
+        model.meta["weight_plan"] = {}
+    for param, fake_quants, others in _weight_readers(models).values():
+        if not fake_quants:
+            continue
+        values = _weight_values(param, [m for _, _, m in fake_quants])
+        shared = (
+            not others
+            and len({id(m) for m, _, _ in fake_quants}) == len(fake_quants)
+            and all(torch.equal(values[0], v) for v in values)
+        )
+        for i, (model, node, _) in enumerate(fake_quants):
+            if not shared:
+                action = mismatched_weights
+            else:
+                action = "bake" if i == 0 else "baked"
+            model.meta["weight_plan"][node.args[0].target] = action
+
+
 def convert_pt2e(
-    model: GraphModule,
+    model: Union[GraphModule, Sequence[GraphModule]],
     output_dtype: str = None,
     eliminate_no_effect: bool = True,
+    mismatched_weights: str = "copy",
 ):
-    if model.meta.get("frozen_weights"):
+    """Replace every fake-quant of the prepared graph(s) with its quantized
+    form: a weight is quantized once, at convert, an activation by a
+    quantize node in the graph, and a GEMM's result is dequantized after
+    it.
+
+    Several graphs exported from one model share its parameters, so they
+    are converted together: a parameter is quantized in place only when
+    every fake-quant reading it agrees and nothing else reads it (see
+    ``_plan_weights``); otherwise ``mismatched_weights`` says whether each
+    graph gets its own quantized copy or quantizes the weight at run time.
+
+    Args:
+        model: A prepared graph module, or several that may share
+            parameters; rewritten in place.
+        output_dtype: Dtype of a GEMM's result, or None for the model's.
+        eliminate_no_effect: Drop dequantize nodes whose scale is one.
+        mismatched_weights: ``"copy"`` or ``"dynamic"``.
+
+    Returns:
+        ``model``, converted.
+
+    Raises:
+        ValueError: A graph was frozen by ``freeze_weights``, or
+            ``mismatched_weights`` is neither value.
+    """
+    if mismatched_weights not in ("copy", "dynamic"):
+        raise ValueError(
+            f"mismatched_weights must be 'copy' or 'dynamic', not "
+            f"{mismatched_weights!r}"
+        )
+    models = [model] if isinstance(model, GraphModule) else list(model)
+    if any(graph_module.meta.get("frozen_weights") for graph_module in models):
         raise ValueError(
             "convert_pt2e needs the raw weights that freeze_weights "
             "replaced; convert a graph that was not frozen"
         )
+    for graph_module in models:
+        fold_conv_bn_qat(graph_module)
+        swap_matmul_inputs(graph_module)
+    _plan_weights(models, mismatched_weights)
+    for graph_module in models:
+        _convert_graph(graph_module, output_dtype, eliminate_no_effect)
+        del graph_module.meta["weight_plan"]
+    return model
 
-    fold_conv_bn_qat(model)
 
+def _convert_graph(
+    model: GraphModule, output_dtype: str, eliminate_no_effect: bool
+) -> None:
+    """Rewrite one planned graph's fake-quants (see ``convert_pt2e``)."""
     modules = dict(model.named_modules(remove_duplicate=False))
-
-    swap_matmul_inputs(model)
 
     for node in list(model.graph.nodes):
         if node.op != "call_module":
@@ -1644,5 +1794,3 @@ def convert_pt2e(
     )
     model.recompile()
     model.delete_all_unused_submodules()
-
-    return model

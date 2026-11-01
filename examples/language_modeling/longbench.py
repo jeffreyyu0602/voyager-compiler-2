@@ -26,10 +26,10 @@ from fuzzywuzzy import fuzz
 from huggingface_hub import hf_hub_download
 from rouge import Rouge
 from tqdm import tqdm
+from transformers import AutoConfig
 
 from common import (
     BF16_CONFIG,
-    SEQ_BLOCK,
     add_inference_args,
     add_model_args,
     add_quantization_args,
@@ -37,6 +37,7 @@ from common import (
     generate_answer,
     load_model_and_tokenizer,
 )
+from voyager_compiler.quantization.model import SEQ_BLOCK
 
 LONGBENCH_REPO = "THUDM/LongBench"
 
@@ -229,10 +230,7 @@ def parse_args():
     add_inference_args(parser)
     add_longbench_args(parser)
     add_quantization_args(parser)
-    args = parser.parse_args()
-    if (args.qconfig or args.kivi) and args.max_length is None:
-        parser.error("--max_length sizes the quantized graphs' KV cache")
-    return args
+    return parser.parse_args()
 
 
 def load_longbench(dataset, longbench_e):
@@ -454,10 +452,10 @@ def evaluate(model, tokenizer, args, output_dir):
     sample it wrote.
 
     Args:
-        model: Anything with ``generate`` and ``device``: an HF causal LM,
-            or the quantized generator ``common.build_generator`` returns.
-            Without ``args.max_length`` its ``config`` supplies the prompt
-            budget.
+        model: Anything with ``generate``, ``device`` and ``config``: an HF
+            causal LM, or the ``QuantizedLM`` ``common.build_generator``
+            returns.  Without ``args.max_length`` its ``config`` supplies
+            the prompt budget.
         tokenizer: Its tokenizer.
         args: Parsed options carrying the inference and task settings.
         output_dir: Where ``<task>.jsonl`` and ``result.json`` go.
@@ -522,10 +520,18 @@ def main(args):
         if device.type == "cuda":
             torch.cuda.set_device(device)
         datasets = args.datasets or (DATASETS_E if args.e else DATASETS)
-        longest_generation = max(DATASET2MAXGEN[name] for name in datasets)
-        # Whole prefill blocks and whole residual chunks.
+        generations = [DATASET2MAXGEN[name] for name in datasets]
+        longest_prompt = args.max_length
+        if longest_prompt is None:
+            # ``evaluate`` budgets each task's prompt at the model's context
+            # less the task's generation.
+            config = AutoConfig.from_pretrained(args.model_id)
+            longest_prompt = config.max_position_embeddings - min(generations)
+        context_length = -(-longest_prompt // SEQ_BLOCK) * SEQ_BLOCK
+        # Whole prefill blocks and whole residual chunks, with a block of
+        # slack for the chat template's tokens past the prompt budget.
         block = math.lcm(SEQ_BLOCK, args.residual_length)
-        cache_len = args.max_length + SEQ_BLOCK + longest_generation
+        cache_len = longest_prompt + SEQ_BLOCK + max(generations)
         cache_len = -(-cache_len // block) * block
         model, tokenizer = build_generator(
             args.model_id,
@@ -535,6 +541,7 @@ def main(args):
             args.kivi,
             args.residual_length,
             args.codebooks,
+            context_length,
             cache_len,
             device,
         )

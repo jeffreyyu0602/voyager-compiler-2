@@ -59,6 +59,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _passed_whole,
     _subgraph,
 )
+from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
 
@@ -293,12 +294,55 @@ def shared_dram_layout(
     return layout
 
 
+def planned_buffer_layout(
+    planned: GraphModule, model: GraphModule, config
+) -> Dict[str, Tuple[int, int]]:
+    """The DRAM ranges ``model``'s buffers already hold in ``planned``.
+
+    A ``get_attr`` buffer of ``model`` whose tensor is the very object a
+    planned buffer of ``planned`` holds -- a KV cache a prefill and a decode
+    graph write -- keeps that buffer's address.  Matching is by tensor
+    identity, never by name: a constant each graph holds a copy of, such as
+    a codebook, stays private.
+
+    Args:
+        planned: A program ``plan_memory`` placed.
+        model: A transformed program, not yet planned.
+        config: The accelerator, which sets each buffer's size.
+
+    Returns:
+        ``{get_attr target: (start, end)}`` in bytes, for ``plan_memory``'s
+        ``dram_layout``.
+
+    Raises:
+        ValueError: If the two programs size a shared buffer differently.
+    """
+    segment_of = {
+        id(fetch_attr(planned, node.target)): node.meta["memory"]
+        for node in planned.graph.find_nodes(op="get_attr")
+        if "memory" in node.meta
+    }
+    layout = {}
+    for node in model.graph.find_nodes(op="get_attr"):
+        segment = segment_of.get(id(fetch_attr(model, node.target)))
+        if segment is None:
+            continue
+        size = _nbytes(node, config)
+        if size != segment.end - segment.start:
+            raise ValueError(
+                f"{node.target} takes {size} bytes but {segment.node} holds "
+                f"the same tensor in {segment.end - segment.start}"
+            )
+        layout[node.target] = (segment.start, segment.end)
+    return layout
+
+
 def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
-    ``meta['memory']`` on each DRAM buffer root.  An input named in
-    ``dram_layout`` takes its range there, and the other persistent tensors
-    follow the whole layout.
+    ``meta['memory']`` on each DRAM buffer root.  An input, or a ``get_attr``
+    buffer, named in ``dram_layout`` takes its range there, and the other
+    persistent tensors follow the whole layout.
     """
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
@@ -354,8 +398,9 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
     # Persistent region first (params + inputs), linear, no reuse.
     offset = max((end for _, end in dram_layout.values()), default=0)
     for b in persistent:
-        if b.op == "placeholder" and b.name in dram_layout:
-            start, end = dram_layout[b.name]
+        key = b.name if b.op == "placeholder" else b.target
+        if key in dram_layout:
+            start, end = dram_layout[key]
             b.meta["memory"] = Segment(start, end, MemoryLevel.DRAM, b)
             continue
         size = _nbytes(b, config)
@@ -798,7 +843,8 @@ def plan_memory(
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
 
     ``dram_layout`` (see ``shared_dram_layout``) pins the inputs this
-    program shares with others to their agreed DRAM ranges.
+    program shares with others to their agreed DRAM ranges; a ``get_attr``
+    buffer named in it is pinned the same way (``planned_buffer_layout``).
 
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —

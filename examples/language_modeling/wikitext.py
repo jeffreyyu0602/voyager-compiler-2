@@ -2,8 +2,8 @@ import argparse
 import logging
 
 import torch
-from accelerate.utils import get_max_memory
 from datasets import load_dataset
+from transformers.modeling_outputs import CausalLMOutput
 
 from common import (
     add_model_args,
@@ -11,18 +11,12 @@ from common import (
     load_model_and_tokenizer,
 )
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
-from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
+    QuantizedLM,
     add_experiment_args,
     get_default_quantizer,
-    prepare_pt2e,
-    freeze_weights,
-    with_execution_context,
     print_node_scope_tabular,
-    get_device_map,
-    dispatch_model,
-    insert_align_device_nodes,
-    sink_obs_or_fq,
+    with_execution_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,12 +41,6 @@ def parse_args():
         "--qconfig", default=None, help="Quantization scheme for the model"
     )
     parser.add_argument(
-        "--reserved_memory",
-        type=int,
-        default=8,
-        help="GPU memory reserved for storing activations",
-    )
-    parser.add_argument(
         "--print_model",
         action="store_true",
         help="Print node scope information",
@@ -62,70 +50,79 @@ def parse_args():
 
 
 def setup_quantized_model(
-    model_id,
-    quantizer,
-    max_length,
-    torch_dtype,
-    device=None,
-    reserved_memory=8,
-    print_model=False,
+    model_id, quantizer, max_length, torch_dtype, device, print_model=False
 ):
-    """Load model, prepare the quantized graph module, and dispatch to GPU(s).
+    """Load the model and quantize it into a ``QuantizedLM`` with only a
+    prefill graph, returning every position's logits, for
+    ``evaluate_perplexity``'s windows: ``max_length`` tokens, or any shorter
+    multiple of ``SEQ_BLOCK``.
 
-    When device is not None (single GPU), moves the model to that device.
-    When device is None (multi-GPU), dispatches the graph module across
-    available GPUs after prepare_pt2e, reserving reserved_memory GiB per GPU
-    for activations.
+    Args:
+        model_id: Hub id or local path of the checkpoint.
+        quantizer: Annotates every graph.
+        max_length: Window length, a multiple of ``SEQ_BLOCK``.
+        torch_dtype: ``"auto"`` or a torch dtype name, as on the CLI.
+        device: The one device everything runs on.
+        print_model: Print the forward graph and its node scopes.
 
-    Returns (model, tokenizer).
+    Returns:
+        ``(lm, tokenizer)``.
+
+    Raises:
+        NotImplementedError: ``device`` is None, which asked for the graph
+            sharded across every GPU.
     """
+    if device is None:
+        raise NotImplementedError(
+            "A QuantizedLM runs on one device; sharding its graphs across "
+            "GPUs is not supported.  Pass --gpu."
+        )
     model, tokenizer = load_model_and_tokenizer(
         model_id, torch_dtype, attn_implementation="eager"
     )
+    model.to(device)
+    lm = QuantizedLM(
+        model,
+        quantizer,
+        context_length=max_length,
+        cache_len=max_length,
+        phases=("prefill",),
+        logits_to_keep=0,
+    )
+    if print_model:
+        lm.graphs["prefill"].graph.print_tabular()
+        print_node_scope_tabular(lm.graphs["prefill"])
+    return lm, tokenizer
 
-    if device is not None:
-        model.to(device)
 
-    vocab_size = model.config.get_text_config().vocab_size
-    input_ids = torch.randint(0, vocab_size, (1, max_length), device=device)
-    labels = input_ids.clone()
-    example_args = (input_ids,)
-    example_kwargs = {"labels": labels, "use_cache": False}
-    chunk_dim = torch.export.Dim("chunk_dim", min=2, max=max_length // 64)
-    dynamic_shapes = {
-        "input_ids": {1: chunk_dim * 64},
-        "labels": {1: chunk_dim * 64},
-        "use_cache": None,
-    }
+def prefill_loss(lm):
+    """``evaluate_perplexity``'s model on ``lm``: a function returning the
+    causal-LM loss of a window, computed from the prefill graph's logits
+    with the model's own loss function.
 
-    with torch.no_grad():
-        gm = prepare_pt2e(
-            model, quantizer, example_args, example_kwargs, dynamic_shapes
+    Args:
+        lm: A ``QuantizedLM`` whose prefill graph returns every position's
+            logits.
+
+    Returns:
+        ``loss(input_ids, labels, use_cache)``, whose ``use_cache`` only
+        satisfies ``evaluate_perplexity``'s call.
+    """
+    prefill = lm.graphs["prefill"]
+    vocab_size = lm.config.get_text_config().vocab_size
+
+    def loss(input_ids, labels, use_cache):
+        logits = prefill(
+            input_ids=input_ids,
+            cache_position=torch.arange(
+                input_ids.shape[1], device=input_ids.device
+            ),
+        )
+        return CausalLMOutput(
+            loss=lm.model.loss_function(logits, labels, vocab_size)
         )
 
-    if print_model:
-        gm.graph.print_tabular()
-        print_node_scope_tabular(gm)
-
-    sink_obs_or_fq(gm)
-
-    if device is None:
-        reserved_bytes = reserved_memory * 1024**3
-        max_memory = {
-            k: v - reserved_bytes
-            for k, v in get_max_memory().items()
-            if isinstance(k, int) and v > reserved_bytes
-        }
-        device_map = get_device_map(gm, max_memory)
-        dispatch_model(gm, device_map)
-
-        for node in list(gm.graph.nodes):
-            if node.op not in ["placeholder", "output"] and not node.users:
-                gm.graph.erase_node(node)
-
-        insert_align_device_nodes(gm, (input_ids, labels))
-
-    return gm, tokenizer
+    return loss
 
 
 @with_execution_context
@@ -147,8 +144,7 @@ def main(args):
         quantizer,
         args.max_length,
         args.torch_dtype,
-        device=device,
-        reserved_memory=args.reserved_memory,
+        device,
         print_model=args.print_model,
     )
 
@@ -161,7 +157,7 @@ def main(args):
         )
 
         evaluate_perplexity(
-            model,
+            prefill_loss(model),
             calib_encodings,
             args.max_length,
             args.stride,
@@ -169,19 +165,19 @@ def main(args):
             num_steps=args.calibration_steps,
         )
 
-        for module in model.modules():
-            if isinstance(module, FakeQuantizeBase):
-                module.disable_observer()
+        model.disable_observers()
 
-    freeze_weights(model)
-
-    model.graph.print_tabular()
+    model.freeze()
 
     test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     test_encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
     ppl = evaluate_perplexity(
-        model, test_encodings, args.max_length, args.stride, device
+        prefill_loss(model),
+        test_encodings,
+        args.max_length,
+        args.stride,
+        device,
     )
 
     print(f"model:      {args.model_id}")

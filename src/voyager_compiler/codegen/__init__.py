@@ -22,10 +22,13 @@ from voyager_compiler.codegen.transform.padding import (
     pad_vit_embeddings_output,
 )
 from voyager_compiler.codegen.transform.quant_folding import (
+    CacheFormat,
     fuse_quantize_dequantize_with_producer,
     quantizes_kv_cache,
     sink_cache_folds,
     split_kv_cache,
+    split_token_blocked_caches,
+    store_prompt_chunks,
 )
 from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
@@ -39,6 +42,7 @@ from voyager_compiler.codegen.transform.rewrites import (
     remove_zero_attention_mask,
     replace_conv2d_with_im2col,
     replace_interpolate,
+    specialize_symbolic_sizes,
 )
 from voyager_compiler.codegen.transform.scalarize import (
     scalarize_index_arithmetic,
@@ -50,6 +54,7 @@ from voyager_compiler.codegen.transform.tiling.grid_search import (
 )
 
 __all__ = [
+    "CacheFormat",
     "deduplicate_nodes",
     "eliminate_reshape_with_no_effect",
     "extract_input_preprocessor",
@@ -76,7 +81,10 @@ __all__ = [
     "replace_interpolate",
     "scalarize_index_arithmetic",
     "sink_cache_folds",
+    "specialize_symbolic_sizes",
     "split_kv_cache",
+    "split_token_blocked_caches",
+    "store_prompt_chunks",
     "gemv_op_tiling",
     "vector_op_tiling",
     "pool_op_tiling",

@@ -45,6 +45,7 @@ __all__ = [
     "extract_input_preprocessor",
     "inline_autocast_modules",
     "fold_constant_generators",
+    "specialize_symbolic_sizes",
     "remove_fp32_casts",
     "remove_prunable_ops",
     "remove_zero_attention_mask",
@@ -479,6 +480,47 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     model.recompile()
 
 
+# The size queries a dynamic-shape export inserts for a dimension it does
+# not know at trace time.
+_SIZE_QUERIES = (
+    torch.ops.aten.sym_size.int,
+    torch.ops.aten.sym_stride.int,
+    torch.ops.aten.sym_numel.default,
+)
+
+
+def specialize_symbolic_sizes(model: GraphModule):
+    """Replace every size the graph reads at run time by the example's.
+
+    A graph exported with a dynamic dimension queries that dimension
+    (``sym_size.int``) and passes the result to ``arange`` and to ``view`` /
+    ``reshape`` / ``expand`` shape lists.  The lowering plans for one shape,
+    the example's, which shape propagation has just recorded as the query's
+    ``.value``; this pass writes that value into every user as a literal and
+    erases the query, so the graph reads as a static export.  Scalar
+    arithmetic on such sizes (an ``operator.mul`` on SymInts) is specialized
+    the same way once its operands are all literals.  A graph with no size
+    query is left as it is; a node's ``meta["val"]`` keeps the symbolic
+    shape export gave it.
+
+    Args:
+        model: The graph module to rewrite in place, shape-propagated on
+            concrete inputs.
+    """
+    graph = model.graph
+    for node in list(graph.nodes):
+        if node.op != "call_function":
+            continue
+        if node.target not in _SIZE_QUERIES and node.all_input_nodes:
+            continue
+        if not isinstance(node.value, (int, float)):
+            continue
+        node.replace_all_uses_with(node.value)
+        graph.erase_node(node)
+    graph.lint()
+    model.recompile()
+
+
 def _producer_graph(node: Node, producers: Dict[Node, Graph]) -> Graph:
     """The graph computing ``node``'s constant from the model's own buffers:
     ``node`` over its inputs, each a ``get_attr`` of an original buffer or
@@ -638,6 +680,7 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
 
 
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
+_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
 
 
 def _repeated_heads(node: Node):
@@ -670,14 +713,15 @@ def _repeated_heads(node: Node):
 
 
 def normalize_attention_operands(model: GraphModule) -> GraphModule:
-    """Hand each ``scaled_dot_product_attention`` its operands as the flash
-    attention kernel takes them.
+    """Hand each ``scaled_dot_product_attention`` and ``sdpa_mx`` its
+    operands as the flash attention kernel takes them.
 
-    A key and value whose heads a GQA repeat (``_repeated_heads``) multiplies
-    by the same group are read unrepeated under ``enable_gqa``, so the kernel
-    folds each group of query heads onto its KV head.  A bool ``attn_mask``
-    becomes the additive one, zero where it keeps and the query dtype's
-    minimum elsewhere.
+    A ``scaled_dot_product_attention`` key and value whose heads a GQA repeat
+    (``_repeated_heads``) multiplies by the same group are read unrepeated
+    under ``enable_gqa``, so the kernel folds each group of query heads onto
+    its KV head.  A bool ``attn_mask`` of either op becomes the additive one,
+    zero where it keeps and the minimum of the attention's output dtype
+    elsewhere.
 
     Args:
         model: The graph, rewritten in place.
@@ -687,10 +731,11 @@ def normalize_attention_operands(model: GraphModule) -> GraphModule:
     """
     graph = model.graph
     changed = False
-    for node in [n for n in graph.nodes if n.target is _SDPA]:
+    for node in [n for n in graph.nodes if n.target in (_SDPA, _SDPA_MX)]:
         repeats = [_repeated_heads(a) for a in node.args[1:3]]
         if (
-            not node.kwargs.get("enable_gqa", False)
+            node.target is _SDPA
+            and not node.kwargs.get("enable_gqa", False)
             and None not in repeats
             and repeats[0][1] == repeats[1][1]
         ):
@@ -705,7 +750,7 @@ def normalize_attention_operands(model: GraphModule) -> GraphModule:
             changed = True
         mask = get_arg_value(node, 3, "attn_mask", None)
         if isinstance(mask, Node) and mask.value.dtype == torch.bool:
-            dtype = node.args[0].value.dtype
+            dtype = node.value.dtype
             with graph.inserting_before(node):
                 zero = create_getattr_from_value(
                     model, graph, "attention_zero", torch.tensor(0, dtype=dtype)

@@ -4,7 +4,8 @@
 ``GraphModule``; ``create_getattr_from_value`` materialises a tensor into
 an existing graph as a buffer; ``get_module_stack``,
 ``get_node_name_to_scope`` and ``print_node_scope_tabular`` read the module
-provenance capture stamps on every node.
+provenance capture stamps on every node.  ``WHOLE_CACHE_OP`` is the
+``node.meta`` key naming the op a node of a split KV cache stands for.
 """
 
 import logging
@@ -17,7 +18,15 @@ from torch.fx import Graph, GraphModule, Node
 
 logger = logging.getLogger(__name__)
 
+# ``node.meta`` key ``split_kv_cache`` sets on each node it adds to a decode
+# graph or retargets: the op the node stands for in the decode graph of whole
+# caches, or None for a node that graph lacks.  ``share_fake_quants`` names
+# operands by it, so a split decode's attention operands are named as in a
+# prefill.
+WHOLE_CACHE_OP = "whole_cache_op"
+
 __all__ = [
+    "WHOLE_CACHE_OP",
     "create_getattr_from_value",
     "export_model",
     "get_aten_graph_module",

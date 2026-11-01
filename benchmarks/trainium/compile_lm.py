@@ -43,9 +43,15 @@ sys.path.insert(
 )
 from test_codegen import FUSION_PATTERNS  # noqa: E402
 from utils.models import llama  # noqa: E402
+from utils.models.utils import (  # noqa: E402
+    get_compile_args,
+    get_transform_args,
+)
 
 from voyager_compiler import (  # noqa: E402
+    ShapeProp,
     compile,
+    fake_like,
     get_default_quantizer,
     transform,
 )
@@ -150,16 +156,15 @@ def main():
     )
     # Attention's matmuls stay BF16.
     quantizer.set_object_type(torch.ops.aten.matmul.default, None)
-    gm, example_args, example_kwargs, _, transform_args, compile_args, _ = (
-        llama.quantize_model(
-            model,
-            tokenizer,
-            quantizer,
-            FUSION_PATTERNS,
-            voyager,
-            reference=False,
-        )
+    gm, example_kwargs = llama.quantize_stage(
+        model, tokenizer, quantizer, voyager
     )
+    example_args = ()
+    # Stamp dtypes for remove_fp32_casts without running the model.
+    flat_args, _ = tree_flatten((example_args, example_kwargs))
+    ShapeProp(gm).propagate(*map(fake_like, flat_args))
+    transform_args = get_transform_args(voyager, FUSION_PATTERNS)
+    compile_args = get_compile_args(voyager)
     transform_args["config"] = config
     compile_args["config"] = config
     # The flash attention's causal table is the additive fill.
@@ -179,7 +184,6 @@ def main():
         json.dump({"total_s": total, "kernels_s": predicted}, f, indent=1)
     manifest = translate(model, args.out, config, values)
     kernels = [s for s in manifest["steps"] if s["kernel"] is not None]
-    flat_args, _ = tree_flatten((example_args, example_kwargs))
     path = os.path.join(args.out, "tensors.pt")
     record(gm, flat_args, manifest, path, steps=not args.no_reference)
     print(

@@ -8,13 +8,13 @@ from transformers import (
 )
 
 from voyager_compiler import (
-    convert_pt2e,
-    prepare_pt2e,
-    transform,
+    Example,
+    QuantizedModel,
     compile,
+    transform,
 )
 
-from .utils import get_transform_args, get_compile_args
+from .utils import get_transform_args, get_compile_args, single_cpu_thread
 
 
 def load_model(args):
@@ -35,76 +35,74 @@ def load_model(args):
     return model, tokenizer
 
 
+def _inputs(batch):
+    """The model's inputs in ``batch``, labels left out."""
+    return {k: v for k, v in batch.items() if k != "labels"}
+
+
+def quantize_model(model, quantizer, calibration_data, args):
+    """Quantize the whole ``model``, embeddings to classifier, as one
+    ``QuantizedModel`` prepared with its observers on, for training under
+    ``--training`` and for inference otherwise; the pooler and classifier
+    stay unquantized.  The graphs take a GLUE batch of ``calibration_data``
+    as their example, the training ones with its labels."""
+    batch = next(
+        iter(
+            DataLoader(
+                calibration_data,
+                collate_fn=default_data_collator,
+                batch_size=1,
+            )
+        )
+    )
+    quantizer.set_module_name("pooler", None)
+    quantizer.set_module_name("classifier", None)
+    return QuantizedModel(
+        model,
+        quantizer,
+        Example((), _inputs(batch)),
+        Example((), batch),
+        phases=("training",) if args.training else ("inference",),
+        backward_override=args.backward_override,
+    )
+
+
 def quantize_and_dump_model(
     model, quantizer, calibration_data, fusion_patterns, args
 ):
+    """Quantize ``model`` (``quantize_model``), calibrate its inference graph
+    on ``--calibration_steps`` batches, convert it, then transform and
+    compile it.  Returns ``(gm, old_output, new_output)``; ``new_output`` is
+    ``None`` unless ``--debug`` re-runs the lowered graph."""
+    quantized = quantize_model(model, quantizer, calibration_data, args)
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
+    example_kwargs = _inputs(next(iter(calibration_dataloader)))
 
-    compile_args = get_compile_args(args)
-    transform_args = get_transform_args(args, fusion_patterns)
-
-    batch = next(iter(calibration_dataloader))
-    input_ids = batch["input_ids"]
-    input_shape = input_ids.size()
-
-    embedding_output = model.bert.embeddings(
-        input_ids=input_ids,
-    )
-
-    extended_attention_mask = model.bert.get_extended_attention_mask(
-        batch["attention_mask"], input_shape
-    )
-
-    example_args = (embedding_output, extended_attention_mask)
-
-    class BertWrapper(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.bert = model.bert
-            self.classifier = model.classifier
-
-        def forward(self, hidden_states, attention_mask):
-            for i, layer_module in enumerate(self.bert.encoder.layer):
-                hidden_states = layer_module(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                )
-
-                if args.num_hidden_layers and i + 1 >= args.num_hidden_layers:
-                    break
-
-            pooled_output = self.bert.pooler(hidden_states)
-            logits = self.classifier(pooled_output)
-            return logits
-
-    quantizer.set_module_name("pooler", None)
-    quantizer.set_module_name("classifier", None)
-
-    gm = prepare_pt2e(BertWrapper(), quantizer, example_args)
-
-    if args.calibration_steps > 0:
+    with torch.no_grad():
         for i, batch in enumerate(
             tqdm(calibration_dataloader, desc="Calibrating BERT")
         ):
-            embedding_output = model.bert.embeddings(
-                input_ids=batch["input_ids"]
-            )
-            gm(embedding_output, extended_attention_mask)
-            if i == args.calibration_steps - 1:
+            if i == args.calibration_steps:
                 break
+            quantized.infer(**_inputs(batch))
+    quantized.eval()
+    quantized.convert(args.bias)
+    gm = quantized.graphs["inference"]
 
-    convert_pt2e(gm, args.bias)
+    old_output = gm(**example_kwargs)
 
-    old_output = gm(*example_args)
-
-    transform(gm, example_args, **transform_args)
+    transform(
+        gm, (), example_kwargs, **get_transform_args(args, fusion_patterns)
+    )
+    compile(gm, (), example_kwargs, **get_compile_args(args))
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args) if args.debug else None
-
-    compile(gm, example_args, **compile_args)
+    new_output = None
+    if args.debug:
+        with single_cpu_thread():
+            new_output = gm(**example_kwargs)
     return gm, old_output, new_output
 
 
@@ -140,14 +138,12 @@ def evaluate_gm(gm, dataset):
     total_samples = 0
 
     with torch.no_grad():
-        for data_label_pair in tqdm(dataset, desc="Evaluating Quantized BERT"):
-            label = data_label_pair["labels"]
-            outputs = gm(
-                data_label_pair["embedding_output"],
-                data_label_pair["attention_mask"],
+        for batch in tqdm(dataset, desc="Evaluating Quantized BERT"):
+            label = batch["labels"]
+            outputs = gm(**_inputs(batch))
+            logits = (
+                outputs["logits"] if isinstance(outputs, dict) else outputs[0]
             )
-
-            logits = outputs
             prediction = torch.argmax(logits, dim=-1)
             if prediction == label:
                 correct_predictions += 1

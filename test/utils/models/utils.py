@@ -1,7 +1,9 @@
 import os
+from contextlib import contextmanager
 
 import torch
 from voyager_compiler import (
+    QuantizedModel,
     capture_training,
     compile,
     gradient_program,
@@ -37,6 +39,17 @@ def get_compile_args(args):
     }
 
 
+@contextmanager
+def single_cpu_thread():
+    """Run the enclosed code on one CPU thread, then restore the old count."""
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(threads)
+
+
 class Loss(torch.nn.Module):
     """A Hugging Face model whose forward returns its loss alone."""
 
@@ -48,7 +61,7 @@ class Loss(torch.nn.Module):
         return self.model(**inputs).loss
 
 
-def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
+def compile_training_step(model, inputs, fusion_patterns, args, quantizer=None):
     """Compile one AdamW step of training ``model`` on the batch ``inputs``.
 
     The step is two programs sharing one DRAM layout: the gradient program
@@ -56,19 +69,22 @@ def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
     into its own directory under ``args.model_output_dir``.  They run on
     ``model``'s own tensors and ``inputs``, zeroed gradient buffers or, for
     the update, random gradients, and the optimizer's state as before a
-    first step.  With quantization specs, the step trains through
-    ``quantizer``'s fake-quants -- the backward too with ``--error``, else
-    as ``--backward_override`` says -- after ``--calibration_steps`` eager steps
-    have started their delayed scaling.  A dropout draws its mask per tile
-    once compiled, so with dropout the compiled program's results differ
-    from the reference's.
+    first step.  With quantization specs, the step trains through the
+    fake-quants -- the backward too with ``--error``, else as
+    ``--backward_override`` says -- after ``--calibration_steps`` eager
+    steps have started their delayed scaling.  A dropout draws its mask per
+    tile once compiled, so with dropout the compiled program's results
+    differ from the reference's.
 
     Args:
-        model: A Hugging Face model that returns its loss given labels.
+        model: A ``QuantizedModel`` holding the training graphs, or a
+            Hugging Face model that returns its loss given labels, captured
+            here.
         inputs: One batch, labels included.
         fusion_patterns: The fusion patterns ``transform`` applies.
         args: The command line.
-        quantizer: Picks the GEMM operands to quantize.
+        quantizer: Picks the GEMM operands to quantize when ``model`` is
+            captured here; a ``QuantizedModel`` brought its own.
 
     Returns:
         ``(programs, reference, lowered)``, each keyed ``"gradient"`` and
@@ -77,24 +93,31 @@ def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
         ``--remove_fp32_casts`` changes the numbers on purpose -- and the
         same from the compiled graphs under ``--debug``, else ``None``.
     """
-    model = Loss(model).train()
     specs = (args.activation, args.weight, args.error)
-    if any(spec is not None for spec in specs):
-        prepare_training(
-            model,
-            quantizer,
-            (),
-            inputs,
-            None,
-            backward_override=args.backward_override,
-        )
+    quantized = any(spec is not None for spec in specs)
+    if isinstance(model, QuantizedModel):
+        # Its forward returns the Hugging Face output; Loss takes the loss.
+        loss = Loss(model.train())
+        model = model.model
+    else:
+        model = loss = Loss(model).train()
+        if quantized:
+            prepare_training(
+                model,
+                quantizer,
+                (),
+                inputs,
+                None,
+                backward_override=args.backward_override,
+            )
+        else:
+            with torch.enable_grad():
+                capture_training(model, (), inputs, None)
+    if quantized:
         for _ in range(args.calibration_steps):
             with torch.enable_grad():
-                model(**inputs).backward()
+                loss(**inputs).backward()
         model.zero_grad(set_to_none=True)
-    else:
-        with torch.enable_grad():
-            capture_training(model, (), inputs, None)
     gradient = gradient_program(model)
     # A torch optimizer skips a parameter the loss never reaches, such as a
     # vision tower under a text-only batch: it steps the ones with gradients.
@@ -160,4 +183,7 @@ def compile_training_step(model, inputs, fusion_patterns, args, quantizer):
             dram_layout=layout,
             **compile_args,
         )
-    return programs, reference, run() if args.debug else None
+    if not args.debug:
+        return programs, reference, None
+    with single_cpu_thread():
+        return programs, reference, run()

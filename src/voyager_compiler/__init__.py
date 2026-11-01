@@ -48,13 +48,17 @@ from voyager_compiler.codegen import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     scalarize_index_arithmetic,
+    specialize_symbolic_sizes,
     split_kv_cache,
+    split_token_blocked_caches,
+    store_prompt_chunks,
 )
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     flush_tensor_files,
     gen_code_bufferized,
     plan_memory,
+    planned_buffer_layout,
     print_bufferized_graph,
     print_layer_table,
     shared_dram_layout,
@@ -88,12 +92,15 @@ from voyager_compiler.ops.layout import (
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
     DirectCastFakeQuantize,
+    Example,
     FusedAmaxObsFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
     QScheme,
     QuantizationConfig,
     QuantizationSpec,
+    QuantizedLM,
+    QuantizedModel,
     TrainingQuantizers,
     TrainingStep,
     capture_training,
@@ -101,8 +108,6 @@ from voyager_compiler.quantization import (
     derive_bias_qparams_fn,
     disable_observers,
     fold_conv_bn_qat,
-    freeze_cache_reads,
-    freeze_weights,
     get_default_quantizer,
     gradient_program,
     prepare_for_qat,
@@ -131,6 +136,7 @@ __all__ = [
     "AcceleratorConfig",
     "DerivedQuantizationSpec",
     "DirectCastFakeQuantize",
+    "Example",
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
@@ -139,6 +145,8 @@ __all__ = [
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
+    "QuantizedLM",
+    "QuantizedModel",
     "ShapeProp",
     "TrainingQuantizers",
     "TrainingStep",
@@ -156,8 +164,6 @@ __all__ = [
     "extract_input_preprocessor",
     "fetch_attr",
     "fold_conv_bn_qat",
-    "freeze_cache_reads",
-    "freeze_weights",
     "fuse_operator",
     "get_aten_graph_module",
     "get_conv_bn_layers",
@@ -170,6 +176,7 @@ __all__ = [
     "merge_sibling_linears",
     "normalize_attention_operands",
     "pad_vit_embeddings_output",
+    "planned_buffer_layout",
     "prepare_for_qat",
     "prepare_pt2e",
     "prepare_qat_pt2e",
@@ -188,7 +195,10 @@ __all__ = [
     "set_training",
     "shared_dram_layout",
     "sink_obs_or_fq",
+    "specialize_symbolic_sizes",
     "split_kv_cache",
+    "split_token_blocked_caches",
+    "store_prompt_chunks",
     "transform",
     "update_program",
     "with_execution_context",
@@ -286,6 +296,7 @@ def transform(
     skip_op_fusion=False,
     fuse_reshape=True,
     keep_fp32=True,
+    cache_formats=None,
 ):
     """Lower ``model`` in place through the graph-level passes.
 
@@ -318,9 +329,19 @@ def transform(
             its producer's output.
         keep_fp32: ``False`` computes in 16-bit float where the model casts
             up to float32 (``remove_fp32_casts``).
+        cache_formats: For a prefill graph filling a decode graph's split
+            KV caches, the transformed decode graph's
+            ``meta["cache_formats"]``: the prefill then stores the prompt's
+            whole chunks in the decode's quantized format, into the
+            decode's own buffers (``store_prompt_chunks``).  None for any
+            other graph.
 
     Returns:
         ``model``.
+
+    Raises:
+        ValueError: ``model`` writes a split cache's residual but no
+            ``cache_formats`` say how its chunks are stored.
     """
     if example_kwargs is None:
         example_kwargs = {}
@@ -335,12 +356,30 @@ def transform(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
 
+    specialize_symbolic_sizes(model)
+    # A decode cache whose blocks run along the positions is split here, so
+    # its index arithmetic is folded and scalarized with the graph's own.
+    lanes = config.vector_lanes if config.pe_array_size is not None else 1
+    split_token_blocked_caches(model, lanes)
     fold_constant_generators(model)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
     normalize_attention_operands(model)
     scalarize_index_arithmetic(model)
     fuse_quantize_dequantize_with_producer(model)
+    if cache_formats is not None:
+        store_prompt_chunks(model, cache_formats)
+    elif not model.meta.get("cache_formats") and any(
+        n.target is torch.ops.aten.index_copy_.default
+        and n.args[0].op == "get_attr"
+        and n.args[0].target.endswith("_residual")
+        for n in model.graph.nodes
+    ):
+        # A prefill writes a residual but folds no chunk of its own.
+        raise ValueError(
+            "the graph writes a split KV cache's residual: pass the decode "
+            "graph's cache_formats so its chunks are stored in that format"
+        )
 
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, config.pe_array_size)
@@ -404,8 +443,10 @@ def compile(
             takes ``DEFAULT_RUNTIME_TOLERANCE``.
         dram_layout: The DRAM ranges ``shared_dram_layout`` agreed for the
             inputs ``model`` shares with other programs, such as a training
-            step's gradient and update programs; ``None`` places every
-            input freely.
+            step's gradient and update programs, or that
+            ``planned_buffer_layout`` found for the ``get_attr`` buffers
+            it shares with an already planned program, such as a decode
+            graph's KV cache; ``None`` places every input freely.
         accumulate_fp32: Accumulate a GEMM split along K in float32 rather
             than its output dtype.
         bool_mask: Store an ``is_causal`` flash attention's mask table as

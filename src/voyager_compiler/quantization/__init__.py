@@ -32,6 +32,11 @@ from voyager_compiler.quantization.codebook_optimizer import (
     optimal_codebooks,
     refit_window,
 )
+from voyager_compiler.quantization.model import (
+    Example,
+    QuantizedLM,
+    QuantizedModel,
+)
 from voyager_compiler.quantization.qspec import (
     DEFAULT_AMAX_HISTORY_LEN,
     QScheme,
@@ -41,8 +46,6 @@ from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
     fold_conv_bn_qat,
-    freeze_cache_reads,
-    freeze_weights,
     get_default_quantizer,
     prepare_pt2e,
     prepare_qat_pt2e,
@@ -50,6 +53,10 @@ from voyager_compiler.quantization.quantize_pt2e import (
     set_training,
     sink_obs_or_fq,
     swap_matmul_inputs,
+)
+from voyager_compiler.quantization.sharing import (
+    fake_quant_edges,
+    share_fake_quants,
 )
 from voyager_compiler.quantization.training import (
     DEFAULT_BACKWARD_OVERRIDE,
@@ -83,12 +90,15 @@ __all__ = [
     "Histogram",
     "DerivedQuantizationSpec",
     "DirectCastFakeQuantize",
+    "Example",
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
+    "QuantizedLM",
+    "QuantizedModel",
     "TrainingQuantizers",
     "TrainingStep",
     "capture_training",
@@ -97,11 +107,10 @@ __all__ = [
     "convert_pt2e",
     "derive_bias_qparams_fn",
     "disable_observers",
+    "fake_quant_edges",
     "fake_quantize_class",
     "fit_codebooks",
     "fold_conv_bn_qat",
-    "freeze_cache_reads",
-    "freeze_weights",
     "gemm_partners",
     "get_default_quantizer",
     "get_quantization_map",
@@ -119,6 +128,7 @@ __all__ = [
     "return_gradients",
     "set_batch_norm_training",
     "set_training",
+    "share_fake_quants",
     "sink_obs_or_fq",
     "swap_matmul_inputs",
     "update_program",

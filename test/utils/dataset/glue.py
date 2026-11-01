@@ -55,6 +55,10 @@ def retrieve_dataset(model, tokenizer, args):
 
 
 def dump_dataset(output_dir, dataset, model):
+    """Write each sample of ``dataset`` as the compiled graph's inputs under
+    ``output_dir/<step>_<label>/`` and return them: a BERT graph takes the
+    token ids, token type ids and attention mask themselves; a MobileBERT
+    graph starts at the embedding output and takes the additive mask."""
     eval_dataloader = DataLoader(
         dataset, collate_fn=default_data_collator, batch_size=1
     )
@@ -62,21 +66,28 @@ def dump_dataset(output_dir, dataset, model):
     if isinstance(model, MobileBertPreTrainedModel):
         embeddings = model.mobilebert.embeddings
     elif isinstance(model, BertPreTrainedModel):
-        embeddings = model.bert.embeddings
+        embeddings = None
     else:
         raise ValueError("Model not supported")
 
     preprocessed_dataset = []
 
     for step, batch in enumerate(tqdm(eval_dataloader, desc="Dumping dataset")):
+        label = int(batch["labels"].item())
+        folder = os.path.join(output_dir, f"{step}_{label}")
+        os.makedirs(folder, exist_ok=True)
+        if embeddings is None:
+            preprocessed_dataset.append(batch)
+            for name, tensor in batch.items():
+                if name != "labels":
+                    write_tensor_to_file(
+                        tensor, os.path.join(folder, f"{name}.bin")
+                    )
+            continue
         embedding_output = embeddings(
             input_ids=batch["input_ids"], token_type_ids=batch["token_type_ids"]
         )
         attention_mask = (1.0 - batch["attention_mask"]) * torch.finfo(torch.float).min
-        label = int(batch["labels"].item())
-
-        folder = os.path.join(output_dir, f"{step}_{label}")
-        os.makedirs(folder, exist_ok=True)
 
         preprocessed_dataset.append({
             "embedding_output": embedding_output,

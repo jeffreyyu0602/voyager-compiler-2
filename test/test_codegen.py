@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 
 import torch
 from torch.testing import assert_close
@@ -113,18 +114,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "model",
-        help=(
-            "Model to compile. Medusa stages are medusa_prefill and "
-            "medusa_decode."
-        ),
+        help="Model to compile.",
     )
     parser.add_argument(
         "--model_name_or_path",
         default=None,
         help=(
             "Path to pretrained model or model identifier from "
-            "huggingface.co/models. Use tiny-random for the offline Medusa "
-            "smoke model."
+            "huggingface.co/models."
         ),
     )
     parser.add_argument(
@@ -179,9 +176,10 @@ def main():
         type=int,
         default=None,
         help=(
-            "Positions of a KIVI KV cache kept in full precision while their "
-            "chunk fills; a multiple of the 64-token KIVI group, 128 by "
-            "default."
+            "Positions of every quantized KV cache kept in full precision "
+            "while their chunk fills, a multiple of the 64-token KIVI group. "
+            "Without it only a cache whose quantization blocks run along the "
+            "positions is split, by one lane block; a KIVI cache requires it."
         ),
     )
     parser.add_argument(
@@ -203,8 +201,7 @@ def main():
         choices=sorted(QUANTIZATION_CONFIGS),
         help=(
             "Named per-operand qconfig table for LLMs (from "
-            "examples/language_modeling/quantization_configs.py); also puts "
-            "softmax and rms_norm outputs in fp8."
+            "examples/language_modeling/quantization_configs.py)."
         ),
     )
     parser.add_argument(
@@ -355,8 +352,11 @@ def main():
 
         if args.training:
             inputs = {k: torch.tensor([v]) for k, v in train_dataset[0].items()}
+            quantized = bert.quantize_model(
+                model, quantizer, train_dataset, args
+            )
             gm, old_output, new_output = compile_training_step(
-                model, inputs, FUSION_PATTERNS, args, quantizer
+                quantized, inputs, FUSION_PATTERNS, args
             )
         else:
             gm, old_output, new_output = bert.quantize_and_dump_model(
@@ -375,18 +375,21 @@ def main():
         "llama_decode",
         "llama_decode_kivi",
         "llama_verify",
+        *llama.CACHE_STAGES,
     ):
         model, tokenizer = llama.load_model(args)
 
         if args.training:
-            input_ids = llama._prompt_ids(tokenizer, args.context_length)
-            inputs = {"input_ids": input_ids, "labels": input_ids}
-            # As inference: the rotary embedding's matmul stays unquantized.
-            quantizer.set_module_name_object_type_order(
-                llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
-            )
+            lm = llama.quantize_model(model, tokenizer, quantizer, args)
             gm, old_output, new_output = compile_training_step(
-                model, inputs, FUSION_PATTERNS, args, quantizer
+                lm,
+                llama.training_inputs(tokenizer, args),
+                FUSION_PATTERNS,
+                args,
+            )
+        elif args.model in llama.CACHE_STAGES:
+            gm, old_output, new_output = llama.compile_cache_programs(
+                model, tokenizer, quantizer, FUSION_PATTERNS, args
             )
         else:
             gm, old_output, new_output = llama.quantize_and_dump_model(
@@ -406,14 +409,12 @@ def main():
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
 
-        gm, old_output, new_output, preprocess_fn = (
-            vit.quantize_and_dump_model(
-                model=model,
-                quantizer=quantizer,
-                calibration_data=imagenet_dataset,
-                fusion_patterns=FUSION_PATTERNS,
-                args=args,
-            )
+        gm, old_output, new_output, preprocess_fn = vit.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            calibration_data=imagenet_dataset,
+            fusion_patterns=FUSION_PATTERNS,
+            args=args,
         )
 
         if args.dump_dataset:
@@ -438,35 +439,39 @@ def main():
         out_dir = args.report_output_dir
         if out_dir == "." and args.model_output_dir:
             out_dir = args.model_output_dir
-        calibration = (
-            load_calibration(args.calib_in) if args.calib_in else None
-        )
+        calibration = load_calibration(args.calib_in) if args.calib_in else None
         if calibration is not None:
             print(
                 f"[report] {len(calibration.measurements)} measured groups "
                 f"from {args.calib_in}"
             )
-        print(f"[report] {args.model} -> {out_dir}", flush=True)
-        result = report(
-            gm,
-            AcceleratorConfig.from_args(args),
-            output_dir=out_dir,
-            basename=args.report_basename,
-            calibration=calibration,
-        )
-        rows = kernel_rows(result)
-        # Compute kernels only: the DMA-only ones carry a key too, but they
-        # are not things the RTL measures.
-        groups = len({r.group for r in rows if r.group and r.ops_per_period})
-        print(
-            f"[report] total_latency={result.total_latency} "
-            f"dram_read={result.dram_read_bytes} "
-            f"dram_write={result.dram_write_bytes} "
-            f"kernels={len(rows)} groups={groups} "
-            f"calibrated={sum(1 for r in rows if r.calibration)} "
-            f"coverage={coverage(rows, result.total_latency):.3f}",
-            flush=True,
-        )
+        # A stage of several programs reports each into its own directory.
+        programs = gm if isinstance(gm, dict) else {"": gm}
+        for name, program in programs.items():
+            program_dir = os.path.join(out_dir, name)
+            print(f"[report] {args.model} {name} -> {program_dir}", flush=True)
+            result = report(
+                program,
+                AcceleratorConfig.from_args(args),
+                output_dir=program_dir,
+                basename=args.report_basename,
+                calibration=calibration,
+            )
+            rows = kernel_rows(result)
+            # Compute kernels only: the DMA-only ones carry a key too, but
+            # they are not things the RTL measures.
+            groups = len(
+                {r.group for r in rows if r.group and r.ops_per_period}
+            )
+            print(
+                f"[report] total_latency={result.total_latency} "
+                f"dram_read={result.dram_read_bytes} "
+                f"dram_write={result.dram_write_bytes} "
+                f"kernels={len(rows)} groups={groups} "
+                f"calibrated={sum(1 for r in rows if r.calibration)} "
+                f"coverage={coverage(rows, result.total_latency):.3f}",
+                flush=True,
+            )
 
     if new_output is None:
         print("Skipping output verification (pass --debug to run it)")
@@ -491,14 +496,15 @@ def main():
                 old.abs().to(torch.float32) + OUTPUT_ATOL
             )
             worst = max(worst, deviation.max().item())
+            if len(old_flat) > 1:
+                # A stage of several programs: name each one's deviation.
+                print(f"  output deviation {deviation.max().item():.2e}")
             assert_close(new, old, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
         print(f"Results match (max deviation {worst:.2e})")
     except Exception as e:
         print(f"WARNING: output verification failed: {e}")
         print(old_output)
         print(new_output)
-        if args.model.startswith("medusa_"):
-            raise
 
 
 if __name__ == "__main__":

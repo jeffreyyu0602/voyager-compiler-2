@@ -38,6 +38,7 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
 from voyager_compiler.codegen.transform.bufferize.memory_planning import (
     MemoryPlan,
     plan_memory,
+    planned_buffer_layout,
     shared_dram_layout,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import BuildContext
@@ -62,6 +63,7 @@ __all__ = [
     "gen_compute_graph",
     "print_bufferized_graph",
     "plan_memory",
+    "planned_buffer_layout",
     "MemoryLevel",
     "MemoryPlan",
     "shared_dram_layout",

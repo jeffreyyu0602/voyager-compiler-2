@@ -398,12 +398,15 @@ def is_prunable_op(node: Node) -> bool:
     if node.target == torch.ops.aten.alias.default:
         return True
 
-    # A slice from 0 to the end of the input tensor
+    # A slice from 0 to the end of the input tensor; a negative start counts
+    # from the end, so ``x[:, -1:]`` of a single row is one too.
     if node.target == torch.ops.aten.slice.Tensor:
         dim = get_arg_value(node, 1, "dim", 0)
         start = get_arg_value(node, 2, "start")
         end = get_arg_value(node, 3, "end")
         step = get_arg_value(node, 4, "step", 1)
+        if start is not None and start < 0 and hasattr(node.args[0], "shape"):
+            start = max(start + node.args[0].shape[dim], 0)
         if start is not None and start != 0 or step != 1:
             return False
         if end is not None and hasattr(node.args[0], "shape"):

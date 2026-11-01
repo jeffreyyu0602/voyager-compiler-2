@@ -122,6 +122,9 @@ _LLM = (
     + _FP16
 )
 _LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
+# A prompt of 960 tokens leaves a 64-token tail past its 128-position chunks.
+_LLM_TAIL = _LLM.replace("--context_length 1024", "--context_length 960")
+_RESIDUAL = " --residual_length 128"
 _LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
@@ -166,7 +169,32 @@ COMMANDS = [
     Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
     Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
     Command("llama_decode", "MXNF4", "64,64", "llama_decode", _LLM),
-    Command("llama_decode_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
+    Command(
+        "llama_decode_kivi",
+        "MXNF4",
+        "64,64",
+        "llama_decode_kivi",
+        _LLM + _RESIDUAL,
+    ),
+    # -- the prefill that fills the decode's KV cache, compiled with it: a
+    # 128-position residual with a tail of 0 and of 64 tokens, the latter
+    # under flash attention too, and the split each cache's blocks ask for --
+    Command("llama_cache", "MXNF4", "64,64", "llama_cache", _LLM + _RESIDUAL),
+    Command(
+        "llama_cache",
+        "MXNF4",
+        "64,64",
+        "llama_cache_tail",
+        _LLM_TAIL + _RESIDUAL,
+    ),
+    Command(
+        "llama_cache",
+        "MXNF4",
+        "64,64",
+        "llama_cache_sdpa",
+        _LLM_TAIL + _RESIDUAL + " --attn_implementation sdpa",
+    ),
+    Command("llama_cache", "MXNF4", "64,64", "llama_cache_blocks", _LLM),
     # -- BF16 (an unquantized KV cache stays whole) --
     Command("llama_decode", "BF16", "64,64", "llama_decode", _LLM),
     # -- MXNF4 (vision / bert) --
