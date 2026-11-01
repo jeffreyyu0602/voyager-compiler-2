@@ -7,7 +7,9 @@ checks each one's kernels in the NKI CPU simulator (``check.py
 a user-supplied output location.  Each point's Trainium ``model.txt``,
 ``layers.txt`` and ``kernels.txt`` (its distinct kernels, named by a digest
 of their NKI source, with their call counts) are compared with the previous
-run's, the way ``test/run_ci.py`` compares the Voyager CI's.
+run's. The Voyager CI, ``test/run_ci.py``, instead compiles a baseline
+commit and your code side by side; this script takes only its ``--only``
+matching and its output listing from it.
 
 Usage (from the repo root, in the Voyager env)::
 
@@ -29,6 +31,7 @@ on any FAILED or MISMATCH.
 """
 
 import argparse
+import difflib
 import importlib.util
 import json
 import os
@@ -40,8 +43,10 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +68,14 @@ RUN_POINT = Path("~/claude/trn/host/run_point.sh").expanduser()
 HOST_RUNS = RUN_POINT.parent / "runs"
 # The Trn2 host has one NeuronCore: one point runs on it at a time.
 DEVICE = threading.Lock()
+
+# Timestamp folder format; lexicographic sort == chronological sort.
+TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+# Number of unified-diff lines shown in the report for a mismatch.
+DIFF_EXCERPT_LINES = 60
+# The verdicts that fail a run.
+GATED = ("FAILED", "MISMATCH")
 
 TITLE = "trainium CI"
 # The files each point's outputs are compared by.
@@ -129,6 +142,191 @@ POINTS = [
     Point("gemma3", GEMMA, "bf16", "decode"),
 ]
 assert len({p.label for p in POINTS}) == len(POINTS), "duplicate labels"
+
+
+def _find_previous_run(out_dir, current):
+    """Newest timestamp dir under ``out_dir`` that isn't ``current``."""
+    runs = sorted(
+        p.name
+        for p in out_dir.iterdir()
+        if p.is_dir() and TS_RE.match(p.name) and p.name != current
+    )
+    return out_dir / runs[-1] if runs else None
+
+
+def compare(label, failed, run_dir, prev_run, names):
+    """Classifies one label's output files against the previous run's.
+
+    Args:
+        label: The command's label, its folder under each run.
+        failed: The command wrote no outputs to compare.
+        run_dir: This run's folder.
+        prev_run: The previous run's folder, or ``None``.
+        names: The names of the files compared (``outputs``).
+
+    Returns:
+        ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only for
+        a MISMATCH.
+    """
+    if failed:
+        return "FAILED", ""
+    previous = (
+        set()
+        if prev_run is None
+        else set(voyager_ci.outputs(prev_run / label, names))
+    )
+    if not previous:
+        return "NEW", ""
+
+    programs = set(voyager_ci.outputs(run_dir / label, names))
+    diff = [
+        f"only in {run.name}/{label}: {program}"
+        for run, only in (
+            (prev_run, previous - programs),
+            (run_dir, programs - previous),
+        )
+        for program in sorted(only)
+    ]
+    for program in sorted(programs & previous):
+        diff += difflib.unified_diff(
+            (prev_run / label / program).read_text().splitlines(),
+            (run_dir / label / program).read_text().splitlines(),
+            fromfile=f"{prev_run.name}/{label}/{program}",
+            tofile=f"{run_dir.name}/{label}/{program}",
+            lineterm="",
+        )
+    if not diff:
+        return "MATCH", ""
+    return "MISMATCH", "\n".join(diff[:DIFF_EXCERPT_LINES])
+
+
+def open_run(output_dir, title, names):
+    """Makes this run's timestamped folder and prints what it compares.
+
+    Args:
+        output_dir: The folder holding every run (created if missing).
+        title: The CI's name, printed first.
+        names: The names of the files compared (``outputs``).
+
+    Returns:
+        ``(run_dir, prev_run)``: this run's folder and the newest earlier
+        run's, or ``None`` when there is none.
+    """
+    out_dir = Path(output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime(TS_FORMAT)
+    run_dir = out_dir / timestamp
+    run_dir.mkdir()
+
+    prev_run = _find_previous_run(out_dir, timestamp)
+
+    print(f"{title} -> {run_dir}")
+    if prev_run is not None:
+        compared = ", ".join(names)
+        print(f"comparing {compared} against previous run: {prev_run.name}")
+    else:
+        print("no previous run found; this run is the baseline")
+    return run_dir, prev_run
+
+
+def run_all(items, run, jobs):
+    """Runs ``run`` on each of ``items``, ``jobs`` at a time.
+
+    Prints each item's verdict as it lands.
+
+    Args:
+        items: What is run, e.g. the commands.
+        run: Runs one item and returns its ``(label, status, verdict,
+            excerpt)``.
+        jobs: How many run at once.
+
+    Returns:
+        Each item's ``run`` result, in the order of ``items``.
+    """
+    print(f"running {len(items)} commands, {jobs} at a time\n")
+    results = [None] * len(items)
+    with ThreadPoolExecutor(jobs) as pool:
+        futures = {pool.submit(run, c): i for i, c in enumerate(items)}
+        for done, future in enumerate(as_completed(futures), 1):
+            label, status, verdict, excerpt = future.result()
+            results[futures[future]] = (label, status, verdict, excerpt)
+            suffix = "" if status == "ok" else f" ({status})"
+            print(f"[{done}/{len(items)}] {label} ... {verdict}{suffix}")
+            sys.stdout.flush()
+    return results
+
+
+def build_report(results, run_dir, prev_run, title):
+    """Renders the summary written to ``report.txt`` and stdout.
+
+    A label in the previous run that is absent from ``results`` is reported
+    MISSING; it is found as the first three path segments of a ``model.txt``
+    there, so every label must be three segments and write one.
+
+    Args:
+        results: Each command's ``(label, status, verdict, excerpt)``.
+        run_dir: This run's folder.
+        prev_run: The previous run's folder, or ``None``.
+        title: The CI's name, heading the report.
+
+    Returns:
+        The report's text, ending in ``RESULT: PASS`` or ``RESULT: FAIL``.
+    """
+    counts = {}
+    for _, _, verdict, _ in results:
+        counts[verdict] = counts.get(verdict, 0) + 1
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"{title} report  ({run_dir.name})")
+    if prev_run is not None:
+        lines.append(f"compared against: {prev_run.name}")
+    else:
+        lines.append("compared against: (none - baseline run)")
+    lines.append("=" * 70)
+
+    order = ["MATCH", "NEW", "MISMATCH", "FAILED", "MISSING"]
+    summary = "  ".join(f"{v}={counts[v]}" for v in order if v in counts)
+    lines.append(f"totals: {summary}")
+    lines.append("")
+
+    # Detail any non-clean verdicts.
+    for label, status, verdict, excerpt in results:
+        if verdict in ("MATCH", "NEW"):
+            continue
+        detail = f"  - {verdict}: {label}"
+        if status != "ok":
+            detail += f" [{status}; see {label}/run.log]"
+        lines.append(detail)
+        if excerpt:
+            for dl in excerpt.splitlines():
+                lines.append(f"      {dl}")
+
+    # Numeric warnings: reported, never gated.
+    warned = [r for r in results if r[1] in ("numeric_drift", "unverified")]
+    if warned:
+        lines.append("")
+        lines.append("numeric warnings (not gated):")
+        for label, status, _, _ in warned:
+            lines.append(f"  - {status}: {label} [see {label}/run.log]")
+
+    # Labels present in the previous run but absent now.
+    if prev_run is not None:
+        current_labels = {r[0] for r in results}
+        # A label is the first three path segments; training nests its
+        # programs' model.txt one level further down.
+        previous = {
+            "/".join(p.relative_to(prev_run).parts[:3])
+            for p in prev_run.rglob("model.txt")
+        }
+        for label in sorted(previous - current_labels):
+            lines.append(f"  - MISSING: {label} (in {prev_run.name})")
+
+    bad = any(r[2] in GATED for r in results)
+    lines.append("")
+    lines.append("RESULT: FAIL" if bad else "RESULT: PASS")
+    return "\n".join(lines)
 
 
 def steps(point, dest, args, run_name):
@@ -225,7 +423,7 @@ def run_point(point, run_dir, prev_run, args, env, cores):
         cores: A queue of ``taskset`` core ranges, one per job.
 
     Returns:
-        ``(label, status, verdict, excerpt)``, as ``voyager_ci.run_all``
+        ``(label, status, verdict, excerpt)``, as ``run_all``
         takes it.
     """
     label = point.label
@@ -257,9 +455,7 @@ def run_point(point, run_dir, prev_run, args, env, cores):
                         break
                     write_kernels(dest)
         built = status not in ("build_failed", "no_output")
-        verdict, excerpt = voyager_ci.compare(
-            label, not built, run_dir, prev_run, OUTPUTS
-        )
+        verdict, excerpt = compare(label, not built, run_dir, prev_run, OUTPUTS)
     except Exception:
         status, verdict, excerpt = "crashed", "FAILED", traceback.format_exc()
         with open(dest / "run.log", "a") as log:
@@ -405,7 +601,7 @@ def main():
         hi = first + (j + 1) * count // args.jobs - 1
         cores.put(f"{lo}-{hi}")
 
-    run_dir, prev_run = voyager_ci.open_run(args.output_dir, TITLE, OUTPUTS)
+    run_dir, prev_run = open_run(args.output_dir, TITLE, OUTPUTS)
     env = dict(
         os.environ,
         OMP_NUM_THREADS=str(args.threads),
@@ -413,16 +609,16 @@ def main():
         CUDA_VISIBLE_DEVICES="",
         PYTHONPATH=str(REPO_ROOT / "src"),
     )
-    results = voyager_ci.run_all(
+    results = run_all(
         points,
         lambda p: run_point(p, run_dir, prev_run, args, env, cores),
         args.jobs,
     )
-    report = voyager_ci.build_report(results, run_dir, prev_run, TITLE)
+    report = build_report(results, run_dir, prev_run, TITLE)
     report += "\n" + summary(results, run_dir, prev_run)
     (run_dir / "report.txt").write_text(report + "\n")
     print("\n" + report)
-    return 1 if any(r[2] in voyager_ci.GATED for r in results) else 0
+    return 1 if any(r[2] in GATED for r in results) else 0
 
 
 if __name__ == "__main__":

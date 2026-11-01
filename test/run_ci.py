@@ -1,41 +1,85 @@
 #!/usr/bin/env python
-"""Local pre-push CI for the voyager codegen commands.
+"""Pre-push CI: what your code changes in every compiled CI config.
 
-Runs every actively-used ``compile_model.py`` invocation (the ones reached
-through the accelerator's ``codegen.mk``) without dumping tensors, and drops
-each run's artifacts into a date+time folder under a user-supplied output
-location.  If a prior run exists in that location, the freshly produced
-``model.txt`` of each command is compared against the previous run's and any
-mismatch (or compile failure) is reported.
+Compiles every CI command (a ``compile_model.py`` invocation; ``--list``
+prints them) with the baseline and with your code, and compares each
+Voyager ``model.txt`` after ``tools/canon_model.py`` renames its values,
+together with the predicted latency and DRAM bytes that
+``compile_model.py --report`` prints (training commands take no
+``--report``). Each config that differs is then compiled at every local
+commit, to name the commit that changed it.
+
+- The baseline is ``git merge-base HEAD origin/main``, or ``--base``. It is
+  built in a git worktree under ``<output_dir>/worktrees``, with the
+  commands its own ``run_ci.py --list`` prints; every command runs with
+  ``PYTHONPATH`` at its own tree's ``src/``. When that listing fails, every
+  config is NEW. A run removes the worktrees an earlier one left.
+- Your code is the checkout as it is, uncommitted and new files included.
+- Every build, of any version, runs its command exactly as listed, so with
+  the ``--debug`` that checks the lowered graph's output against the
+  model's. The report gives each build's numeric verdict; a verdict that
+  differs between two versions is a change, like one in ``model.txt``.
+  When both builds fail the check, the outputs each one prints are
+  compared, and printed outputs that differ are a change too.
+- Every build is cached under ``<output_dir>/cache/<key>/<label>``. The key
+  is git's ids of the sources the commands read (``SOURCES``), uncommitted
+  and new files counted as ``git add -A`` would stage them, plus the Python,
+  torch and transformers versions. A failed build is not cached, nor is your
+  code's when its sources change during the run. A cached build that left
+  out its listed ``--debug`` is rebuilt. ``--fresh`` rebuilds your code
+  without the cache.
+- Attribution walks ``git rev-list --reverse --first-parent base..HEAD``,
+  then your uncommitted edits, comparing each with the one before. A commit
+  whose sources match its parent's shares its parent's build. It is skipped,
+  with a report line, when the baseline is not the first commit's parent.
+
+A run writes ``<output_dir>/<time>/``: ``report.txt``, the uncut cleaned
+diff of each config that differs (``<label>/model.diff``) and of each
+commit that changed it (``commits/<hash>/<label>.diff``, with
+``commits/your_code/`` for the uncommitted edits), and
+``changelog_draft.md``. Verdicts: MATCH, MISMATCH, NEW (only in your code),
+MISSING (only in the baseline) and FAILED (your code fails to compile). The
+run exits non-zero when a command FAILED, or at once when another run holds
+``<output_dir>``. A run stopped by SIGTERM, SIGHUP or Ctrl-C ends its
+compiles and waits for them before it removes its worktrees.
 
 Usage (from the repo root, with the conda env active)::
 
     python test/run_ci.py <output_dir> [--jobs N] [--threads T]
-
-``--jobs`` runs that many commands at once; ``--threads`` caps each one's CPU
-threads, so ``N * T`` bounds the cores the run takes.  Exits non-zero if any
-command fails to compile or any ``model.txt`` differs from the previous run,
-so it can gate a pre-push hook.
+    python test/run_ci.py <output_dir> --base <commit> [--fresh]
+    python test/run_ci.py --list
 """
 
 import argparse
 import difflib
+import fcntl
+import hashlib
+import json
 import os
+import platform
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
 
 # Repo root = parent of this file's directory (test/run_ci.py -> repo root).
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TEST_CODEGEN = REPO_ROOT / "scripts" / "compile_model.py"
+COMPILE_MODEL = REPO_ROOT / "scripts" / "compile_model.py"
 
-# Number of unified-diff lines shown in the report for a mismatch.
-DIFF_EXCERPT_LINES = 60
+# The name cleaner is a tool script, not a package.
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+import canon_model  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Command table.
@@ -218,14 +262,34 @@ COMMANDS = [
 
 # Timestamp folder format; lexicographic sort == chronological sort.
 TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
-TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
-
-# The CI's name, heading its output and report.
-TITLE = "voyager codegen CI"
-# The files each command's outputs are compared by.
-OUTPUTS = ("model.txt",)
-# The verdicts that fail a run.
-GATED = ("FAILED", "MISMATCH")
+# The output folder ``--list`` names: ``<RUN_DIR>/<label>``.
+RUN_DIR = "<run_dir>"
+# What the commands read, relative to the repo root: the package, the
+# driver and its loaders (under test/ at older commits), and the qconfig
+# table scripts/models/llama.py imports from the
+# language-modeling example.
+SOURCES = (
+    "src",
+    "scripts",
+    "test/compile_model.py",
+    "test/utils",
+    "examples/language_modeling/quantization_configs.py",
+)
+# What compile_model.py prints before the outputs of a failed numeric check.
+FAILED_CHECK = "WARNING: output verification failed"
+# A number in that printout; comparing only the numbers keeps a change of
+# output structure (a bare tensor for a one-element tuple) from counting.
+NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?")
+# The predicted cost ``compile_model.py --report`` prints.
+REPORT_LINE = re.compile(
+    r"\[report\] total_latency=(?P<total_latency>\S+) "
+    r"dram_read=(?P<dram_read>\d+) dram_write=(?P<dram_write>\d+)"
+)
+VERDICTS = ("MATCH", "MISMATCH", "NEW", "MISSING", "FAILED")
+# The signals that stop a run.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# Build statuses that leave nothing to compare.
+BROKEN = ("error", "no_output")
 
 
 def _label(command):
@@ -264,15 +328,14 @@ def _build(command, run_dir):
     """Expand a Command into ``(label, dest, argv)`` for this run.
 
     The argv runs this repo's compile_model.py with --model_output_dir pointed
-    into the timestamped run folder; --dump_tensors is never added.
-    ``--debug`` is always added: without it compile_model never evaluates the
-    lowered graph, so the run checks codegen only and no numeric comparison
-    happens at all.
+    into the run folder; --dump_tensors is never added. ``--debug`` is always
+    added: without it compile_model never evaluates the lowered graph, so the
+    run checks codegen only and no numeric comparison happens at all.
     """
     label = _label(command)
     dest = run_dir / label
 
-    argv = [sys.executable, str(TEST_CODEGEN), command.model, "--debug"]
+    argv = [sys.executable, str(COMPILE_MODEL), command.model, "--debug"]
     argv += shlex.split(SCHEME_ARGS[command.scheme])
     argv += ["--pe_array_size", command.unrolling]
     argv += shlex.split(command.extra)
@@ -303,183 +366,1029 @@ def outputs(dest, names):
     )
 
 
-def _run_one(label, dest, argv, env):
-    """Run one command in ``env``; capture combined output to
-    ``dest/run.log``.
+def parse_listing(text):
+    """Reads ``run_ci.py --list`` output: ``{label: argv}``."""
+    commands = {}
+    for line in text.splitlines():
+        argv = shlex.split(line)
+        dest = argv[argv.index("--model_output_dir") + 1]
+        commands[dest.removeprefix(RUN_DIR + "/")] = argv
+    return commands
 
-    Returns a status string: ``ok`` / ``error`` (nonzero exit) /
-    ``no_output`` (exited 0 but no model.txt) / ``numeric_drift`` (the
-    lowered graph's output left compile_model's tolerance) / ``unverified``
-    (the model ran no comparison despite --debug).  compile_model only warns
-    about the last two, so they have to be read back out of the log; neither
-    fails the run.
+
+def git(*args, env=None, check=True):
+    """Runs git in the repo and returns its stripped stdout."""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def describe(commit):
+    """``<short hash> <subject>`` of a commit."""
+    return git("log", "-1", "--format=%h %s", commit)
+
+
+def source_key(trees):
+    """The cache key of a source tree.
+
+    Args:
+        trees: ``git ls-tree`` lines naming git's id of each of ``SOURCES``
+            in the tree.
+
+    Returns:
+        A hex digest of them and of the Python, torch and transformers
+        versions the commands run with.
     """
+    versions = [
+        platform.python_version(),
+        metadata.version("torch"),
+        metadata.version("transformers"),
+    ]
+    text = "\n".join([trees, *versions])
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def commit_key(commit):
+    """The cache key of a commit's sources; a path it lacks is skipped."""
+    return source_key(git("ls-tree", commit, "--", *SOURCES))
+
+
+def checkout_key(scratch):
+    """The cache key of the checkout's sources as ``git add -A`` stages them.
+
+    The files are staged into a copy of the index whose new objects go to a
+    scratch object folder, so neither the real index nor the repository's
+    objects change.
+
+    Args:
+        scratch: A folder for the index copy and objects, emptied after.
+    """
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        objects = Path(tmp, "objects")
+        objects.mkdir()
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(Path(tmp, "index"))
+        env["GIT_OBJECT_DIRECTORY"] = str(objects)
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = str(
+            REPO_ROOT / git("rev-parse", "--git-path", "objects")
+        )
+        shutil.copy(REPO_ROOT / git("rev-parse", "--git-path", "index"), tmp)
+        present = [
+            p
+            for p in SOURCES
+            if (REPO_ROOT / p).exists() or git("ls-files", "--", p)
+        ]
+        git("add", "-A", "--", *present, env=env)
+        tree = git("write-tree", env=env)
+        return source_key(git("ls-tree", tree, "--", *SOURCES, env=env))
+
+
+@dataclass
+class Version:
+    """A source tree whose commands are compiled.
+
+    Attributes:
+        title: How the report names it: a short hash, or ``your code``.
+        key: Its sources' cache key.
+        commit: The commit it is, or ``None`` for your checkout.
+        root: Where its files are; set when one of its commands compiles.
+        commands: ``{label: argv}``, as its ``run_ci.py --list`` prints.
+        error: Why its commands could not be listed, if they could not.
+    """
+
+    title: str
+    key: str
+    commit: str | None
+    root: Path | None = None
+    commands: dict = field(default_factory=dict)
+    error: str = ""
+
+
+@dataclass
+class Build:
+    """One command compiled from one version.
+
+    Attributes:
+        status: ``ok``; ``error`` (it exited non-zero, or its version could
+            not list its commands); ``no_output`` (it wrote no
+            ``model.txt``); ``numeric_drift`` or ``unverified`` (its lowered
+            graph left compile_model's tolerance, or was not checked, as in a
+            commit whose commands list no ``--debug``); or ``absent`` (its
+            version has no such command).
+        dest: Its output folder, or ``None`` when it never ran.
+        report: The predicted ``total_latency``, ``dram_read`` and
+            ``dram_write``, or ``None`` when it printed none.
+    """
+
+    status: str
+    dest: Path | None = None
+    report: dict | None = None
+
+    @property
+    def broken(self):
+        """Whether it left nothing to compare."""
+        return self.status in BROKEN
+
+
+class Cache:
+    """Builds and command listings saved by source key."""
+
+    def __init__(self, folder):
+        self.folder = folder
+
+    def load(self, key, label, argv):
+        """The cached build of ``label`` under ``key``, or ``None``.
+
+        Args:
+            key: The version's source key.
+            label: The command's label.
+            argv: The command as the version lists it. A build whose
+                ``run.log`` shows it ran without the listed ``--debug`` is
+                not served.
+        """
+        dest = self.folder / key / label
+        if not (dest / "result.json").exists():
+            return None
+        with open(dest / "run.log") as log:
+            ran = shlex.split(log.readline().removeprefix("$ "))
+        if "--debug" in argv and "--debug" not in ran:
+            return None
+        result = json.loads((dest / "result.json").read_text())
+        return Build(result["status"], dest, result["report"])
+
+    def store(self, key, label, build):
+        """Moves a finished build into the cache and returns it there."""
+        dest = self.folder / key / label
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(build.dest, dest)
+        result = {"status": build.status, "report": build.report}
+        (dest / "result.json").write_text(json.dumps(result))
+        return Build(build.status, dest, build.report)
+
+    def listing(self, key, text=None):
+        """Reads, or with ``text`` saves, the command listing of ``key``."""
+        path = self.folder / key / "commands.txt"
+        if text is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        return path.read_text() if path.exists() else None
+
+
+class Worktrees:
+    """Git worktrees of commits under one folder.
+
+    Entering removes any worktree an earlier run left in the folder; leaving
+    removes this run's.
+    """
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.paths = {}
+
+    def __enter__(self):
+        if self.folder.exists():
+            for path in self.folder.iterdir():
+                git("worktree", "remove", "--force", str(path), check=False)
+                shutil.rmtree(path, ignore_errors=True)
+        git("worktree", "prune")
+        return self
+
+    def __exit__(self, *exc):
+        for path in self.paths.values():
+            git("worktree", "remove", "--force", str(path), check=False)
+        git("worktree", "prune", check=False)
+
+    def add(self, commit):
+        """Checks out ``commit`` (once) and returns its folder."""
+        if commit not in self.paths:
+            path = self.folder / commit[:12]
+            git("worktree", "add", "--detach", "--quiet", str(path), commit)
+            self.paths[commit] = path
+        return self.paths[commit]
+
+
+@contextmanager
+def locked(folder):
+    """Holds ``folder``'s lock, so no two runs share it."""
+    handle = open(folder / ".lock", "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise SystemExit(f"another run_ci.py is using {folder}")
+    try:
+        yield
+    finally:
+        handle.close()
+
+
+class Compiles:
+    """The compiles a run starts, so that a stopped run can end them.
+
+    Each compile runs in a session of its own, so its process group holds it
+    and whatever it starts. A group is signalled only while its leader is
+    unreaped, so its id cannot have passed to another process.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = set()
+        self.stopping = False
+
+    def run(self, argv, **kwargs):
+        """Runs a compile to its end.
+
+        Args:
+            argv: The command.
+            **kwargs: Passed to ``subprocess.Popen``.
+
+        Returns:
+            Its exit code, or ``-SIGTERM`` when the run is stopping, in which
+            case it is not started.
+        """
+        with self.lock:
+            if self.stopping:
+                return -signal.SIGTERM
+            proc = subprocess.Popen(argv, start_new_session=True, **kwargs)
+            self.running.add(proc.pid)
+        # Wait without reaping: the group id stays this run's until it
+        # leaves ``running``.
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        with self.lock:
+            if self.stopping:
+                # End anything it started and left running.
+                kill_group(proc.pid, signal.SIGKILL)
+            self.running.discard(proc.pid)
+        return proc.wait()
+
+    def stop(self, grace=10):
+        """Ends the running compiles, waits for them, and starts no more.
+
+        Args:
+            grace: Seconds a compile has to exit on SIGTERM before SIGKILL.
+        """
+        for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
+            with self.lock:
+                self.stopping = True
+                for pid in self.running:
+                    kill_group(pid, sig)
+            deadline = time.time() + wait if wait else float("inf")
+            while self.running and time.time() < deadline:
+                time.sleep(0.1)
+
+
+def kill_group(pid, sig):
+    """Sends ``sig`` to the process group led by ``pid``, if it remains."""
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+COMPILES = Compiles()
+
+
+def stop_on_signal(signum, frame):
+    """Stops the run, leaving later stop signals no effect.
+
+    Later signals reach a handler that does nothing, so the cleanup, which
+    ends the compiles before the worktrees go, runs whole. A handler, unlike
+    ``SIG_IGN``, is not inherited by a compile started meanwhile, so that
+    compile still ends on SIGTERM.
+
+    Args:
+        signum: The signal received.
+        frame: Unused; the signal handler's signature requires it.
+    """
+    for sig in STOP_SIGNALS:
+        if signal.getsignal(sig) is stop_on_signal:
+            signal.signal(sig, lambda *_: None)
+    # Not print(): the handler may interrupt a print to the same stream.
+    name = signal.Signals(signum).name
+    os.write(sys.stderr.fileno(), f"\nstopped by {name}\n".encode())
+    raise SystemExit(128 + signum)
+
+
+def tree_env(root, threads):
+    """The environment a version's commands run in."""
+    env = dict(os.environ)
+    paths = [str(root / "src"), env.get("PYTHONPATH", "")]
+    env["PYTHONPATH"] = os.pathsep.join(p for p in paths if p)
+    if threads is not None:
+        for var in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+        ):
+            env[var] = str(threads)
+    return env
+
+
+def list_commands(version, cache, trees):
+    """Fills in a commit's commands, from the cache or its own ``--list``.
+
+    Args:
+        version: The commit's ``Version``; its worktree is made if needed.
+        cache: The ``Cache``.
+        trees: The ``Worktrees``.
+    """
+    text = cache.listing(version.key)
+    if text is None:
+        version.root = trees.add(version.commit)
+        proc = subprocess.run(
+            [sys.executable, "test/run_ci.py", "--list"],
+            cwd=version.root,
+            env=tree_env(version.root, None),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            version.error = f"its run_ci.py --list failed:\n{proc.stderr}"
+            return
+        text = cache.listing(version.key, proc.stdout)
+    version.commands = parse_listing(text)
+
+
+def compile_one(version, label, dest, threads):
+    """Runs a version's command into ``dest``.
+
+    Args:
+        version: The ``Version``; its ``root`` is set.
+        label: The command's label.
+        dest: The output folder.
+        threads: CPU threads the command may use, or ``None``.
+
+    Returns:
+        The ``Build``.
+    """
+    root = version.root
+    codegen = root / "scripts" / "compile_model.py"
+    if not codegen.exists():
+        codegen = root / "test" / "test_codegen.py"
+    argv = list(version.commands[label])
+    argv[:2] = [sys.executable, str(codegen)]
+    argv[argv.index("--model_output_dir") + 1] = str(dest)
+    prints_report = "total_latency=" in codegen.read_text()
+    if prints_report and "--training" not in argv:
+        argv.append("--report")
+
     dest.mkdir(parents=True, exist_ok=True)
     log_path = dest / "run.log"
     with open(log_path, "w") as log:
-        log.write("$ " + " ".join(shlex.quote(a) for a in argv) + "\n\n")
+        log.write(f"$ {shlex.join(argv)}\n\n")
         log.flush()
-        proc = subprocess.run(
+        code = COMPILES.run(
             argv,
-            cwd=str(REPO_ROOT),
-            env=env,
+            cwd=root,
+            env=tree_env(root, threads),
             stdout=log,
             stderr=subprocess.STDOUT,
         )
-
-    if proc.returncode != 0:
-        return "error"
-    if not outputs(dest, OUTPUTS):
-        return "no_output"
     log = log_path.read_text()
-    if "Skipping output verification" in log:
-        return "unverified"
-    if "Results match" not in log:
-        return "numeric_drift"
-    return "ok"
+    found = REPORT_LINE.search(log)
+    report = found.groupdict() if found else None
+    if code != 0:
+        status = "error"
+    elif not outputs(dest, ("model.txt",)):
+        status = "no_output"
+    elif "Skipping output verification" in log:
+        status = "unverified"
+    elif "Results match" not in log:
+        status = "numeric_drift"
+    else:
+        status = "ok"
+    return Build(status, dest, report)
 
 
-def _find_previous_run(out_dir, current):
-    """Newest timestamp dir under ``out_dir`` that isn't ``current``."""
-    runs = sorted(
-        p.name
-        for p in out_dir.iterdir()
-        if p.is_dir() and TS_RE.match(p.name) and p.name != current
-    )
-    return out_dir / runs[-1] if runs else None
+def build_all(requests, cache, trees, staging, args):
+    """Compiles the requested builds that are not cached.
 
-
-def compare(label, failed, run_dir, prev_run, names):
-    """Classifies one label's output files against the previous run's.
+    A key and label requested by several versions compile once, by a commit
+    when one asks: a commit's builds are cached as they finish, while your
+    code's stay in ``staging`` for the caller to cache.
 
     Args:
-        label: The command's label, its folder under each run.
-        failed: The command wrote no outputs to compare.
-        run_dir: This run's folder.
-        prev_run: The previous run's folder, or ``None``.
-        names: The names of the files compared (``outputs``).
+        requests: ``(version, label, fresh)`` triples; ``fresh`` skips the
+            cache.
+        cache: The ``Cache``.
+        trees: The ``Worktrees``.
+        staging: The folder builds are made in.
+        args: The parsed command line (``jobs``, ``threads``).
 
     Returns:
-        ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only for
-        a MISMATCH.
+        ``{(version title, label): Build}`` and the number compiled.
     """
-    if failed:
-        return "FAILED", ""
-    previous = (
-        set() if prev_run is None else set(outputs(prev_run / label, names))
-    )
-    if not previous:
-        return "NEW", ""
+    builds = {}
+    todo = {}
+    for version, label, fresh in requests:
+        if version.error:
+            builds[version.title, label] = Build("error")
+            continue
+        if label not in version.commands:
+            builds[version.title, label] = Build("absent")
+            continue
+        argv = version.commands[label]
+        cached = None if fresh else cache.load(version.key, label, argv)
+        if cached:
+            builds[version.title, label] = cached
+        else:
+            todo.setdefault((version.key, label, fresh), []).append(version)
+    for versions in todo.values():
+        versions.sort(key=lambda v: v.commit is None)
+        if versions[0].root is None:
+            versions[0].root = trees.add(versions[0].commit)
 
-    programs = set(outputs(run_dir / label, names))
-    diff = [
-        f"only in {run.name}/{label}: {program}"
-        for run, only in (
-            (prev_run, previous - programs),
-            (run_dir, programs - previous),
+    def run(item):
+        (key, label, fresh), versions = item
+        maker = versions[0]
+        dest = staging / maker.title.replace(" ", "_") / label
+        build = compile_one(maker, label, dest, args.threads)
+        if maker.commit is not None and not fresh and not build.broken:
+            build = cache.store(key, label, build)
+        return build
+
+    started = time.time()
+    pool = ThreadPoolExecutor(args.jobs)
+    try:
+        futures = {pool.submit(run, item): item for item in todo.items()}
+        for done, future in enumerate(as_completed(futures), 1):
+            (_, label, _), versions = futures[future]
+            build = future.result()
+            for version in versions:
+                builds[version.title, label] = build
+            names = ", ".join(v.title for v in versions)
+            print(
+                f"[{done}/{len(todo)}] {names}: {label} ... {build.status} "
+                f"({time.time() - started:.0f} s)",
+                flush=True,
+            )
+    except BaseException:
+        # Stopped or crashed: end the running compiles, which the pool
+        # would otherwise wait out.
+        COMPILES.stop()
+        raise
+    finally:
+        pool.shutdown(cancel_futures=True)
+    return builds, len(todo)
+
+
+@dataclass
+class Delta:
+    """How one build of a config differs from another.
+
+    Attributes:
+        old: The earlier build.
+        new: The later build.
+        equal: Whether they compare equal: the same numeric verdict, the
+            same printed outputs when both failed the check, the same
+            programs, each with equal cleaned text and addresses, and the
+            same predicted cost when the old build printed one (the new one
+            must too).
+        note: What changed when a side has nothing to compare.
+        numerics: ``<old status> -> <new status>`` when the numeric verdict
+            changed, else ``""``.
+        outputs_changed: Whether both failed the numeric check and their
+            logs print different numbers for the outputs.
+        programs: ``{program: canon_model.Comparison}`` for each program
+            both wrote.
+        only: The programs one build wrote and the other did not.
+        diff: The unified diff of the cleaned texts, uncut.
+    """
+
+    old: Build
+    new: Build
+    equal: bool = True
+    note: str = ""
+    numerics: str = ""
+    outputs_changed: bool = False
+    programs: dict = field(default_factory=dict)
+    only: list = field(default_factory=list)
+    diff: list = field(default_factory=list)
+
+
+def delta(old, new):
+    """Compares two builds of one config (see ``Delta``)."""
+    if "absent" in (old.status, new.status):
+        if old.status == new.status:
+            return Delta(old, new)
+        note = "added" if old.status == "absent" else "removed"
+        return Delta(old, new, False, note)
+    if old.broken or new.broken:
+        if old.broken and new.broken:
+            return Delta(old, new, True, "still fails to compile")
+        note = "compiles again" if old.broken else "fails to compile"
+        return Delta(old, new, False, note)
+
+    result = Delta(old, new)
+    if old.status != new.status:
+        result.numerics = f"{old.status} -> {new.status}"
+    elif old.status == "numeric_drift":
+        old_out, new_out = (
+            NUMBER.findall(
+                (b.dest / "run.log").read_text().partition(FAILED_CHECK)[2]
+            )
+            for b in (old, new)
         )
-        for program in sorted(only)
-    ]
-    for program in sorted(programs & previous):
-        diff += difflib.unified_diff(
-            (prev_run / label / program).read_text().splitlines(),
-            (run_dir / label / program).read_text().splitlines(),
-            fromfile=f"{prev_run.name}/{label}/{program}",
-            tofile=f"{run_dir.name}/{label}/{program}",
+        result.outputs_changed = old_out != new_out
+    olds = outputs(old.dest, ("model.txt",))
+    news = outputs(new.dest, ("model.txt",))
+    result.only = sorted(map(str, set(olds) ^ set(news)))
+    for program in sorted(set(olds) & set(news)):
+        before = canon_model.canonicalize((old.dest / program).read_text())
+        after = canon_model.canonicalize(
+            (new.dest / program).read_text(), before
+        )
+        result.programs[str(program)] = canon_model.compare(before, after)
+        result.diff += difflib.unified_diff(
+            before.text.splitlines(),
+            after.text.splitlines(),
+            f"old/{program}",
+            f"new/{program}",
             lineterm="",
         )
-    if not diff:
-        return "MATCH", ""
-    return "MISMATCH", "\n".join(diff[:DIFF_EXCERPT_LINES])
+    result.equal = (
+        not result.numerics
+        and not result.outputs_changed
+        and (old.report is None or old.report == new.report)
+        and not result.only
+        and all(c.equal for c in result.programs.values())
+    )
+    return result
 
 
-def open_run(output_dir, title, names):
-    """Makes this run's timestamped folder and prints what it compares.
+LOST_COST = "no predicted cost, though the old build printed one"
+
+
+def lost_cost(change):
+    """Whether a ``Delta``'s new build compiled but lost the old one's cost."""
+    return (
+        bool(change.old.report)
+        and not change.new.report
+        and not change.new.broken
+    )
+
+
+def verdict(change):
+    """The verdict on a config's ``Delta`` from the baseline to your code."""
+    if change.new.status == "absent":
+        return "MISSING"
+    if change.new.broken:
+        return "FAILED"
+    if change.old.status == "absent":
+        return "NEW"
+    return "MATCH" if change.equal else "MISMATCH"
+
+
+def cost(old, new):
+    """The predicted cost of two builds, old -> new, or ``""``."""
+    if not (old.report and new.report):
+        return ""
+    parts = []
+    for key, unit in (
+        ("total_latency", "cycles"),
+        ("dram_read", "B"),
+        ("dram_write", "B"),
+    ):
+        a, b = old.report[key], new.report[key]
+        x, y = float(a), float(b)
+        change = f" ({(y - x) / x:+.2%})" if x and x != y else ""
+        parts.append(f"{key} {a} -> {b} {unit}{change}")
+    return "; ".join(parts)
+
+
+def explain(change):
+    """Report lines for a ``Delta`` that is not equal."""
+    lines = [change.note] if change.note else []
+    if change.numerics:
+        lines.append(f"numeric verdict: {change.numerics}")
+    if change.outputs_changed:
+        lines.append("printed outputs differ (both failed the numeric check)")
+    if lost_cost(change):
+        lines.append(LOST_COST)
+    if change.only:
+        lines.append(f"programs in one build only: {', '.join(change.only)}")
+    if change.programs:
+        edits = sum(
+            1
+            for line in change.diff
+            if line[:1] in "+-" and line[:3] not in ("+++", "---")
+        )
+        lines.append(f"model.txt: {edits} cleaned lines changed")
+    for program, result in change.programs.items():
+        prefix = "" if len(change.programs) == 1 else f"{program}: "
+        lines += [prefix + line for line in canon_model.summary(result)]
+    if cost(change.old, change.new):
+        lines.append(f"predicted: {cost(change.old, change.new)}")
+    return lines
+
+
+@dataclass
+class Step:
+    """One version of the attribution walk, compared with the one before.
+
+    Attributes:
+        version: A local commit, or your code for its uncommitted edits.
+        title: How the change log names it.
+        against: The title of the version it is compared with.
+        shared: Its sources match that version's, so it shares its builds.
+        changes: ``{label: Delta}`` for each traced config it changed.
+        failed: The traced configs it failed to build.
+        builds: ``{label: Build}`` for each traced config, unless shared.
+    """
+
+    version: Version
+    title: str
+    against: str = ""
+    shared: bool = False
+    changes: dict = field(default_factory=dict)
+    failed: list = field(default_factory=list)
+    builds: dict = field(default_factory=dict)
+
+
+def attribute(base, yours, commits, traced, cache, trees, run_dir, args):
+    """Finds the commit, or the uncommitted edits, that changed each config.
 
     Args:
-        output_dir: The folder holding every run (created if missing).
-        title: The CI's name, printed first.
-        names: The names of the files compared (``outputs``).
+        base: The baseline's ``Version``.
+        yours: Your code's ``Version``.
+        commits: The local commits, oldest first; the first one's parent is
+            the baseline and each other's the one before it.
+        traced: ``{label: (baseline build, your build)}`` for each config
+            that differs end to end.
+        cache: The ``Cache``.
+        trees: The ``Worktrees``.
+        run_dir: This run's folder.
+        args: The parsed command line.
 
     Returns:
-        ``(run_dir, prev_run)``: this run's folder and the newest earlier
-        run's, or ``None`` when there is none.
+        The ``Step`` list, oldest first, and the number of builds compiled.
     """
-    out_dir = Path(output_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    steps = []
+    for commit in commits:
+        version = Version(git("rev-parse", "--short", commit), "", commit)
+        version.key = commit_key(commit)
+        steps.append(Step(version, describe(commit)))
+    if yours.key != (steps[-1].version if steps else base).key:
+        steps.append(Step(yours, "your uncommitted edits"))
 
-    timestamp = datetime.now().strftime(TS_FORMAT)
-    run_dir = out_dir / timestamp
+    requests = []
+    previous = base
+    for step in steps:
+        step.against = previous.title
+        step.shared = step.version.key == previous.key
+        if not step.shared and step.version is not yours:
+            list_commands(step.version, cache, trees)
+            requests += [(step.version, label, False) for label in traced]
+        previous = step.version
+    builds, compiled = build_all(
+        requests, cache, trees, run_dir / "build", args
+    )
+
+    for label, (reference, end) in traced.items():
+        good = None if reference.broken else reference
+        good_title = base.title
+        for step in (s for s in steps if not s.shared):
+            title = step.version.title
+            build = end if step.version is yours else builds[title, label]
+            step.builds[label] = build
+            change = delta(reference, build)
+            if build.broken:
+                step.failed.append(label)
+            if reference.broken and not build.broken and good is not None:
+                # Compiles again: say whether it matches the last good build.
+                change = delta(good, build)
+                change.note = (
+                    "compiles again, "
+                    + ("same as" if change.equal else "differs from")
+                    + f" the last good build ({good_title})"
+                )
+                change.equal = False
+            if not change.equal:
+                step.changes[label] = change
+                folder = run_dir / "commits" / title.replace(" ", "_")
+                path = folder / f"{label}.diff"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("\n".join(change.diff) + "\n")
+            reference = build
+            if not build.broken:
+                good, good_title = build, title
+    return steps, compiled
+
+
+def changelog(steps, base, traced, skipped):
+    """Drafts the change-log entries of the steps, newest first."""
+    lines = [
+        f"<!-- Drafted by test/run_ci.py against {base.title}. Only the "
+        "configs that differ from the baseline to your code are traced per "
+        "commit. Write each why by hand. -->",
+        "",
+    ]
+    if skipped:
+        lines += [f"Attribution skipped: {skipped}", ""]
+    elif not traced:
+        lines += ["No config differs from the baseline.", ""]
+    for step in reversed(steps):
+        commit = step.version.commit
+        if commit:
+            date = git("log", "-1", "--format=%ad", "--date=short", commit)
+            lines += [f"## {step.title} ({date})", ""]
+        else:
+            lines += [f"## {step.title} (on {step.against})", ""]
+        changed = [
+            f"{label} ({c.note})" if c.note else label
+            for label, c in sorted(step.changes.items())
+            if (
+                c.note
+                or c.only
+                or not all(p.equal for p in c.programs.values())
+            )
+        ]
+        if step.shared:
+            lines.append("- model.txt: no compiled source changed.")
+        elif changed:
+            lines.append(
+                f"- model.txt: changed in {', '.join(changed)} "
+                f"(vs {step.against})."
+            )
+            lines.append("  Why: (write by hand)")
+        else:
+            lines.append("- model.txt: unchanged in the traced configs.")
+        costs = [
+            f"{label} {cost(c.old, c.new)}"
+            for label, c in step.changes.items()
+            if cost(c.old, c.new) and c.old.report != c.new.report
+        ]
+        costs += [
+            f"{label} {LOST_COST}"
+            for label, c in sorted(step.changes.items())
+            if lost_cost(c)
+        ]
+        if costs:
+            others = "; others unchanged" if len(costs) < len(traced) else ""
+            lines.append(f"- Predicted latency: {'; '.join(costs)}{others}.")
+        else:
+            lines.append("- Predicted latency: unchanged.")
+        numerics = [
+            f"{label} {c.numerics}"
+            for label, c in sorted(step.changes.items())
+            if c.numerics
+        ]
+        if numerics:
+            lines.append(f"- Numeric verdict: {'; '.join(numerics)}.")
+        if step.failed:
+            lines.append(f"- Failed to build: {', '.join(step.failed)}.")
+        lines += ["- Measured: none.", ""]
+    return "\n".join(lines)
+
+
+def config_lines(changes, verdicts, base, steps):
+    """The report's lines on each config and on the attribution builds.
+
+    Args:
+        changes: ``{label: Delta}``, baseline to your code.
+        verdicts: ``{label: verdict}``.
+        base: The baseline's ``Version``.
+        steps: The attribution ``Step`` list.
+
+    Returns:
+        The lines, one config after another.
+    """
+    lines = []
+    for label in changes:
+        change = changes[label]
+        lines.append(f"{verdicts[label]:<9} {label}")
+        # Each build of it, as (verdict name, log name, build): the
+        # baseline's, each attribution build's, and your code's.
+        statuses = [(base.title, "baseline", change.old)]
+        statuses += [
+            (s.version.title, s.version.title, s.builds[label])
+            for s in steps
+            if label in s.builds and s.version.commit is not None
+        ]
+        statuses.append(("your code", "your", change.new))
+        lines.append(
+            "    numerics: "
+            + "; ".join(f"{title} {b.status}" for title, _, b in statuses)
+        )
+        if not change.equal:
+            lines += [f"    {line}" for line in explain(change)]
+            causes = [s.title for s in steps if label in s.changes]
+            if causes:
+                lines.append(f"    caused by: {'; '.join(causes)}")
+            if change.diff:
+                lines.append(f"    diff: {label}/model.diff")
+        elif cost(change.old, change.new):
+            lines.append(f"    predicted: {cost(change.old, change.new)}")
+        # The log of each build whose check did not pass.
+        for _, name, b in statuses:
+            if b.status in ("ok", "absent"):
+                continue
+            log = f"; see {b.dest / 'run.log'}" if b.dest else ""
+            lines.append(f"    {name} build: {b.status}{log}")
+    for step in steps:
+        for label in step.failed:
+            lines.append(
+                f"attribution: {step.version.title} failed to build {label}"
+            )
+        if step.version.error:
+            lines.append(
+                f"attribution: {step.version.title}: {step.version.error}"
+            )
+    return lines
+
+
+def run(args, out, commands, trees):
+    """Compiles, compares and reports; returns the exit code."""
+    run_dir = out / datetime.now().strftime(TS_FORMAT)
     run_dir.mkdir()
-
-    prev_run = _find_previous_run(out_dir, timestamp)
-
-    print(f"{title} -> {run_dir}")
-    if prev_run is not None:
-        compared = ", ".join(names)
-        print(f"comparing {compared} against previous run: {prev_run.name}")
+    cache = Cache(out / "cache")
+    head = git("rev-parse", "HEAD")
+    if args.base:
+        base_commit = git("rev-parse", "--verify", f"{args.base}^{{commit}}")
+        origin = f"--base {args.base}"
     else:
-        print("no previous run found; this run is the baseline")
-    return run_dir, prev_run
+        base_commit = git("merge-base", "HEAD", "origin/main")
+        origin = "merge-base of HEAD and origin/main"
+    base = Version(
+        git("rev-parse", "--short", base_commit),
+        commit_key(base_commit),
+        base_commit,
+    )
+    yours = Version("your code", checkout_key(out), None, REPO_ROOT)
+    for command in commands:
+        label, _, argv = _build(command, Path(RUN_DIR))
+        yours.commands[label] = argv
+    dirty = yours.key != commit_key(head)
 
+    lines = [
+        f"voyager codegen CI  ({run_dir.name})",
+        f"baseline:  {describe(base_commit)}  ({origin})",
+        f"your code: {describe(head)}"
+        + ("  + uncommitted edits to the sources" if dirty else ""),
+    ]
+    print("\n".join(lines) + f"\n-> {run_dir}\n", flush=True)
 
-def run_all(items, run, jobs):
-    """Runs ``run`` on each of ``items``, ``jobs`` at a time.
+    list_commands(base, cache, trees)
+    unlisted = base.error
+    if unlisted:
+        lines.append(f"baseline {base.title}: {unlisted.rstrip()}")
+        lines.append("every config is compared as NEW")
+        # Cleared so that its builds count as absent (NEW), not failed.
+        base.error = ""
+    labels = list(yours.commands) + [
+        label
+        for label in base.commands
+        if label not in yours.commands
+        and (not args.only or any(matches(label, p) for p in args.only))
+    ]
+    requests = [(base, label, False) for label in labels]
+    requests += [(yours, label, args.fresh) for label in labels]
+    builds, compiled = build_all(
+        requests, cache, trees, run_dir / "build", args
+    )
 
-    Prints each item's verdict as it lands.
+    steady = checkout_key(out) == yours.key
+    for label in labels:
+        build = builds[yours.title, label]
+        staged = build.dest is not None and run_dir in build.dest.parents
+        if steady and not args.fresh and staged and not build.broken:
+            builds[yours.title, label] = cache.store(yours.key, label, build)
 
-    Args:
-        items: What is run, e.g. the commands.
-        run: Runs one item and returns its ``(label, status, verdict,
-            excerpt)``.
-        jobs: How many run at once.
+    changes = {}
+    verdicts = {}
+    for label in labels:
+        change = delta(builds[base.title, label], builds[yours.title, label])
+        changes[label] = change
+        verdicts[label] = verdict(change)
+        if change.diff:
+            (run_dir / label).mkdir(parents=True, exist_ok=True)
+            diff = "\n".join(change.diff) + "\n"
+            (run_dir / label / "model.diff").write_text(diff)
 
-    Returns:
-        Each item's ``run`` result, in the order of ``items``.
-    """
-    print(f"running {len(items)} commands, {jobs} at a time\n")
-    results = [None] * len(items)
-    with ThreadPoolExecutor(jobs) as pool:
-        futures = {pool.submit(run, c): i for i, c in enumerate(items)}
-        for done, future in enumerate(as_completed(futures), 1):
-            label, status, verdict, excerpt = future.result()
-            results[futures[future]] = (label, status, verdict, excerpt)
-            suffix = "" if status == "ok" else f" ({status})"
-            print(f"[{done}/{len(items)}] {label} ... {verdict}{suffix}")
-            sys.stdout.flush()
-    return results
+    traced = {
+        label: (change.old, change.new)
+        for label, change in changes.items()
+        if not change.equal
+    }
+    steps = []
+    skipped = ""
+    if traced:
+        commits = git(
+            "rev-list", "--reverse", "--first-parent", f"{base_commit}..{head}"
+        ).split()
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_commit, head],
+            cwd=REPO_ROOT,
+        )
+        if unlisted:
+            skipped = f"the baseline {base.title} could not list its commands"
+        elif ancestor.returncode:
+            skipped = f"the baseline {base.title} is not an ancestor of HEAD"
+        elif commits and git("rev-parse", f"{commits[0]}^") != base_commit:
+            skipped = (
+                f"the first local commit {commits[0][:7]} does not have the "
+                f"baseline {base.title} as its parent (a merge brought the "
+                "baseline in)"
+            )
+        else:
+            steps, more = attribute(
+                base, yours, commits, traced, cache, trees, run_dir, args
+            )
+            compiled += more
+    (run_dir / "changelog_draft.md").write_text(
+        changelog(steps, base, traced, skipped)
+    )
+
+    counts = {v: list(verdicts.values()).count(v) for v in VERDICTS}
+    lines += [
+        f"builds:    {compiled} compiled; the rest came from the cache"
+        + ("; your code was built fresh" if args.fresh else ""),
+        "totals:    " + "  ".join(f"{v}={n}" for v, n in counts.items() if n),
+    ]
+    tallies = []
+    for title, statuses in (
+        (base.title, [c.old.status for c in changes.values()]),
+        ("your code", [c.new.status for c in changes.values()]),
+    ):
+        tally = " ".join(
+            f"{s}={statuses.count(s)}" for s in sorted(set(statuses))
+        )
+        tallies.append(f"{title} {tally}")
+    lines.append("numerics:  " + "; ".join(tallies))
+    if not steady:
+        lines.append(
+            "your sources changed during the run: their builds were not "
+            "cached"
+        )
+    if skipped:
+        lines.append(f"attribution skipped: {skipped}")
+    lines.append("")
+    lines += config_lines(changes, verdicts, base, steps)
+    failed = counts["FAILED"]
+    lines += [
+        "",
+        f"RESULT: FAIL ({failed} FAILED)" if failed else "RESULT: PASS",
+    ]
+    report = "\n".join(lines) + "\n"
+    (run_dir / "report.txt").write_text(report)
+    print("\n" + report)
+    return 1 if failed else 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument(
         "output_dir",
         nargs="?",
-        help="Location for dated CI artifacts (created if missing).",
+        help="Folder for runs, the build cache and worktrees (created if "
+        "missing); one run uses it at a time.",
     )
     parser.add_argument(
         "--only",
         action="append",
         metavar="SUBSTR",
         help="Run only commands whose <network>/<scheme>/<unrolling> label "
-        "contains SUBSTR (case-insensitive; repeatable).",
+        "SUBSTR selects (see matches(); repeatable).",
     )
     parser.add_argument(
         "--list",
         action="store_true",
-        help="List command labels and exit.",
+        help="Print each command's argv, one per line, and exit.",
     )
     parser.add_argument(
         "--jobs",
         type=int,
         default=1,
-        help="Commands to run at once.",
+        help="Commands to compile at once.",
     )
     parser.add_argument(
         "--threads",
         type=int,
         help="CPU threads each command may use (OMP / MKL / OpenBLAS); "
         "unset leaves each command its default.",
+    )
+    parser.add_argument(
+        "--base",
+        help="The commit to compare with (default: git merge-base HEAD "
+        "origin/main).",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Rebuild your code without the cache; with --base HEAD on a "
+        "clean tree, checks that a compile repeats.",
     )
     args = parser.parse_args()
 
@@ -491,8 +1400,8 @@ def main():
 
     if args.list:
         for command in commands:
-            _, _, argv = _build(command, Path("<run_dir>"))
-            print(" ".join(shlex.quote(a) for a in argv))
+            _, _, argv = _build(command, Path(RUN_DIR))
+            print(shlex.join(argv))
         return 0
 
     if not args.output_dir:
@@ -500,105 +1409,15 @@ def main():
     if not commands:
         parser.error(f"--only {args.only} matched no commands")
 
-    run_dir, prev_run = open_run(args.output_dir, TITLE, OUTPUTS)
-
-    env = dict(os.environ)
-    if args.threads is not None:
-        for var in (
-            "OMP_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-        ):
-            env[var] = str(args.threads)
-
-    def run(command):
-        label, dest, argv = _build(command, run_dir)
-        status = _run_one(label, dest, argv, env)
-        failed = status in ("error", "no_output")
-        verdict, excerpt = compare(label, failed, run_dir, prev_run, OUTPUTS)
-        return label, status, verdict, excerpt
-
-    # (label, status, verdict, diff_excerpt), in command order.
-    results = run_all(commands, run, args.jobs)
-
-    report = build_report(results, run_dir, prev_run, TITLE)
-    (run_dir / "report.txt").write_text(report)
-    print("\n" + report)
-
-    # Gate: fail on any compile failure or model.txt mismatch.
-    return 1 if any(r[2] in GATED for r in results) else 0
-
-
-def build_report(results, run_dir, prev_run, title):
-    """Renders the summary written to ``report.txt`` and stdout.
-
-    A label in the previous run that is absent from ``results`` is reported
-    MISSING; it is found as the first three path segments of a ``model.txt``
-    there, so every label must be three segments and write one.
-
-    Args:
-        results: Each command's ``(label, status, verdict, excerpt)``.
-        run_dir: This run's folder.
-        prev_run: The previous run's folder, or ``None``.
-        title: The CI's name, heading the report.
-
-    Returns:
-        The report's text, ending in ``RESULT: PASS`` or ``RESULT: FAIL``.
-    """
-    counts = {}
-    for _, _, verdict, _ in results:
-        counts[verdict] = counts.get(verdict, 0) + 1
-
-    lines = []
-    lines.append("=" * 70)
-    lines.append(f"{title} report  ({run_dir.name})")
-    if prev_run is not None:
-        lines.append(f"compared against: {prev_run.name}")
-    else:
-        lines.append("compared against: (none - baseline run)")
-    lines.append("=" * 70)
-
-    order = ["MATCH", "NEW", "MISMATCH", "FAILED", "MISSING"]
-    summary = "  ".join(f"{v}={counts[v]}" for v in order if v in counts)
-    lines.append(f"totals: {summary}")
-    lines.append("")
-
-    # Detail any non-clean verdicts.
-    for label, status, verdict, excerpt in results:
-        if verdict in ("MATCH", "NEW"):
-            continue
-        detail = f"  - {verdict}: {label}"
-        if status != "ok":
-            detail += f" [{status}; see {label}/run.log]"
-        lines.append(detail)
-        if excerpt:
-            for dl in excerpt.splitlines():
-                lines.append(f"      {dl}")
-
-    # Numeric warnings: reported, never gated.
-    warned = [r for r in results if r[1] in ("numeric_drift", "unverified")]
-    if warned:
-        lines.append("")
-        lines.append("numeric warnings (not gated):")
-        for label, status, _, _ in warned:
-            lines.append(f"  - {status}: {label} [see {label}/run.log]")
-
-    # Labels present in the previous run but absent now.
-    if prev_run is not None:
-        current_labels = {r[0] for r in results}
-        # A label is the first three path segments; training nests its
-        # programs' model.txt one level further down.
-        previous = {
-            "/".join(p.relative_to(prev_run).parts[:3])
-            for p in prev_run.rglob("model.txt")
-        }
-        for label in sorted(previous - current_labels):
-            lines.append(f"  - MISSING: {label} (in {prev_run.name})")
-
-    bad = any(r[2] in GATED for r in results)
-    lines.append("")
-    lines.append("RESULT: FAIL" if bad else "RESULT: PASS")
-    return "\n".join(lines)
+    # Exit through the cleanup below when the run is stopped. A signal
+    # already ignored, as nohup ignores SIGHUP, stays ignored.
+    for sig in STOP_SIGNALS:
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, stop_on_signal)
+    out = Path(args.output_dir).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    with locked(out), Worktrees(out / "worktrees") as trees:
+        return run(args, out, commands, trees)
 
 
 if __name__ == "__main__":
