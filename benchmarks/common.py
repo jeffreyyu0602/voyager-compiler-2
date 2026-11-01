@@ -80,7 +80,6 @@ from transformers.integrations.executorch import (
 import voyager_compiler  # noqa: F401  registers voyager.*
 from voyager_compiler import (
     OpMatcher,
-    QScheme,
     QuantizationSpec,
     convert_pt2e,
     export_model,
@@ -113,7 +112,7 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
 from voyager_compiler.hardware_config import AcceleratorConfig
 from voyager_compiler.quantization.fake_quantize import (
     FakeQuantizeBase,
-    FusedAmaxObsFakeQuantize,
+    MXFakeQuantize,
 )
 from voyager_compiler.shape_prop import ShapeProp, fake_like
 
@@ -784,17 +783,6 @@ def _annotate_attention_mask(gm) -> int:
     return len(masks)
 
 
-def _stateless(fq) -> bool:
-    """A fake-quant module that records nothing in a calibration pass:
-    microscaling computes its block scales per call."""
-    return (
-        isinstance(fq, FusedAmaxObsFakeQuantize)
-        and fq.qscheme == QScheme.MICROSCALING
-        and fq.outlier_pct is None
-        and not fq.record_histogram
-    )
-
-
 def _calibrate(gm, example_args, example_kwargs, mask_dtype):
     """Run the two calibration passes.  The mask's per-tensor observer is fed
     the two values the constant mask holds, ``0`` and ``mask_dtype``'s
@@ -808,7 +796,10 @@ def _calibrate(gm, example_args, example_kwargs, mask_dtype):
         if node.op != "call_module":
             continue
         fq = modules[node.target]
-        if not isinstance(fq, FakeQuantizeBase) or _stateless(fq):
+        if not isinstance(fq, FakeQuantizeBase):
+            continue
+        # Microscaling computes its block scales per call: nothing to record.
+        if isinstance(fq, MXFakeQuantize) and fq.outlier_pct is None:
             continue
         if node.args[0].target is torch.ops.aten.where.ScalarOther:
             edge = torch.tensor([0.0, torch.finfo(mask_dtype).min])
