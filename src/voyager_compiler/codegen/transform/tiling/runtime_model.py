@@ -52,15 +52,19 @@ class Placement:
     """Where a tiling's buffers go on chip.
 
     Attributes:
-        groups: The bank groups, each a frozenset of the :class:`Role`,
-            :class:`Fused` and :class:`KernelInput` members sharing its banks;
-            ``None`` when the model imposes no grouping.
+        groups: The bank groups, each a collection of the :class:`Role`,
+            :class:`Fused` and :class:`KernelInput` members sharing its banks
+            (a GEMM's in the order the planner lays them out); ``None`` when
+            the model imposes no grouping.
         scratch_slots: The regions the reduction scratch is allocated with.
         tier: How much extra bank sharing the tiling needed to fit, 0 for
             none; the grid search keeps the lowest.
         scratch: The regions the kernel keeps beside the op's tiles that no
             FX node names (``OpModel.scratch``), which its builder allocates
             as placed and hands the op by name (``with_scratch``).
+        member_bytes: ``(member, bytes)`` of one ping-pong slot of each group
+            member, which with the groups' order says which banks it covers;
+            empty when the model does not size them.
 
     A backend whose memory has levels the shared code does not know
     subclasses it to place buffers there too.
@@ -70,6 +74,7 @@ class Placement:
     scratch_slots: int = 1
     tier: int = 0
     scratch: tuple = ()
+    member_bytes: tuple = ()
 
 
 @dataclass(frozen=True)

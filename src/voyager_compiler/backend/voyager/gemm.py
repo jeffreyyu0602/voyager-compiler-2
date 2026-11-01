@@ -24,6 +24,7 @@ from voyager_compiler.codegen.transform.tiling.lowering import (
     node_dtype_bits,
     outlier_stats,
     output_dtype,
+    resolve,
     tail_extra_passes,
     tail_keeps_shape,
     weight_batch,
@@ -93,8 +94,9 @@ class RuntimeCalculator:
     tile costing the longer of its loading and the rows streamed through it,
     plus the back-pressure of a single-buffered accumulator against
     ``OUTPUT_SLACK`` of buffering.  The bus charges the words every operand
-    role moves, summed per bank group of the placement with the busiest bank
-    setting the pace: input and weight rows in whole beats, packed as the
+    role moves, summed per scratchpad bank as the placement lays its groups
+    out, with the busiest bank setting the pace: input and weight rows in
+    whole beats, packed as the
     toolchain packs them, with the read interface's lost cycle whenever an
     aligned request follows an unaligned one; block scales one word each;
     the output, the fused tail operands, the bias and the reduction scratch;
@@ -197,20 +199,53 @@ class RuntimeCalculator:
             sizes.append(count * bits / 8)
         return sizes
 
-    def _bank_cycles(self, words, bank_groups):
-        """Cycles the busiest scratchpad bank spends moving ``words`` -- bus
-        words per operand role -- when the roles sharing a bank
-        (``bank_groups``: the placement's groups, ``None`` = nothing shares)
-        queue on its single port.  A role the placement does not name keeps a
-        port of its own.
+    def _banks(self, placement):
+        """The roles each scratchpad bank serves, as ``(role, share)`` pairs,
+        ``share`` being the fraction of the role's bytes in that bank; ``None``
+        when nothing shares a bank.
+
+        Lays each group out as the planner does: from a bank boundary, its
+        members one after another, one ping-pong slot each (the slots repeat
+        the layout).  A merged group is several banks, each with its own
+        port, so only the members that land in the same bank queue together.
+        A group whose members are not sized is taken as one shared port.
         """
-        placed = set()
+        if not placement.groups or not self.bank_size:
+            return None
+        sizes = dict(placement.member_bytes)
+        banks = []
+        for group in placement.groups:
+            if not all(member in sizes for member in group):
+                banks.append(tuple((member, 1.0) for member in group))
+                continue
+            shares = {}
+            offset = 0
+            for member in group:
+                size = sizes[member]
+                if size <= 0:
+                    continue
+                start, end = offset, offset + size
+                first = int(start // self.bank_size)
+                for bank in range(first, math.ceil(end / self.bank_size)):
+                    low = max(start, bank * self.bank_size)
+                    high = min(end, (bank + 1) * self.bank_size)
+                    shares.setdefault(bank, []).append((member, (high - low) / size))
+                offset = end
+            banks.extend(tuple(pairs) for _, pairs in sorted(shares.items()))
+        return tuple(banks)
+
+    def _bank_cycles(self, words, banks):
+        """Cycles the busiest scratchpad bank spends moving ``words`` -- bus
+        words per operand role -- when the roles in a bank (``banks``, from
+        ``_banks``; ``None`` = nothing shares) queue on its single port, each
+        with its share of its words.  A role also moves no faster than its own
+        words, however many banks it spans: one requester streams it.
+        """
         busiest = 0
-        for roles in bank_groups or ():
-            busiest = max(busiest, sum(words.get(role, 0) for role in roles))
-            placed.update(roles)
-        loose = [count for role, count in words.items() if role not in placed]
-        return max([busiest, *loose])
+        for bank in banks or ():
+            load = sum(words.get(role, 0) * share for role, share in bank)
+            busiest = max(busiest, load)
+        return max([busiest, *words.values()])
 
     def _request_words(self, requests, row_elems, bits, loop_bound, pitch):
         """Bus words ``requests`` fetches of one ``row_elems``-element row
@@ -532,9 +567,10 @@ class RuntimeCalculator:
             result[Fused(i)] = switches * max(1, BANK_SWITCH_CYCLES + 1 - beats)
         return result
 
-    def _tail_stall(self, mapping, bank_groups, words, compute, bank):
+    def _tail_stall(self, mapping, banks, words, compute, bank):
         """Cycles the array loses to the tail's burst on a bank that feeds
-        one of its every-round buffers.
+        one of its every-round buffers (``banks``, from ``_banks``; each role
+        counts with its share of the bank).
 
         Those buffers ping-pong per L1 sweep (``blockings[IC][2]`` sweeps
         to a block), so each sweep's fetch must land inside the sweep before
@@ -548,7 +584,7 @@ class RuntimeCalculator:
         the steps whose ping-pong slots agree: every step when the stream
         is refetched with it, else every other.
         """
-        if not bank_groups:
+        if not banks:
             return 0
         sweeps = mapping.loop_blockings[le.IC][2]
         steps = self._l3_blocks(mapping)
@@ -565,12 +601,15 @@ class RuntimeCalculator:
             Role.WEIGHT_SCALE: WEIGHT_DIMS,
         }
         stall = 0.0
-        for roles in bank_groups:
+        for pairs in dict.fromkeys(banks):
+            share = dict(pairs)
+            roles = list(share)
+            local = {role: words.get(role, 0) * share[role] for role in roles}
             streams = [role for role in roles if role in stream_dims]
             tails = []
             for role in roles:
                 is_tail = role is Role.OUTPUT or isinstance(role, Fused)
-                if is_tail and words.get(role, 0):
+                if is_tail and local[role]:
                     tails.append(role)
             if not streams or not tails:
                 continue
@@ -579,27 +618,29 @@ class RuntimeCalculator:
                 for role in roles
                 if role not in streams and role not in tails
             ]
-            stream_words = [words.get(role, 0) / sweeps for role in streams]
+            stream_words = [local[role] / sweeps for role in streams]
             busiest = max(stream_words)
             pending = sum(stream_words)
-            spread = sum(words.get(role, 0) for role in others) / sweeps
-            tail_words = sum(words[role] for role in tails)
+            spread = sum(local[role] for role in others) / sweeps
+            tail_words = sum(local[role] for role in tails)
             # The output's beats and its scales leave on two requesters,
             # every beat and every scale a request of its own; a fused
-            # operand is fetched once per output vector.
+            # operand is fetched once per output vector.  A role split over
+            # banks sends each its share of the requests.
             oc_dim = mapping.loop_partitionings[le.OC][0]
             requests = []
             for role in tails:
                 if role is Role.OUTPUT:
                     out = vectors * oc_dim
                     stores = self._bus_words(out, self.output_dtype_width)
-                    requests.append(stores)
+                    requests.append(stores * share[role])
                     if self.output_scale_width:
-                        requests.append(math.ceil(out / self.scale_block_size))
+                        scales = math.ceil(out / self.scale_block_size)
+                        requests.append(scales * share[role])
                 elif le.OC in self.tail_specs[role.index][0]:
-                    requests.append(vectors)
+                    requests.append(vectors * share[role])
                 else:
-                    requests.append(words[role])
+                    requests.append(local[role])
             beats_per_grant = tail_words / max(requests)
             remaining = tail_words
             priced = 0.0
@@ -619,7 +660,7 @@ class RuntimeCalculator:
             stall = max(stall, fraction * excess)
         return stall
 
-    def matrix_cycles(self, mapping, bank_groups):
+    def matrix_cycles(self, mapping, banks):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
         plus the back-pressure a single-buffered accumulator takes while the
@@ -642,8 +683,8 @@ class RuntimeCalculator:
 
         Args:
             mapping: The interstellar mapping to price.
-            bank_groups: Its placement's bank groups (``Placement.groups``),
-                or ``None`` when nothing shares a bank.
+            banks: Its placement's banks, the roles each serves with their
+                shares (``_banks``), or ``None`` when nothing shares a bank.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -798,13 +839,13 @@ class RuntimeCalculator:
         # The matrix unit and the vector unit are pipelined -- one drains a
         # tile while the other computes the next -- so a block costs the
         # busier of the two.
-        bank = self._bank_cycles(words, bank_groups)
+        bank = self._bank_cycles(words, banks)
         block_time = max(computation_l1_time, bank)
         # The tail's words do not spread over the block: they land as a
         # burst on a few of its sweeps, and on a bank that feeds one of the
         # array's ping-pong buffers they can outrun the sweeps they land on.
         block_time += self._tail_stall(
-            mapping, bank_groups, words, computation_l1_time, bank
+            mapping, banks, words, computation_l1_time, bank
         )
 
         # The SpMM unit runs the block alongside and the vector pipeline
@@ -832,15 +873,15 @@ class RuntimeCalculator:
                     * self.weight_dtype_width
                     / 8
                 )
-                banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
-                switch = BANK_SWITCH_CYCLES * (1 - 1 / banks)
+                weight_banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
+                switch = BANK_SWITCH_CYCLES * (1 - 1 / weight_banks)
             spmm_block_time = visits * SPMM_ROW_CYCLES + gathers * (1 + switch)
             block_time = max(block_time, spmm_block_time)
 
         # The first tile's loads overlap nothing; the last parked tile's drain
         # is a whole vector pass, while a single-buffered accumulator's drain
         # is already in its blocks' own time.
-        buffer_fill = self._bank_cycles(loads, bank_groups)
+        buffer_fill = self._bank_cycles(loads, banks)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
         drain = output_size * vector_beats if parked else 0
         overhead = buffer_fill + skew + drain
@@ -854,7 +895,7 @@ class RuntimeCalculator:
         steps = self._l3_blocks(mapping) if num_k == 1 else num_k
         return steady + overhead / (steps * self.batch)
 
-    def vector_cycles(self, mapping, bank_groups):
+    def vector_cycles(self, mapping, banks):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
         step that ends a K sweep, after that step's accumulation.
 
@@ -864,7 +905,7 @@ class RuntimeCalculator:
         which is what ``vector_op_utilization`` charges for the same tail in
         the reporting model -- and the busiest bank: the accumulator read
         back, the finished tile and its scales written, each tail operand
-        read, summed wherever the placement puts them together.
+        read, summed per bank as the placement lays them out.
         """
         blockings = mapping.loop_blockings
         output_size = 1
@@ -891,7 +932,7 @@ class RuntimeCalculator:
             words[Role.OUTPUT] += self._bus_words(
                 output_size * oc_dim, self.output_dtype_width
             )
-        return max(lanes, self._bank_cycles(words, bank_groups))
+        return max(lanes, self._bank_cycles(words, banks))
 
     def cost(self, mapping, placement):
         """The op's latency under ``mapping`` laid out as ``placement``, the
@@ -900,9 +941,9 @@ class RuntimeCalculator:
         Args:
             mapping: The interstellar mapping to price, its loop orders
                 included.
-            placement: The ``Placement`` its tile takes: the bank groups the
-                bus is priced per and the regions the reduction scratch
-                takes.
+            placement: The ``Placement`` its tile takes: the bank groups
+                whose layout the bus is priced per bank by, and the regions
+                the reduction scratch takes.
         """
         blockings = mapping.loop_blockings
         partitionings = mapping.loop_partitionings
@@ -980,10 +1021,10 @@ class RuntimeCalculator:
             for (dims, _), size in zip(self.tail_specs, tail_sizes)
         ]
 
-        bank_groups, scratch_slots = placement.groups, placement.scratch_slots
-        matrix_cycles = self.matrix_cycles(mapping, bank_groups)
+        banks, scratch_slots = self._banks(placement), placement.scratch_slots
+        matrix_cycles = self.matrix_cycles(mapping, banks)
         vector_cycles = (
-            self.vector_cycles(mapping, bank_groups) if self.has_tail else 0
+            self.vector_cycles(mapping, banks) if self.has_tail else 0
         )
 
         input_steps = batch_loads(mapping, INPUT_DIMS, self.batch, self.batch)
@@ -1098,6 +1139,9 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         bank_width: Bytes of a scratchpad store word, ``None`` without one.
         vector_lanes: Values one store beat writes.
         usable_scratchpad_size: Bytes the plan may spend on chip.
+        member_order: The placement members in the order the planner lays a
+            bank group out: the inputs in ``all_input_nodes`` order, then
+            the output, then the scratch.
     """
 
     space: MatrixSpace
@@ -1116,6 +1160,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
     bank_width: int | None
     vector_lanes: int
     usable_scratchpad_size: int
+    member_order: tuple
 
     @classmethod
     def from_node(cls, node, model):
@@ -1169,6 +1214,26 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             else min(config.pe_array_size) * input_width
         )
         layer = matrix_layer(anchor)
+        # The planner lays a bank group's buffers out in SRAM alloc order:
+        # the inputs as ``node`` takes them, then the output and the scratch.
+        inputs = node.all_input_nodes
+
+        def position(member):
+            source = resolve(member, node, anchor)
+            return inputs.index(source) if source in inputs else len(inputs)
+
+        operands = [
+            Role.INPUT,
+            Role.CSR,
+            Role.INPUT_SCALE,
+            Role.WEIGHT,
+            Role.WEIGHT_SCALE,
+            Role.BIAS,
+        ] + [Fused(i) for i in range(len(fused_specs))]
+        member_order = tuple(sorted(operands, key=position)) + (
+            Role.OUTPUT,
+            Role.SCRATCH,
+        )
         key = layer_key(anchor) + (
             tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
             fused_specs,
@@ -1181,6 +1246,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             outlier_pct,
             out_outlier_pct,
             outlier_rate,
+            member_order,
         )
         return cls(
             input_dtype_width=input_width,
@@ -1238,6 +1304,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             bank_width=config.bank_width,
             vector_lanes=config.vector_lanes,
             usable_scratchpad_size=config.usable_scratchpad_size,
+            member_order=member_order,
         )
 
     def fit(self, mapping):
@@ -1284,8 +1351,9 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         a loop order or how the PE level splits into steps and copies.
 
         Returns:
-            The groups' members, one frozenset per bank group and the
-            scratch's last, with the regions the scratch takes;
+            The groups' members, one tuple per bank group in the order the
+            planner lays them out and the scratch's last, with each member's
+            bytes and the regions the scratch takes;
             ``Placement()`` without banks.  ``None`` when the tile does not
             fit, or its block scales overflow the SpMM unit's buffer.
         """
@@ -1346,42 +1414,43 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         # Its staging ping-pongs exactly when the input does -- a sweep that
         # gathers once keeps one slot (``_SparseGemm.forward``).
         gathered = if_count * self.outlier_pct
+        sizes = {
+            Role.INPUT: self._alloc_bytes(if_count, self.input_dtype_width),
+            Role.CSR: self._alloc_bytes(gathered, self.csr_data_width)
+            + self._alloc_bytes(gathered, self.csr_index_width),
+            Role.INPUT_SCALE: self._scale_bytes(
+                if_count, self.input_scale_width
+            ),
+            Role.WEIGHT: self._alloc_bytes(fl_count, self.weight_dtype_width),
+            Role.WEIGHT_SCALE: self._scale_bytes(
+                fl_count, self.weight_scale_width
+            ),
+            Role.BIAS: bias,
+            Role.OUTPUT: self._alloc_bytes(of_count, out_bits)
+            + out_scale
+            + staged_csr,
+        }
         groups = [
             (
-                self._alloc_bytes(if_count, self.input_dtype_width)
-                + self._alloc_bytes(gathered, self.csr_data_width)
-                + self._alloc_bytes(gathered, self.csr_index_width),
-                slots(INPUT_DIMS, self.batch),
                 frozenset({Role.INPUT, Role.CSR}),
-            ),
-            (
-                self._scale_bytes(if_count, self.input_scale_width),
                 slots(INPUT_DIMS, self.batch),
-                frozenset({Role.INPUT_SCALE}),
             ),
+            (frozenset({Role.INPUT_SCALE}), slots(INPUT_DIMS, self.batch)),
             (
-                self._alloc_bytes(fl_count, self.weight_dtype_width)
-                + self._scale_bytes(fl_count, self.weight_scale_width)
-                + bias,
-                slots(WEIGHT_DIMS, self.weight_batch),
                 frozenset({Role.WEIGHT, Role.WEIGHT_SCALE, Role.BIAS}),
+                slots(WEIGHT_DIMS, self.weight_batch),
             ),
-            (
-                self._alloc_bytes(of_count, out_bits) + out_scale + staged_csr,
-                slots(OUTPUT_DIMS, self.batch),
-                frozenset({Role.OUTPUT}),
-            ),
+            (frozenset({Role.OUTPUT}), slots(OUTPUT_DIMS, self.batch)),
         ]
         for i, (dims, bits) in enumerate(self.tail_specs):
             elements = math.prod(extent(d) for d in dims)
             distinct = self.batch if le.ON in dims else 1
-            groups.append(
-                (
-                    self._alloc_bytes(elements, bits),
-                    slots(dims, distinct),
-                    frozenset({Fused(i)}),
-                )
-            )
+            sizes[Fused(i)] = self._alloc_bytes(elements, bits)
+            groups.append((frozenset({Fused(i)}), slots(dims, distinct)))
+        groups = [
+            (sum(sizes[member] for member in members), slot_count, members)
+            for members, slot_count in groups
+        ]
 
         # An absent operand (no scale, no bias) occupies no bank.
         groups = [group for group in groups if group[0] > 0]
@@ -1462,7 +1531,20 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         partition = [members for _, _, members in merged]
         if scratch:
             partition.append(frozenset({Role.SCRATCH}))
-        return Placement(tuple(partition), scratch_slots=regions)
+            sizes[Role.SCRATCH] = scratch
+        # Each group's members in the order the planner lays them out, with
+        # their sizes, so the bus is priced per bank they cover.
+        rank = {member: i for i, member in enumerate(self.member_order)}
+        partition = [
+            tuple(sorted(members, key=rank.__getitem__))
+            for members in partition
+        ]
+        member_bytes = tuple(
+            (member, sizes[member]) for members in partition for member in members
+        )
+        return Placement(
+            tuple(partition), scratch_slots=regions, member_bytes=member_bytes
+        )
 
     def _align(self, size):
         """``size`` rounded up to a whole ``bank_width`` store word."""

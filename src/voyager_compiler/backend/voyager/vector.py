@@ -25,6 +25,7 @@ import logging
 import math
 
 import torch
+from torch.fx import GraphModule
 
 from voyager_compiler.codegen.node_info import (
     LAYER_NORM_OPS,
@@ -125,6 +126,35 @@ def _input_bits(node, anchor) -> int:
         src = bound_operands(node, submodule).get(src, src)
     bits = node_dtype_bits(src)
     return max(bits) if isinstance(bits, list) else bits
+
+
+def mx_scale_pass(node) -> bool:
+    """Whether ``node`` runs a ``quantize_mx`` that blocks along an axis
+    other than the last.  The unit derives a block's scale from the lanes
+    streaming past, which is the block only along the last axis, so the
+    toolchain first reduces each block's maximum in a pass of its own and
+    the quantize pass reads it back (``push_mx_scale_pass``): two passes.
+    A fused ``node`` runs the quantize as its submodule's last op."""
+    quant = node
+    if node.op == "call_module":
+        submod = node.meta.get("submodule")
+        if not isinstance(submod, GraphModule):
+            return False
+        ops = [n for n in submod.graph.nodes if n.op == "call_function"]
+        quant = ops[-1] if ops else None
+    if (
+        quant is None
+        or quant.target is not torch.ops.quantized_ops.quantize_mx.default
+    ):
+        return False
+    val = getattr(quant.args[0], "value", None)
+    if val is None:
+        val = quant.args[0].meta.get("val")
+    ndim = getattr(val, "ndim", 0)
+    for axis in get_arg_value(quant, 2, "axes"):
+        if not (axis == -1 or (ndim and axis == ndim - 1)):
+            return True
+    return False
 
 
 def _output_writes(node, lanes: int, beat: int) -> float:
@@ -375,9 +405,11 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """Fraction of peak a vector ``node`` sustains, bound by the bus.
 
     Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
-    pass over the data (``OP_PASSES``; one for everything else) costs a lane
-    group the greater of its read cycles, the bus beats its widest streamed
-    operand is fetched in, and its write cycles, at ``config.bytes_per_cycle``
+    pass over the data (``OP_PASSES``; a scale pass and a quantize pass for a
+    ``quantize_mx`` along another axis than the last, ``mx_scale_pass``; one
+    for everything else) costs a lane group the greater of its read cycles,
+    the bus beats its widest streamed operand is fetched in, and its write
+    cycles, at ``config.bytes_per_cycle``
     per beat: a reduction pass writes one value per row, so it runs at the
     read rate, and a record that ends mid-beat is split by the bus, so a
     sub-byte output can take more write cycles than read cycles.  A
@@ -437,6 +469,9 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
         ]
         reads = {IN: max(widths, default=16)}
         profile = [(IN, OUT)]
+        # The scale pass writes one maximum per block of lanes: a reduction.
+        if mx_scale_pass(node):
+            profile = [(IN, None), (IN, OUT)]
     for read, write in profile:
         read_cycles = math.ceil(lanes * reads[read] / 8 / bytes_per_cycle)
         if write is None:
