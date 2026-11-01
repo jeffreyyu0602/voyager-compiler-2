@@ -57,7 +57,14 @@ class OpInfo:
     ``cost.py``.  A calibrated op carries the RTL-derived ``measured_cycles``
     instead, with ``calibration`` saying how it was derived (``exact`` for
     a one-op period, ``shared`` when the period's ops split one
-    measurement pro rata).
+    measurement pro rata, ``per-op`` when the op's own RTL runtime priced
+    it).
+
+    ``slot`` is the op's 0-based ordinal within its kernel, in the order
+    the scheduler first walks the kernel's ops.  Kernels built from one
+    nest walk their ops in the same order, so ``(build_key, slot)`` names
+    the same op in every one of them; that is what a per-op measurement is
+    keyed by.
     """
 
     key: str
@@ -67,6 +74,7 @@ class OpInfo:
     units: Tuple[str, ...] = ("vector",)
     utilization: float = 1.0
     kernel: str = ""
+    slot: int = -1
     measured_cycles: Optional[int] = None
     calibration: str = ""
 

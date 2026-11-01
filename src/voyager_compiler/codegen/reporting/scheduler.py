@@ -103,6 +103,8 @@ class ResourceState:
         self.skips: List[LoopSkip] = []
         self.ops: Dict[int, OpInfo] = {}  # id(node) -> OpInfo
         self._op_names: set = set()
+        # kernel -> how many of its ops get_op has numbered (the next slot)
+        self._kernel_slots: Dict[str, int] = {}
         # semaphore slot -> FIFO of completion cycles
         self.sem_fifos: Dict[object, Deque[int]] = {}
         # id(async compute node) -> its end, handed to the following insert
@@ -141,7 +143,8 @@ class ResourceState:
 
     def get_op(self, node) -> OpInfo:
         """Memoize one ``OpInfo`` per static compute node (keyed by identity, so
-        same-named nodes in different loop bodies stay distinct)."""
+        same-named nodes in different loop bodies stay distinct), numbered by
+        its ``slot`` within the kernel before calibration prices it."""
         key = id(node)
         op = self.ops.get(key)
         if op is None:
@@ -153,6 +156,9 @@ class ResourceState:
                 i += 1
             self._op_names.add(op.key)
             op.kernel = self.cur_kernel
+            slot = self._kernel_slots.get(self.cur_kernel, 0)
+            op.slot = slot
+            self._kernel_slots[self.cur_kernel] = slot + 1
             if self.calibration is not None:
                 self.calibration.apply(
                     op, self.kernel_groups.get(self.cur_kernel)

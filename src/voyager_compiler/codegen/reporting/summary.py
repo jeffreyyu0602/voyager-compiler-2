@@ -63,6 +63,34 @@ class KernelRow:
         )
 
 
+def _busy_cycles(recs) -> int:
+    """Cycles at least one of ``recs`` is running: the union of their
+    intervals, so ops overlapping on different units count once."""
+    busy, end = 0, None
+    for r in sorted(recs, key=lambda r: r.start):
+        if end is None or r.start >= end:
+            busy += r.end - r.start
+            end = r.end
+        elif r.end > end:
+            busy += r.end - end
+            end = r.end
+    return busy
+
+
+# The order a kernel's mixed calibration labels are joined in, finest first.
+_LABEL_ORDER = ("per-op", "exact", "shared", "analytic")
+
+
+def _calibration_label(period_ops: List[OpInfo]) -> str:
+    """How a kernel's period was priced: one label when its ops agree, else
+    the distinct labels finest first, for example ``per-op+shared`` when
+    some ops had their own measurement and the rest fell back to the ratio,
+    or ``per-op+analytic`` when some were left unpriced."""
+    present = {op.calibration or "analytic" for op in period_ops}
+    labels = [label for label in _LABEL_ORDER if label in present]
+    return "+".join(labels)
+
+
 def _main_skip(skips: List[LoopSkip]) -> Optional[LoopSkip]:
     """The fold covering the most iterations: the kernel's steady state."""
     if not skips:
@@ -122,27 +150,36 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
             row.dram_per_period = sum(
                 r.end - r.start for r in template if r.resource == ("dram",)
             )
-            counts = Counter(r.op_key for r in template if r.kind == "compute")
+            compute = [r for r in template if r.kind == "compute"]
             iterations = skip.period
         else:
             loop_recs = [r for r in recs if r.loop_uid != -1]
-            counts = Counter(r.op_key for r in loop_recs if r.kind == "compute")
+            compute = [r for r in loop_recs if r.kind == "compute"]
             iterations = max(1, row.walked)
+        counts = Counter(r.op_key for r in compute)
         row.ops_per_period = {
             k: v / iterations if v % iterations else v // iterations
             for k, v in counts.items()
         }
+        # Per iteration, the time the schedule spends computing, overlaps
+        # counted once.  Analytic cyc/iter scales it back by analytic over
+        # effective: exact under the ratio, which scales ops alike, but only
+        # an effective-weighted approximation under per-op prices.
+        busy = _busy_cycles(compute)
         analytic = sum(ops[k].analytic_cycles * v for k, v in counts.items())
-        row.analytic_per_iteration = analytic / iterations
+        effective = sum(ops[k].effective_cycles * v for k, v in counts.items())
+        row.analytic_per_iteration = (
+            busy * analytic / effective / iterations if effective else 0.0
+        )
         measured = [
             ops[k] for k in counts if ops[k].measured_cycles is not None
         ]
         if measured:
-            row.calibration = measured[0].calibration
-            row.measured_per_iteration = (
-                sum(ops[k].effective_cycles * v for k, v in counts.items())
-                / iterations
-            )
+            # The busy time comes out of the schedule, so it is the measured
+            # figure under per-op prices as much as under the ratio.
+            period_ops = [ops[k] for k in counts]
+            row.calibration = _calibration_label(period_ops)
+            row.measured_per_iteration = busy / iterations
         rows[kernel] = row
     return sorted(rows.values(), key=lambda r: r.start)
 

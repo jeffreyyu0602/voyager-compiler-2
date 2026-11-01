@@ -21,18 +21,29 @@ overlap stay.  ``Calibration.apply`` prices every compute op of a measured
 kernel by the ratio of measured to analytic cycles per iteration -- exact
 for a one-op period, pro rata (``shared``) when a period runs several ops.
 
+A finer measurement takes precedence: the ``Op calibration`` sheet gives
+one op's own steady-state cycles per invocation, keyed by build key and the
+op's ``slot`` in its kernel, and the op is priced at exactly that; the
+scheduler then works out how the kernel's ops overlap.  The build key does
+not cover tiling, so a row also carries the shapes it was measured at, and
+an op tiled otherwise ignores it.  An op with no usable row keeps the ratio
+path, and the kernel's launch term applies either way.
+
 The same sheet carries the group's measured **power**, which corrects
 nothing: the compiler has no power model, and the number exists only so the
 reporting workbook can turn a latency into an energy.
 """
 
+import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from torch.fx import GraphModule
 
 from voyager_compiler.codegen.reporting.model import OpInfo
+
+logger = logging.getLogger(__name__)
 
 _LAYER_RE = re.compile(r"layers_(\d+)_")
 
@@ -117,22 +128,97 @@ class Measurement:
         return self.measured_per_iteration / self.analytic_per_iteration
 
 
+@dataclass
+class OpMeasurement:
+    """One op's own RTL runtime: ``cycles`` per invocation in steady state,
+    for the op at ``slot`` of every kernel built with ``key``.  The other
+    fields say where the number came from and are carried, not used."""
+
+    key: str
+    slot: int
+    cycles: float
+    kernel: str = ""
+    op: str = ""
+    unit: str = ""
+    passes: int = 0
+    samples: int = 0
+    method: str = ""  # start-to-start | start-to-done | sum-of-passes
+    source: str = ""  # the regression_results folder it was read from
+    shapes: str = ""  # op_shapes of the op measured; blank matches any
+
+
+def shape_text(dims) -> str:
+    """One shape as the Operations sheet writes it: ``1x256x512``."""
+    if dims is None:
+        return ""
+    return "x".join(str(int(d)) for d in dims)
+
+
+def op_shapes(op: OpInfo) -> str:
+    """An op's input, weight and output shapes as one ``Shapes`` cell of the
+    Op calibration sheet: ``input | weight | output``."""
+    cells = []
+    for name in ("input", "weight", "output"):
+        cells.append(shape_text(op.detail.get(name)))
+    return " | ".join(cells)
+
+
 class Calibration:
     """Build group -> measurement, applied to each ``OpInfo`` as it is
     priced.  ``power`` is carried through untouched for the reporting
-    workbook; only ``ratio`` and ``launch_cycles`` change a schedule."""
+    workbook; only the per-op cycles, ``ratio`` and ``launch_cycles``
+    change a schedule."""
 
-    def __init__(self, measurements: Dict[str, Measurement]):
+    def __init__(
+        self,
+        measurements: Dict[str, Measurement],
+        op_measurements: Optional[Dict[Tuple[str, int], OpMeasurement]] = None,
+    ):
         self.measurements = measurements
+        self.op_measurements = op_measurements or {}
         self.applied: Dict[str, int] = {}
+        # (key, slot) -> (the row's shapes, the op's): rows not applied
+        # because this compile tiles the op otherwise.
+        self.shape_mismatches: Dict[Tuple[str, int], Tuple[str, str]] = {}
 
     def apply(self, op: OpInfo, group: Optional[str]) -> None:
+        """Price ``op``: by its own measurement when the ``Op calibration``
+        sheet has a row for ``(group, op.slot)`` measured at the op's shapes,
+        else by the group's ratio, else not at all (the analytic price
+        stands)."""
+        per_op = self.op_measurements.get((group, op.slot)) if group else None
+        if per_op is not None and per_op.shapes:
+            shapes = op_shapes(op)
+            if shapes != per_op.shapes:
+                self._shape_mismatch(per_op, shapes)
+                per_op = None
+        if per_op is not None:
+            op.measured_cycles = max(1, round(per_op.cycles))
+            op.calibration = "per-op"
+            self.applied[group] = self.applied.get(group, 0) + 1
+            return
         m = self.measurements.get(group) if group else None
         if m is None or not m.measured_per_iteration:
             return
         op.measured_cycles = max(1, round(op.analytic_cycles * m.ratio))
         op.calibration = "exact" if m.exact else "shared"
         self.applied[group] = self.applied.get(group, 0) + 1
+
+    def _shape_mismatch(self, row: "OpMeasurement", shapes: str) -> None:
+        """Note, once per row, an op whose shapes differ from its row's."""
+        where = (row.key, row.slot)
+        if where in self.shape_mismatches:
+            return
+        self.shape_mismatches[where] = (row.shapes, shapes)
+        logger.warning(
+            "Op calibration %s slot %d (%s) was measured at %s; this compile "
+            "has %s, so the op keeps the ratio path",
+            row.key,
+            row.slot,
+            row.op,
+            row.shapes,
+            shapes,
+        )
 
     def launch_cycles(self, group: Optional[str]) -> int:
         """The measured fixed cost of entering a kernel (0 when unmeasured)."""
@@ -277,6 +363,68 @@ def calibration_sheet(wb, rows, calibration=None, formats=None) -> int:
     return written
 
 
+OP_SHEET = "Op calibration"
+OP_HEADERS = [
+    "Key",
+    "Kernel",
+    "Slot",
+    "Op",
+    "Unit",
+    "Passes",
+    "Measured cycles",
+    "Samples",
+    "Method",
+    "Source",
+    "Shapes",
+]
+# Fewer steady-state samples than this is no measurement: the op keeps the
+# ratio path.  A row with Samples left blank was written by hand and counts.
+_MIN_OP_SAMPLES = 2
+
+
+def op_calibration_sheet(wb, calibration, formats=None) -> int:
+    """Write the ``Op calibration`` rows ``calibration`` carries into an open
+    ``xlsxwriter`` workbook, so a per-op calibrated compile's workbook says
+    what priced it and loads back as the same calibration.
+
+    Writes nothing (no sheet) when there are no per-op rows.  Returns the
+    number of rows written.
+    """
+    if calibration is None or not calibration.op_measurements:
+        return 0
+    ws = wb.add_worksheet(OP_SHEET)
+    fmt = formats or {}
+    bold = fmt.get("bold") or wb.add_format({"bold": True})
+    for c, h in enumerate(OP_HEADERS):
+        ws.write(0, c, h, bold)
+    widths = {"Key": 14, "Kernel": 46, "Op": 32, "Source": 40, "Shapes": 40}
+    for name, width in widths.items():
+        column = OP_HEADERS.index(name)
+        ws.set_column(column, column, width)
+    ws.freeze_panes(1, 0)
+
+    for r, m in enumerate(calibration.op_measurements.values(), start=1):
+        values = [
+            m.key,
+            m.kernel,
+            m.slot,
+            m.op,
+            m.unit,
+            m.passes,
+            m.cycles,
+            m.samples,
+            m.method,
+            m.source,
+            m.shapes,
+        ]
+        for c, v in enumerate(values):
+            if isinstance(v, (int, float)):
+                ws.write_number(r, c, v)
+            else:
+                ws.write(r, c, v)
+    return len(calibration.op_measurements)
+
+
 def power_column() -> str:
     """The Power column's A1 letter, for a formula on another sheet."""
     return _letter("Power (W)")
@@ -306,10 +454,20 @@ def load_calibration(path: str) -> Calibration:
     results.  ``Power (W)`` is read straight through.  Rows with neither a
     measurement nor a power are ignored.  The sheet carries one row per key,
     so a repeated key means the file was edited by hand; the last row wins.
+
+    An ``Op calibration`` sheet, when present, is read too (see
+    ``load_op_measurements``); either sheet may be absent, not both.
     """
     import openpyxl
 
     wb = openpyxl.load_workbook(path, data_only=True)
+    op_measurements = load_op_measurements(wb)
+    if FORM_SHEET not in wb.sheetnames:
+        if OP_SHEET not in wb.sheetnames:
+            raise ValueError(
+                f"{path} has neither a {FORM_SHEET!r} nor an {OP_SHEET!r} sheet"
+            )
+        return Calibration({}, op_measurements)
     ws = wb[FORM_SHEET]
     header = [c.value for c in ws[1]]
     col = {name: i for i, name in enumerate(header) if name in FORM_HEADERS}
@@ -350,4 +508,56 @@ def load_calibration(path: str) -> Calibration:
             n2=float(n2 or 0),
             t2=float(t2 or 0),
         )
-    return Calibration(measurements)
+    return Calibration(measurements, op_measurements)
+
+
+def load_op_measurements(wb) -> Dict[Tuple[str, int], OpMeasurement]:
+    """The ``Op calibration`` rows of an open ``openpyxl`` workbook, keyed by
+    ``(Key, Slot)``; empty when the sheet is absent.
+
+    A row needs a key, a slot and a positive ``Measured cycles``; one with
+    fewer than two ``Samples`` is dropped, so its op stays on the ratio
+    path, and so is one whose numbers do not read as numbers.  A repeated
+    ``(Key, Slot)`` means a hand edit; the last row wins.
+    """
+    if OP_SHEET not in wb.sheetnames:
+        return {}
+    ws = wb[OP_SHEET]
+    header = [c.value for c in ws[1]]
+    col = {name: i for i, name in enumerate(header) if name in OP_HEADERS}
+
+    def cell(cells, name):
+        i = col.get(name)
+        return cells[i] if i is not None and i < len(cells) else None
+
+    out: Dict[Tuple[str, int], OpMeasurement] = {}
+    for cells in ws.iter_rows(min_row=2, values_only=True):
+        key = cell(cells, "Key")
+        if not key:
+            continue
+        samples_cell = cell(cells, "Samples")
+        try:
+            slot = int(cell(cells, "Slot"))
+            cycles = float(cell(cells, "Measured cycles"))
+            samples = int(samples_cell) if samples_cell is not None else 0
+            passes = int(cell(cells, "Passes") or 0)
+        except (TypeError, ValueError):
+            continue
+        too_few = samples_cell is not None and samples < _MIN_OP_SAMPLES
+        if cycles <= 0 or too_few:
+            continue
+        m = OpMeasurement(
+            key=str(key),
+            slot=slot,
+            cycles=cycles,
+            kernel=str(cell(cells, "Kernel") or ""),
+            op=str(cell(cells, "Op") or ""),
+            unit=str(cell(cells, "Unit") or ""),
+            passes=passes,
+            samples=samples,
+            method=str(cell(cells, "Method") or ""),
+            source=str(cell(cells, "Source") or ""),
+            shapes=str(cell(cells, "Shapes") or ""),
+        )
+        out[(m.key, m.slot)] = m
+    return out

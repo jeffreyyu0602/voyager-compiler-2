@@ -3,14 +3,15 @@
 Sheets: ``Summary`` (totals, the busy split, calibration coverage),
 ``Kernels`` (one row per bufferized nest: span, traffic, how much of its
 loop was walked or folded, what a steady-state period runs and costs, its
-calibration), ``Operations`` (one row per node that costs
-time -- every static compute node with its shapes, dtypes and ideal /
-analytic / effective cycles, plus the DRAM materializations, tile transfers,
-waits and launches -- each with how many times it ran and what it cost in
-total), ``Events`` (every walked event, with
-a ``fold`` row where a steady state was skipped), and ``Architecture``
-(the config the estimate used).  Nothing recomputes in Excel: changing a
-knob or entering a measurement means re-running the estimator.
+calibration), ``Operations`` (one row per node that costs time -- every
+static compute node with its slot in its kernel, shapes, dtypes and ideal /
+analytic / effective cycles, plus the DRAM materializations, tile
+transfers, waits and launches -- each with how many times it ran and what
+it cost in total), ``Events`` (every walked event, with a ``fold`` row
+where a steady state was skipped), ``Architecture`` (the config the
+estimate used), ``Calibration`` and, when per-op measurements priced the
+estimate, ``Op calibration``.  Nothing recomputes in Excel: changing a knob
+or entering a measurement means re-running the estimator.
 """
 
 import math
@@ -23,6 +24,8 @@ from voyager_compiler.codegen.reporting.calibration import (
     power_column,
     sheet_rows,
     calibration_sheet,
+    op_calibration_sheet,
+    shape_text,
 )
 from voyager_compiler.codegen.reporting.model import ScheduleResult
 from voyager_compiler.codegen.reporting.summary import (
@@ -55,10 +58,7 @@ def _table(wb, name: str, headers: List[str], rows, widths=None):
 
 
 def _shape(op, key) -> str:
-    dims = op.detail.get(key)
-    if dims is None:
-        return ""
-    return "x".join(str(int(d)) for d in dims)
+    return shape_text(op.detail.get(key))
 
 
 def _lane_cycles(result: ScheduleResult, lane: str) -> int:
@@ -88,6 +88,7 @@ def _summary(wb, result: ScheduleResult, rows: List[KernelRow]):
     walked = sum(s.walked for s in result.loops)
     skipped = sum(s.skipped for s in result.loops)
     calibrated = [r for r in rows if r.calibration]
+    per_op = [r for r in calibrated if "per-op" in r.calibration]
     lines = [
         ("total_latency", result.total_latency),
         ("compute_only_cycles", result.busy_compute - overlap),
@@ -111,6 +112,7 @@ def _summary(wb, result: ScheduleResult, rows: List[KernelRow]):
         ("operations_wait_cycles", _lane_cycles(result, "control")),
         ("kernels", len(rows)),
         ("kernels_calibrated", len(calibrated)),
+        ("kernels_calibrated_per_op", len(per_op)),
         ("calibration_coverage", coverage(rows, result.total_latency)),
     ]
     _table(wb, "Summary", ["Metric", "Value"], lines, {0: 24, 1: 16})
@@ -246,6 +248,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
     headers = [
         "Node",
         "Kernel",
+        "Slot",
         "Op type",
         "Units",
         "Input",
@@ -280,6 +283,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                 (
                     op.key,
                     op.kernel,
+                    op.slot,
                     op.op_type,
                     "/".join(op.units),
                     _shape(op, "input"),
@@ -320,6 +324,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                 (
                     e["node"],
                     e["kernel"],
+                    None,  # Slot numbers compute ops only
                     label,
                     "/".join(e["resource"]),
                     "",
@@ -344,7 +349,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
         )
 
     lines = [row for _, row in sorted(lines, key=lambda t: t[0])]
-    _table(wb, "Operations", headers, lines, {0: 32, 1: 40, 4: 16, 5: 16})
+    _table(wb, "Operations", headers, lines, {0: 32, 1: 40, 5: 16, 6: 16})
 
 
 # --------------------------------------------------------------------------
@@ -514,9 +519,11 @@ def totals(table: List[OperationRow], total_latency: int) -> OperationRow:
 
 
 def _calibration(wb, rows, calibration):
-    """The Calibration sheet.  Written by ``calibration.py``, which owns the
-    column layout the loader reads back."""
-    return calibration_sheet(wb, rows, calibration)
+    """The Calibration sheet, then the Op calibration sheet when per-op
+    measurements priced the estimate.  Written by ``calibration.py``, which
+    owns the column layouts the loader reads back."""
+    calibration_sheet(wb, rows, calibration)
+    op_calibration_sheet(wb, calibration)
 
 
 def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
