@@ -14,7 +14,7 @@ it at.
 import contextlib
 import operator
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch._export.verifier as _verifier
@@ -107,6 +107,53 @@ def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
     except AttributeError:
         return None
     return sub if isinstance(sub, GraphModule) else None
+
+
+def _placeholders(gm: GraphModule) -> List[Node]:
+    """The placeholders of ``gm``, in order."""
+    return [n for n in gm.graph.nodes if n.op == "placeholder"]
+
+
+def _regions(gm: GraphModule, node: Node) -> List[Tuple[GraphModule, list]]:
+    """The subgraphs ``node`` runs, each with the operands bound to its
+    placeholders, in program order.
+
+    A ``while_loop`` runs its body (not its cond_fn) on the carried values
+    followed by the extra operands, a ``cond`` runs both branches on one
+    operand list, a ``commit`` or ``with_scratch`` runs its region on
+    ``args[1:]``, and a fused ``call_module`` runs its module on its args.
+    Any other node, and a handle that names no subgraph, contributes none.
+
+    Args:
+        gm: The graph module that holds ``node`` and its subgraphs.
+        node: A node of ``gm``.
+
+    Returns:
+        ``[(subgraph, operands), ...]``.
+    """
+    if node.op == "call_module":
+        targets = [node.target]
+        operands = list(node.args)
+    elif node.op != "call_function":
+        return []
+    elif node.target is _WHILE_LOOP:
+        extra = list(node.args[3]) if len(node.args) > 3 else []
+        targets = [node.args[1].target]
+        operands = list(node.args[2]) + extra
+    elif node.target is _COND:
+        targets = [node.args[1].target, node.args[2].target]
+        operands = list(node.args[3]) if len(node.args) > 3 else []
+    elif node.target in (_COMMIT, _WITH_SCRATCH):
+        targets = [node.args[0].target]
+        operands = list(node.args[1:])
+    else:
+        return []
+    regions = []
+    for target in targets:
+        sub = _subgraph(gm, target)
+        if sub is not None:
+            regions.append((sub, operands))
+    return regions
 
 
 def _passed_whole(node: Node, codebooks: set) -> bool:

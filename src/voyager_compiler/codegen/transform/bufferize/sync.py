@@ -56,6 +56,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     commit_hop,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
+    _placeholders,
     _subgraph,
     voyager,
 )
@@ -271,10 +272,6 @@ def _layers(gm: GraphModule):
             runs.append(current)
         current[1].append(node)
     return runs
-
-
-def _placeholders(gm: GraphModule) -> List[Node]:
-    return [n for n in gm.graph.nodes if n.op == "placeholder"]
 
 
 def _counter_arg(copy: Node):
