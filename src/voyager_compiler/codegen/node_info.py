@@ -1005,7 +1005,7 @@ def relayout_view_shape(relayout, shape):
     return tuple(index.shape)
 
 
-def stream_breaking_quantize(gm):
+def stream_breaking_quantize(gm, batch_dims=0):
     """The terminal ``quantize_mx`` of a fused tail that cannot ride the
     compute pass, or ``None``.
 
@@ -1022,6 +1022,11 @@ def stream_breaking_quantize(gm):
     Args:
         gm: The fused tail or submodule ending in the quantize; a
             non-``GraphModule`` never breaks.
+        batch_dims: Leading dims of the relayout's input that the builder
+            loops outside the tile, one element at a time, so the relayout
+            is replayed with them at size 1: a transpose of a looped dim
+            with a tiled one then only renames dims.  0 for a tile-shaped
+            ``gm``.
 
     Returns:
         ``None`` when the tail has no such quantize, else ``(quant,
@@ -1052,10 +1057,10 @@ def stream_breaking_quantize(gm):
         # An unknown shape counts as reordering: the caller then stages the
         # tile, which is always safe.
         value = _tensor_value(spine)
-        permuted = (
-            value is None
-            or relayout_view_shape(relayout, tuple(value.shape)) is None
-        )
+        permuted = value is None
+        if value is not None:
+            shape = (1,) * batch_dims + tuple(value.shape[batch_dims:])
+            permuted = relayout_view_shape(relayout, shape) is None
 
     val = getattr(quant.args[0], "value", None)
     if val is None:

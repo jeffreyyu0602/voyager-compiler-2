@@ -296,10 +296,11 @@ def tail_extra_passes(node):
     own over the finished tile, ``(single_k, split_k)``: after a reduction
     that runs in one round, and after one split across rounds.
 
-    It does when its quantize breaks the stream or the pipeline has no stage
-    left for it (fusion's ``single_k_tail_fusible`` /
-    ``split_k_tail_fusible``): after the drain on a single round, after the
-    accumulate on a split one, which takes one more.  A CSR-producing
+    It does when its quantize breaks the stream on one batch element's tile
+    or the pipeline has no stage left for it (fusion's
+    ``single_k_tail_fusible`` / ``split_k_tail_fusible``): after the drain
+    on a single round, after the accumulate on a split one, which takes one
+    more.  A CSR-producing
     epilogue (``_EpilogueTail``) re-dices its tile at the consumers' slice
     width: ops between the anchor and the ``quantize_mx_outlier`` run once on
     the whole tile, and their result is staged whenever a slice is finer
@@ -309,7 +310,10 @@ def tail_extra_passes(node):
     """
     anchor = get_anchor_node(node)
     sub_gm = node.meta.get("submodule")
-    breaks_stream = stream_breaking_quantize(sub_gm) is not None
+    # The builder loops a batched matmul's leading dims outside the tile
+    # (``gemm_batch``) and judges the relayout on one element's tile.
+    batch_dims = anchor.value.ndim - 2 if is_bmm(anchor) else 0
+    breaks_stream = stream_breaking_quantize(sub_gm, batch_dims) is not None
     single_k = breaks_stream or not node.meta.get("single_k_tail_fusible", True)
     out_quant = csr_quantize_node(node)
     if not single_k and out_quant is not None:

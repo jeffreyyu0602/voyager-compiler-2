@@ -222,7 +222,9 @@ class OpModel(ABC):
     @abstractmethod
     def fit(self, tiling):
         """The :class:`Placement` ``tiling`` takes on chip, or ``None`` when
-        it does not fit.
+        it does not fit.  A matrix op may answer a tuple of the placements
+        the tiling can take instead; the matrix search prices each and keeps
+        the cheapest, the earliest on a tie.
 
         A matrix op's fit is asked at interstellar's fit check, on a
         ``MappingPoint`` with no loop orders whose L0 blocking counts that
@@ -235,8 +237,8 @@ class OpModel(ABC):
 
     @abstractmethod
     def cost(self, tiling, placement):
-        """The :class:`Cost` of ``tiling`` laid out as ``placement``, the
-        answer ``fit`` gave."""
+        """The :class:`Cost` of ``tiling`` laid out as ``placement``, one of
+        the placements ``fit`` gave."""
 
     def scratch(self, out_tile):
         """The regions the backend's kernel keeps beside the op's tiles that

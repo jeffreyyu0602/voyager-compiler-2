@@ -40,6 +40,7 @@ from voyager_compiler.codegen.transform.tiling.lowering import (
 from voyager_compiler.codegen.transform.tiling.runtime_model import (
     GridSpace,
     MatrixSpace,
+    Placement,
     TileResult,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import TileConstraint
@@ -226,18 +227,18 @@ def _run_search(search):
             "innermost, so the builders could not emit its nest"
         )
 
-    last = None, None  # the blocking fit last: its totals, its Placement
+    last = None, None  # the blocking fit last: its totals, its fit answer
 
     def fit(mapping):
-        """``op.fit`` of ``mapping``, vetoed off the constraint by its L2
-        extents, kept as ``last``."""
+        """``op.fit`` of ``mapping``, ``()`` when the constraint vetoes it
+        by its L2 extents, kept as ``last``."""
         nonlocal last
         totals = _level_totals(mapping)
         allowed = (
             constraint is None
             or constraint.allows(lambda loop: math.prod(totals[loop][:3]))
         )
-        last = totals, (op.fit(mapping) if allowed else None)
+        last = totals, (op.fit(mapping) if allowed else ())
         return last[1]
 
     def size_fn(point, *_):
@@ -246,16 +247,16 @@ def _run_search(search):
         (``opt_valid_blocking``), so ``point`` has no loop orders and
         partitionings of 1.  The other arguments are interstellar's
         contract."""
-        return _VETO if fit(point) is None else _FITS
+        return _FITS if fit(point) else _VETO
 
     def runtime(architecture, layer, mapping):
         """Interstellar's runtime callback: the latency of a full mapping,
-        laid out as its blocking's fit placed it.  ``architecture`` and
-        ``layer`` are its contract."""
-        totals, placement = last
+        laid out as the cheapest placement its blocking's fit offers.
+        ``architecture`` and ``layer`` are its contract."""
+        totals, fitted = last
         if _level_totals(mapping) != totals:
-            placement = fit(mapping)
-        return op.cost(mapping, placement).latency
+            fitted = fit(mapping)
+        return _cheapest(op, mapping, fitted)[1].latency
 
     search.layer.size_fn = size_fn
     try:
@@ -278,14 +279,27 @@ def _run_search(search):
     return mapping
 
 
+def _cheapest(op, mapping, fitted):
+    """``(placement, cost)``: of the placements ``fitted`` (``op.fit``'s
+    answer: one ``Placement`` or a tuple of them) holds, the one ``op``
+    prices fastest under ``mapping``, the earliest on a tie, with that
+    price."""
+    placements = (fitted,) if isinstance(fitted, Placement) else fitted
+    best = None
+    for placement in placements:
+        cost = op.cost(mapping, placement)
+        if best is None or cost.latency < best[1].latency:
+            best = placement, cost
+    return best
+
+
 def _finish_search(search, mapping):
     """``search``'s winning ``mapping`` as a ``TileResult``, finished in the
-    parent: the mapping, the placement its blocking takes, its cost, and
-    interstellar's per-level ``(input, output, weight)`` access counts, which
-    the ``Tiling`` proto reports."""
+    parent: the mapping, the cheapest placement its blocking offers, its
+    cost, and interstellar's per-level ``(input, output, weight)`` access
+    counts, which the ``Tiling`` proto reports."""
     op = search.op
-    placement = op.fit(mapping)
-    cost = op.cost(mapping, placement)
+    placement, cost = _cheapest(op, mapping, op.fit(mapping))
 
     blockings = mapping.loop_blockings
     for level in (1, 2, 3):

@@ -84,8 +84,9 @@ class RuntimeCalculator:
     its compute, otherwise their sum, and the sweep is framed by the
     un-overlapped first load and last store; a split reduction adds its
     accumulate steps and the tail pass that finishes each output tile, and
-    with one scratch region the next tile's first round waits for that
-    pass's done (``matrix_timing``'s completion).  A
+    with one scratch region the next tile's first round starts only at that
+    pass's done and then waits for its own first operands
+    (``matrix_timing``'s completion and refill).  A
     DRAM transfer costs its bytes at ``dram_bandwidth`` plus one access
     latency, block scales being a transfer of their own, and the batch loop
     outside the mapping shares a weight tile among the elements of one
@@ -692,9 +693,10 @@ class RuntimeCalculator:
         spread over the ops a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
 
-        The step's done trails the end of its input by its completion: the
-        array still runs every pass over the last reduction block it
-        fetched, then the systolic skew, then the parked tile's drain.
+        The step's done trails the array's last reduction row by its
+        completion: the systolic skew, then the parked tile's drain.  A round
+        that starts only at that done idles the array for its refill too:
+        its first L1 tile's operands land before the array runs it.
 
         Args:
             mapping: The interstellar mapping to price.
@@ -702,7 +704,7 @@ class RuntimeCalculator:
                 shares (``_banks``), or ``None`` when nothing shares a bank.
 
         Returns:
-            ``(cycles, completion)``.
+            ``(cycles, completion, refill)``.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -904,16 +906,19 @@ class RuntimeCalculator:
         drain = output_size * vector_beats if parked else 0
         overhead = buffer_fill + skew + drain
         steady = l2_blocks * block_time
-        reduction_blocks = blockings[le.IC][1] * blockings[le.IC][2]
-        completion = computation_l1_time / reduction_blocks + skew + drain
+        completion = skew + drain
 
         if not self.double_buffered_l2:
-            return steady + overhead, completion
+            return steady + overhead, completion, buffer_fill
 
         # Every op the sweep dispatches -- the L3 steps and the batch elements
-        # looped outside the mapping -- overlaps the ramps of its neighbours.
-        steps = self._l3_blocks(mapping) if num_k == 1 else num_k
-        return steady + overhead / (steps * self.batch), completion
+        # looped outside the mapping -- overlaps the ramps of its neighbours,
+        # a split reduction's included: its next tile's first round runs
+        # behind this tile's drain unless one scratch region holds it, which
+        # ``cost`` charges per tile.
+        steps = self._l3_blocks(mapping)
+        cycles = steady + overhead / (steps * self.batch)
+        return cycles, completion, buffer_fill
 
     def vector_cycles(self, mapping, banks):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
@@ -1042,7 +1047,7 @@ class RuntimeCalculator:
         ]
 
         banks, scratch_slots = self._banks(placement), placement.scratch_slots
-        matrix_cycles, completion = self.matrix_timing(mapping, banks)
+        matrix_cycles, completion, refill = self.matrix_timing(mapping, banks)
         vector_cycles = (
             self.vector_cycles(mapping, banks) if self.has_tail else 0
         )
@@ -1104,8 +1109,11 @@ class RuntimeCalculator:
         classes[-1] = (classes[-1][0], classes[-1][1] - 1)
         # A chained tail finalizes on the last round's pass.  With one scratch
         # region the next tile's first round overwrites the partial sum that
-        # pass reads, so it starts only once the pass is done.
-        exposed = completion if self.has_tail and scratch_slots == 1 else 0
+        # pass reads, so it starts only once the pass is done, and the array
+        # then waits for that round's first operands.
+        exposed = 0
+        if self.has_tail and scratch_slots == 1:
+            exposed = completion + refill
 
         total_time = load + first_tail + accum_steps * max(load, matrix_cycles)
         # One window per remaining tile, spanning two grid steps: the matrix
@@ -1204,10 +1212,11 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         keeps_shape = tail_keeps_shape(node)
         # A split reduction's tail reads the partial sum from scratch, on the
         # finalize pass or on an extra pass after it.  A second region lets
-        # the next tile's first round start before that read is done, except
-        # in a CSR-producing nest, whose bare stores pin one, and under the
-        # chained tail of an outlier GEMM, whose lag-0 nest does not rotate
-        # it (``_SparseGemm``).  A sync nest keeps one region.
+        # the next tile's first round start before that read is done, so
+        # ``fit`` offers it beside one, except in a CSR-producing nest, whose
+        # bare stores pin one, and under the chained tail of an outlier GEMM,
+        # whose lag-0 nest does not rotate it (``_SparseGemm``).  A sync nest
+        # keeps one region.
         consumes_csr = anchor.kwargs.get("A_data") is not None
         scratch_regions = 1
         if (
@@ -1335,8 +1344,9 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         )
 
     def fit(self, mapping):
-        """The placement of ``mapping``'s scratchpad (L2) tile, or ``None``
-        when it does not fit the usable scratchpad.
+        """The placement of ``mapping``'s scratchpad (L2) tile, or both its
+        placements when the scratch may take one region or two; ``None`` when
+        it does not fit the usable scratchpad.
 
         Every operand is sized the way ``tensor_alloc_bytes`` sizes it for
         the planner -- payload, the slack a final store beat overshoots by,
@@ -1361,10 +1371,12 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         (``_ScratchSpec``), charged whole bank-aligned regions on top; so is
         the finished tile a tail that needs a pass of its own parks even for
         a single round, unless it keeps the tile's shape and runs that pass
-        in place on the output slot.  A split reduction with a tail takes
+        in place on the output slot.  A split reduction with a tail may take
         ``scratch_regions`` regions -- a second lets the next tile's first
-        round start while the tail still reads the partial sum -- when they
-        fit beside the groups, and one otherwise.
+        round start while the tail still reads the partial sum, but leaves
+        fewer banks to the groups.  When they fit beside the groups, both
+        placements are offered, that one first, and the search keeps the
+        cheaper; otherwise the scratch takes one.
 
         A bank cannot be split between groups, so each group rounds up to
         whole banks, which floors a tile at ``num_slots * len(groups)``
@@ -1380,7 +1392,8 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         Returns:
             The groups' members, one tuple per bank group in the order the
             planner lays them out and the scratch's last, with each member's
-            bytes and the regions the scratch takes;
+            bytes and the regions the scratch takes; a tuple of the
+            two-region and the one-region placement when both fit;
             ``Placement()`` without banks.  ``None`` when the tile does not
             fit, or its block scales overflow the SpMM unit's buffer.
         """
@@ -1537,41 +1550,53 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
                 ] + merged[2:]
             return merged, banks(merged) <= budget
 
-        # Banks left for the ping-ponged groups, after the scratch regions.
-        # A second scratch region is kept only when the groups still fit
-        # beside it.
-        while True:
-            budget = num_banks - regions * scratch_banks
-            merged, fits = merge_to_fit(budget)
-            if fits or regions == 1:
-                break
-            regions -= 1
-
-        needed = sum(
-            slot_count * math.ceil(size / bank_size) * bank_size
-            for size, slot_count, _ in merged
-        )
         if scratch:
-            needed += regions * math.ceil(scratch / bank_size) * bank_size
-        if needed > self.usable_scratchpad_size:
-            return None
-        partition = [members for _, _, members in merged]
-        if scratch:
-            partition.append(frozenset({Role.SCRATCH}))
             sizes[Role.SCRATCH] = scratch
-        # Each group's members in the order the planner lays them out, with
-        # their sizes, so the bus is priced per bank they cover.
         rank = {member: i for i, member in enumerate(self.member_order)}
-        partition = [
-            tuple(sorted(members, key=rank.__getitem__))
-            for members in partition
-        ]
-        member_bytes = tuple(
-            (member, sizes[member]) for members in partition for member in members
-        )
-        return Placement(
-            tuple(partition), scratch_slots=regions, member_bytes=member_bytes
-        )
+
+        def place(scratch_slots):
+            """The placement with the scratch in ``scratch_slots`` regions
+            and the groups merged to fit the banks those leave, or ``None``
+            when they do not fit."""
+            budget = num_banks - scratch_slots * scratch_banks
+            merged, fits = merge_to_fit(budget)
+            if not fits and scratch_slots > 1:
+                return None
+            needed = sum(
+                slot_count * math.ceil(size / bank_size) * bank_size
+                for size, slot_count, _ in merged
+            )
+            needed += scratch_slots * scratch_banks * bank_size
+            if needed > self.usable_scratchpad_size:
+                return None
+            partition = [members for _, _, members in merged]
+            if scratch:
+                partition.append(frozenset({Role.SCRATCH}))
+            # Each group's members in the order the planner lays them out,
+            # with their sizes, so the bus is priced per bank they cover.
+            partition = [
+                tuple(sorted(members, key=rank.__getitem__))
+                for members in partition
+            ]
+            member_bytes = tuple(
+                (member, sizes[member])
+                for members in partition
+                for member in members
+            )
+            return Placement(
+                tuple(partition),
+                scratch_slots=scratch_slots,
+                member_bytes=member_bytes,
+            )
+
+        # The second scratch region is a priced choice: when the groups
+        # still fit beside it, both placements are offered and the search
+        # keeps the cheaper, the two-region one on a tie.
+        single = place(1)
+        double = place(regions) if regions > 1 and single else None
+        if double is None:
+            return single
+        return double, single
 
     def _align(self, size):
         """``size`` rounded up to a whole ``bank_width`` store word."""
