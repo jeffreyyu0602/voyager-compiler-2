@@ -65,6 +65,10 @@ class OpInfo:
     nest walk their ops in the same order, so ``(build_key, slot)`` names
     the same op in every one of them; that is what a per-op measurement is
     keyed by.
+
+    ``completion_cycles`` is how long after its charged cycles the op is
+    done: its units free at the end of the charged cycles, while the
+    counter it posts and a drain see the done.
     """
 
     key: str
@@ -77,6 +81,7 @@ class OpInfo:
     slot: int = -1
     measured_cycles: Optional[int] = None
     calibration: str = ""
+    completion_cycles: int = 0
 
     @property
     def analytic_cycles(self) -> int:

@@ -20,7 +20,8 @@ for ``counter >= threshold`` resolves at the ``threshold``-th of them,
 whether that post came from a DMA or an async compute.  ``async_wait``
 blocks the program clock until its wait resolves; a commit's passes wait
 per unit before they start; ``drain`` blocks the program clock until every
-unit is idle.
+pass is done.  A pass frees its unit(s) at the end of its charged cycles but
+is done ``OpInfo.completion_cycles`` later, and its post carries the done.
 
 Every timestamp the machine holds -- the clocks, the unit-free cycles, the
 posted completions and the parked commits' floors -- is exposed by
@@ -96,6 +97,7 @@ class ResourceState:
         self.mma_free = 0
         self.vector_free = 0
         self.dram_free = 0
+        self.passes_done = 0  # the cycle every pass so far is done by
         self.cur_loop = -1  # id() of the while_loop currently being walked
         self.cur_kernel = ""  # the bufferized nest being walked
         self.kernel_groups: Dict[str, str] = {}
@@ -184,12 +186,19 @@ class ResourceState:
             # the program clock: its start floors on the issue cycle
             # (commit_now, advanced by each body op), on the cycle its
             # unit(s)' waits resolved at, and on its unit(s), never on
-            # self.now.
-            floors = [self.commit_floors[_WAIT_UNIT[u]] for u in op.units]
+            # self.now.  A fused op's vector pass works on the matrix output,
+            # so the vector waits floor the end of its cycles, not the start.
+            floors = []
+            for u in op.units:
+                floor = self.commit_floors[_WAIT_UNIT[u]]
+                if u == "vector" and "mma" in op.units:
+                    floor -= op.effective_cycles
+                floors.append(floor)
             start = max(self.commit_now, *units_free, *floors)
         else:
             start = max(self.now, *units_free)
         end = start + op.effective_cycles
+        done = end + op.completion_cycles
         rec = TimingRecord(
             eid=self._eid(),
             node_name=node.name,
@@ -205,14 +214,15 @@ class ResourceState:
         self.records.append(rec)
         for u in op.units:
             self._occupy(u, end)
+        self.passes_done = max(self.passes_done, done)
         if self.in_commit:
             # A committed op occupies its unit(s) but leaves the program clock;
-            # its done-sem post carries the completion.  A sync one advances it.
+            # its post carries the done.  A sync one advances the clock to it.
             self.commit_now = end
             self.last_commit_node = node
-            self.pending_post[id(node)] = end
+            self.pending_post[id(node)] = done
         else:
-            self.now = end
+            self.now = done
         if self.trace is not None:
             base = self.trace_base
             self.trace.append(
@@ -402,7 +412,8 @@ class ResourceState:
 
     def drain(self, node, path) -> TimingRecord:
         """The program clock blocks until no unit has a pass running or
-        queued: every parked commit must be able to run."""
+        queued and every pass is done: every parked commit must be able to
+        run."""
         self._resolve_commits()
         if self.pending_commits:
             raise ValueError(
@@ -411,7 +422,7 @@ class ResourceState:
                 f"would deadlock"
             )
         start = self.now
-        end = max(self.now, self.mma_free, self.vector_free)
+        end = max(self.now, self.passes_done)
         rec = TimingRecord(
             eid=self._eid(),
             node_name=node.name,
@@ -503,6 +514,7 @@ class ResourceState:
                 self.mma_free,
                 self.vector_free,
                 self.dram_free,
+                self.passes_done,
             ),
             tuple(
                 (k, tuple(self.counter_posts[k]))
@@ -529,6 +541,7 @@ class ResourceState:
             self.mma_free,
             self.vector_free,
             self.dram_free,
+            self.passes_done,
         ) = clocks
         for k, values in counters:
             self.counter_posts[k] = list(values)
@@ -545,6 +558,7 @@ class ResourceState:
                 self.mma_free,
                 self.vector_free,
                 self.dram_free,
+                self.passes_done,
             ),
             counter_posts={k: list(v) for k, v in self.counter_posts.items()},
             posts=dict(self.pending_post),
@@ -572,6 +586,7 @@ class ResourceState:
             self.mma_free,
             self.vector_free,
             self.dram_free,
+            self.passes_done,
         ) = cp.clocks
         self.counter_posts = {k: list(v) for k, v in cp.counter_posts.items()}
         self.pending_post = dict(cp.posts)

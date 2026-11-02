@@ -83,7 +83,9 @@ class RuntimeCalculator:
     double-buffered L2 each step costs the slower of its DRAM transfers and
     its compute, otherwise their sum, and the sweep is framed by the
     un-overlapped first load and last store; a split reduction adds its
-    accumulate steps and the tail pass that finishes each output tile.  A
+    accumulate steps and the tail pass that finishes each output tile, and
+    with one scratch region the next tile's first round waits for that
+    pass's done (``matrix_timing``'s completion).  A
     DRAM transfer costs its bytes at ``dram_bandwidth`` plus one access
     latency, block scales being a transfer of their own, and the batch loop
     outside the mapping shares a weight tile among the elements of one
@@ -661,6 +663,15 @@ class RuntimeCalculator:
         return stall
 
     def matrix_cycles(self, mapping, banks):
+        """Cycles of one L3 grid step (``matrix_timing``'s first value).
+
+        Args:
+            mapping: The interstellar mapping to price.
+            banks: Its placement's banks (``_banks``), or ``None``.
+        """
+        return self.matrix_timing(mapping, banks)[0]
+
+    def matrix_timing(self, mapping, banks):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
         plus the back-pressure a single-buffered accumulator takes while the
@@ -681,10 +692,17 @@ class RuntimeCalculator:
         spread over the ops a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
 
+        The step's done trails the end of its input by its completion: the
+        array still runs every pass over the last reduction block it
+        fetched, then the systolic skew, then the parked tile's drain.
+
         Args:
             mapping: The interstellar mapping to price.
             banks: Its placement's banks, the roles each serves with their
                 shares (``_banks``), or ``None`` when nothing shares a bank.
+
+        Returns:
+            ``(cycles, completion)``.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -886,14 +904,16 @@ class RuntimeCalculator:
         drain = output_size * vector_beats if parked else 0
         overhead = buffer_fill + skew + drain
         steady = l2_blocks * block_time
+        reduction_blocks = blockings[le.IC][1] * blockings[le.IC][2]
+        completion = computation_l1_time / reduction_blocks + skew + drain
 
         if not self.double_buffered_l2:
-            return steady + overhead
+            return steady + overhead, completion
 
         # Every op the sweep dispatches -- the L3 steps and the batch elements
         # looped outside the mapping -- overlaps the ramps of its neighbours.
         steps = self._l3_blocks(mapping) if num_k == 1 else num_k
-        return steady + overhead / (steps * self.batch)
+        return steady + overhead / (steps * self.batch), completion
 
     def vector_cycles(self, mapping, banks):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
@@ -1022,7 +1042,7 @@ class RuntimeCalculator:
         ]
 
         banks, scratch_slots = self._banks(placement), placement.scratch_slots
-        matrix_cycles = self.matrix_cycles(mapping, banks)
+        matrix_cycles, completion = self.matrix_timing(mapping, banks)
         vector_cycles = (
             self.vector_cycles(mapping, banks) if self.has_tail else 0
         )
@@ -1057,7 +1077,7 @@ class RuntimeCalculator:
             total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
             if num_k > 1 or self.single_k_tail_extra_pass:
                 total_time += output_tiles * vector_cycles
-            return Cost(total_time, dram_bytes, matrix_cycles)
+            return Cost(total_time, dram_bytes, matrix_cycles, completion)
 
         if num_k == 1:
             # Every step finishes a tile: one schedule covers the sweep.  A
@@ -1069,7 +1089,7 @@ class RuntimeCalculator:
             if self.single_k_tail_extra_pass and not self.tail_keeps_shape:
                 step += vector_cycles
             total_time = sweep_cycles(dmas, l3_blocks, step)
-            return Cost(total_time, dram_bytes, matrix_cycles)
+            return Cost(total_time, dram_bytes, matrix_cycles, completion)
 
         load = input_load + weight_load
         # The sweep's last step has no tile after it to prefetch, so it costs
@@ -1082,6 +1102,10 @@ class RuntimeCalculator:
         # that step owed leaves every tail fetch counted exactly once.
         first_tail = classes[-1][0]
         classes[-1] = (classes[-1][0], classes[-1][1] - 1)
+        # A chained tail finalizes on the last round's pass.  With one scratch
+        # region the next tile's first round overwrites the partial sum that
+        # pass reads, so it starts only once the pass is done.
+        exposed = completion if self.has_tail and scratch_slots == 1 else 0
 
         total_time = load + first_tail + accum_steps * max(load, matrix_cycles)
         # One window per remaining tile, spanning two grid steps: the matrix
@@ -1099,11 +1123,11 @@ class RuntimeCalculator:
                     matrix_cycles + vector_cycles + prefetch + matrix_cycles
                 )
                 continue
-            compute = max(matrix_cycles, prefetch) + matrix_cycles
+            compute = max(matrix_cycles, prefetch) + matrix_cycles + exposed
             dma = max(matrix_cycles + vector_cycles, prefetch) + store + load
             total_time += count * max(compute, dma)
         total_time += matrix_cycles + vector_cycles + store
-        return Cost(total_time, dram_bytes, matrix_cycles)
+        return Cost(total_time, dram_bytes, matrix_cycles, completion)
 
 
 @dataclass(frozen=True)
@@ -1132,8 +1156,8 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             streams through the SpMM unit.
         outlier_pct: Fraction of the activation the consumed CSR holds.
         out_outlier_pct: Fraction of the output the emitted CSR may hold.
-        scratch_regions: Regions a split reduction's read-back tail may give
-            its scratch.
+        scratch_regions: Regions a split reduction with a tail may give its
+            scratch.
         accumulate_fp32: A split reduction accumulates in float32.
         num_slots: Banks a ping-ponged buffer takes, one per slot.
         bank_width: Bytes of a scratchpad store word, ``None`` without one.
@@ -1178,15 +1202,18 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         has_tail = node.meta.get("submodule") is not None
         single_k_extra_pass, split_k_extra_pass = tail_extra_passes(node)
         keeps_shape = tail_keeps_shape(node)
-        # A split reduction's extra pass reads the tile back from scratch; a
-        # second region lets it ride the async finalize commit, except in a
-        # CSR-producing nest, whose bare stores pin one (``_SparseGemm``).
-        # A sync nest waits for the pass, so it keeps one region.
+        # A split reduction's tail reads the partial sum from scratch, on the
+        # finalize pass or on an extra pass after it.  A second region lets
+        # the next tile's first round start before that read is done, except
+        # in a CSR-producing nest, whose bare stores pin one, and under the
+        # chained tail of an outlier GEMM, whose lag-0 nest does not rotate
+        # it (``_SparseGemm``).  A sync nest keeps one region.
+        consumes_csr = anchor.kwargs.get("A_data") is not None
         scratch_regions = 1
         if (
             config.async_pipeline
-            and split_k_extra_pass
             and csr_quantize_node(node) is None
+            and (split_k_extra_pass or (has_tail and not consumes_csr))
         ):
             scratch_regions = 2
         outlier_pct, out_outlier_pct, outlier_rate = outlier_stats(node)
@@ -1295,7 +1322,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             ),
             csr_data_width=node_dtype_bits(anchor.kwargs.get("A_data"), 0),
             csr_index_width=node_dtype_bits(anchor.kwargs.get("A_indices"), 0),
-            consumes_csr=anchor.kwargs.get("A_data") is not None,
+            consumes_csr=consumes_csr,
             outlier_pct=outlier_pct,
             out_outlier_pct=out_outlier_pct,
             scratch_regions=scratch_regions,
@@ -1334,10 +1361,10 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         (``_ScratchSpec``), charged whole bank-aligned regions on top; so is
         the finished tile a tail that needs a pass of its own parks even for
         a single round, unless it keeps the tile's shape and runs that pass
-        in place on the output slot.  A split reduction whose tail reads that
-        tile back from scratch takes ``scratch_regions`` regions -- a second
-        lets the read-back pass ride the finalize commit -- when they fit
-        beside the groups, and one otherwise.
+        in place on the output slot.  A split reduction with a tail takes
+        ``scratch_regions`` regions -- a second lets the next tile's first
+        round start while the tail still reads the partial sum -- when they
+        fit beside the groups, and one otherwise.
 
         A bank cannot be split between groups, so each group rounds up to
         whole banks, which floors a tile at ``num_slots * len(groups)``

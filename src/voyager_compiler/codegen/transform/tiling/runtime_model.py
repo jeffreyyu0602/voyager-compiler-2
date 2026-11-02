@@ -87,11 +87,15 @@ class Cost:
             ``None`` when the model does not count it.
         compute: One step of its grid, which attention's products and
             reporting charge; ``None`` when nothing reads it.
+        completion: Cycles one step's done trails the end of its ``compute``
+            (its last result leaving the unit), which reporting adds to the
+            counter the step posts; 0 when the model does not price it.
     """
 
     latency: float
     dram_bytes: float | None = None
     compute: float | None = None
+    completion: float = 0
 
 
 @dataclass(frozen=True)

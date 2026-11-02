@@ -1803,14 +1803,13 @@ def _gemm_scratch_and_kernel(
             # A single round stages its finished tile, not a running
             # partial: the scratch holds the output's own dtype.
             acc_dtype = out_dtype
-        # Only a lagged tail that reads scratch after the streamed pass gains
-        # a second slot, which the scheduler rotates per tile; a
-        # chained-whole tail never races and keeps one.  The count is the
-        # search's placement (the scratch ladder winner).
-        reads_scratch = not split_k_tail_fusible or split is not None
+        # A lagged kernel rotates a multi-slot scratch per output tile, so the
+        # next tile's first round need not wait for this tile's last read of
+        # the partial sum.  The count is the search's placement (the scratch
+        # ladder winner).
         tile_result = anchor.meta.get("tile_result")
         slots = 1
-        if lag and reads_scratch and tile_result is not None:
+        if lag and tile_result is not None:
             slots = tile_result.placement.scratch_slots
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
         kernel = _reduction_fused_kernel(

@@ -144,6 +144,15 @@ def op_utilization(
     return vector_op_utilization(node, cost, ideal_cycles, tile)
 
 
+def op_completion(node: Node, units: Tuple[str, ...]) -> int:
+    """Cycles a matrix op's done trails the end of its charged cycles: the
+    ``completion`` of the search result stamped on it, 0 without one."""
+    result = node.meta.get("tile_result")
+    if "mma" not in units or result is None or result.cost is None:
+        return 0
+    return math.ceil(result.cost.completion)
+
+
 # --------------------------------------------------------------------------
 # Compute cycles
 # --------------------------------------------------------------------------
@@ -192,6 +201,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=matrix_units,
             utilization=op_utilization(node, matrix_units, ideal, cost),
+            completion_cycles=op_completion(node, matrix_units),
         )
 
     if is_gemm_op(anchor):
@@ -218,6 +228,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=units,
             utilization=op_utilization(node, units, ideal, cost),
+            completion_cycles=op_completion(node, units),
         )
 
     # Vector op: work is the larger of input / output element count -- a
