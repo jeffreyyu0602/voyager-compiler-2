@@ -46,6 +46,7 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen import match_and_fuse_rms_norm
+from voyager_compiler.codegen.node_info import ancestors
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 from .compile_steps import (
@@ -230,10 +231,11 @@ def annotate_kivi_cache(gm):
 
 
 def _annotate_attention_mask(gm):
-    """Quantize the prefill's causal mask to int1: the ``where`` over the
-    boolean mask that the attention scores' ``add`` reads.  The static-cache
-    export builds the mask from ``cache_position`` at run time, so the
-    quantize runs with the graph rather than folding into a constant.
+    """Quantize the prefill's causal mask to int1 when it is a constant: the
+    ``where`` over the boolean mask that the attention scores' ``add``
+    reads, which ``convert_pt2e`` then folds into an int1 constant.  A mask
+    built at run time (the static-cache export's, from ``cache_position``)
+    stays unquantized, so no quantize of it runs in the graph.
 
     Raises:
         RuntimeError: No causal-mask ``where`` feeds an ``add`` and the
@@ -241,13 +243,13 @@ def _annotate_attention_mask(gm):
             quantize).
     """
     qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
-    masks = [
+    wheres = [
         n
         for n in gm.graph.nodes
         if n.target is torch.ops.aten.where.ScalarOther
         and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
     ]
-    if not masks:
+    if not wheres:
         sdpa = any(
             n.target is torch.ops.aten.scaled_dot_product_attention.default
             for n in gm.graph.nodes
@@ -255,6 +257,13 @@ def _annotate_attention_mask(gm):
         if not sdpa:
             raise RuntimeError("no causal-mask where node feeds an add")
         logger.info("no attention mask under sdpa")
+    masks = [
+        n
+        for n in wheres
+        if not any(a.op == "placeholder" for a in ancestors(n))
+    ]
+    if len(masks) < len(wheres):
+        logger.info("causal mask built at run time: left unquantized")
     for mask in masks:
         annotate_output_qspec(mask, qspec)
 
@@ -275,7 +284,8 @@ def quantize_model(model, tokenizer, quantizer, args):
     positions.  Under a KIVI stage the main caches are quantized to 2 bits,
     which needs ``--residual_length``.
     Each graph's RMSNorms are fused before quantization; under
-    ``--quantize_attention_mask`` the prefill's causal mask is int1; under
+    ``--quantize_attention_mask`` the prefill's causal mask, when a
+    constant, is int1; under
     ``--merge_linears`` each inference graph runs the linears reading one
     input as one GEMM over its own stacked copy of their weights, which no
     other graph shares.
