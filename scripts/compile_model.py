@@ -69,8 +69,7 @@ QUANT_OPS = [
     "quantize_affine",
 ]
 # Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
+# not one: the bufferizer builds no GEMM nest that emits an outlier CSR.  The
 # outlier quantize runs as its own row-swept nest, or fused onto a whole-row
 # op, and its slice width follows the consumers.
 GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]

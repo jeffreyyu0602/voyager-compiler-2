@@ -9,7 +9,6 @@ from functools import partial
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
-    csr_quantize_node,
     get_anchor_node,
     get_arg_value,
     tail_targets,
@@ -1153,17 +1152,12 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             passes, the scratch regions and the outlier rates.
         anchor_dtype_width: Bits of the anchor's own dtype, which a partial
             sum and a parked finished tile take on chip.
-        output_csr_data_width: Bits of an outlier value the CSR the fused
-            tail emits stages, 0 without one.
-        output_csr_index_width: Bits of that outlier's column index, 0
-            without one.
         csr_data_width: Bits of an outlier value the consumed CSR gathers, 0
             without one.
         csr_index_width: Bits of that outlier's column index, 0 without one.
         consumes_csr: The GEMM consumes an outlier CSR, so its weight tile
             streams through the SpMM unit.
         outlier_pct: Fraction of the activation the consumed CSR holds.
-        out_outlier_pct: Fraction of the output the emitted CSR may hold.
         scratch_regions: Regions a split reduction with a tail may give its
             scratch.
         accumulate_fp32: A split reduction accumulates in float32.
@@ -1179,13 +1173,10 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
     space: MatrixSpace
     key: tuple
     anchor_dtype_width: int
-    output_csr_data_width: int
-    output_csr_index_width: int
     csr_data_width: int
     csr_index_width: int
     consumes_csr: bool
     outlier_pct: float
-    out_outlier_pct: float
     scratch_regions: int
     accumulate_fp32: bool
     num_slots: int
@@ -1213,29 +1204,22 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         # A split reduction's tail reads the partial sum from scratch, on the
         # finalize pass or on an extra pass after it.  A second region lets
         # the next tile's first round start before that read is done, so
-        # ``fit`` offers it beside one, except in a CSR-producing nest, whose
-        # bare stores pin one, and under the chained tail of an outlier GEMM,
-        # whose lag-0 nest does not rotate it (``_SparseGemm``).  A sync nest
-        # keeps one region.
+        # ``fit`` offers it beside one, except under the chained tail of an
+        # outlier GEMM, which keeps one (``_SparseGemm``).  A sync nest keeps
+        # one region.
         consumes_csr = anchor.kwargs.get("A_data") is not None
         scratch_regions = 1
-        if (
-            config.async_pipeline
-            and csr_quantize_node(node) is None
-            and (split_k_extra_pass or (has_tail and not consumes_csr))
+        if config.async_pipeline and (
+            split_k_extra_pass or (has_tail and not consumes_csr)
         ):
             scratch_regions = 2
-        outlier_pct, out_outlier_pct, outlier_rate = outlier_stats(node)
+        outlier_pct, outlier_rate = outlier_stats(node)
         if isinstance(out_dtype, (list, tuple)):
             value_dtype = out_dtype[-1]
             output_scale_width = get_dtype_width(out_dtype[-2])
         else:
             value_dtype = out_dtype
             output_scale_width = 0
-        # A CSR-producing tail returns (data, indices, indptr, scale,
-        # inliers); a staged entry is an outlier value and its column index,
-        # each its own buffer.
-        emits_csr = isinstance(out_dtype, (list, tuple)) and len(out_dtype) == 5
         input_width = node_dtype_bits(anchor.args[0])
         anchor_width = get_dtype_width(anchor.value.dtype)
         # A scratchpad bank moves one store word per cycle, ``bank_width``
@@ -1280,7 +1264,6 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             keeps_shape,
             scratch_regions,
             outlier_pct,
-            out_outlier_pct,
             outlier_rate,
             member_order,
         )
@@ -1323,17 +1306,10 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             space=model.matrix_space,
             key=key,
             anchor_dtype_width=anchor_width,
-            output_csr_data_width=(
-                get_dtype_width(out_dtype[0]) if emits_csr else 0
-            ),
-            output_csr_index_width=(
-                get_dtype_width(out_dtype[1]) if emits_csr else 0
-            ),
             csr_data_width=node_dtype_bits(anchor.kwargs.get("A_data"), 0),
             csr_index_width=node_dtype_bits(anchor.kwargs.get("A_indices"), 0),
             consumes_csr=consumes_csr,
             outlier_pct=outlier_pct,
-            out_outlier_pct=out_outlier_pct,
             scratch_regions=scratch_regions,
             accumulate_fp32=model.accumulate_fp32,
             num_slots=config.num_slots,
@@ -1357,14 +1333,13 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         Operands are grouped one per bank ideally:
 
             input+csr | input_scale | weight+weight_scale+bias
-                      | output+output_scale+csr staging | each fused operand
+                      | output+output_scale | each fused operand
 
         An outlier CSR the GEMM consumes rides the input's bank -- both are
-        DMA-written and compute-read at the same depth -- and the CSR a fused
-        tail emits stages in the output's, beside the dense pair it stores by
-        the same route.  Each group is ping-ponged unless a single tile
-        serves the whole sweep, its slots in ``num_slots`` separate banks, so
-        a load overlaps the compute reading the other slot.
+        DMA-written and compute-read at the same depth.  Each group is
+        ping-ponged unless a single tile serves the whole sweep, its slots in
+        ``num_slots`` separate banks, so a load overlaps the compute reading
+        the other slot.
 
         A split reduction with a fused tail, or accumulating in float32, also
         accumulates into a scratch buffer the builders allocate exactly once
@@ -1422,18 +1397,6 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             else self._scale_bytes(of_count, self.output_scale_width)
         )
         bias = self._alloc_bytes(extent(le.OC), self.bias_width)
-        # A CSR the tail emits stages in the output's bank before its packed
-        # stores: a block's (value, index) pairs and its row pointers.  The
-        # quantize sees the output tile, so the budget follows it.
-        staged_csr = 0.0
-        if self.output_csr_data_width:
-            rows = of_count / max(1.0, extent(le.OC))
-            staged = of_count * self.out_outlier_pct
-            staged_csr = (
-                self._alloc_bytes(staged, self.output_csr_data_width)
-                + self._alloc_bytes(staged, self.output_csr_index_width)
-                + self._alloc_bytes(rows + 1, 32)
-            )
 
         def slots(dims, distinct):
             """Banks an operand spanning ``dims`` needs: a second holds the
@@ -1466,9 +1429,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
                 fl_count, self.weight_scale_width
             ),
             Role.BIAS: bias,
-            Role.OUTPUT: self._alloc_bytes(of_count, out_bits)
-            + out_scale
-            + staged_csr,
+            Role.OUTPUT: self._alloc_bytes(of_count, out_bits) + out_scale,
         }
         groups = [
             (

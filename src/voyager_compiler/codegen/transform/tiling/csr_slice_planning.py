@@ -1,22 +1,14 @@
-"""Joint slice-width choice for outlier-CSR producers and their consumers.
+"""Slice-width choice for outlier-CSR producers and their consumers.
 
 An outlier CSR is emitted per K slice, and its column indices are local to
 the slice, so every GEMM consuming it must tile its reduction dim at exactly
-that width; a GEMM whose fused tail *emits* a CSR cuts the slices from its
-own output tile, so its column tile is the consumers' reduction tile.  One
-number therefore couples each producer to its consumers, and a producer can
-itself be a consumer (``up_proj -> down_proj -> lm_head``), so the coupled
-ops form a forest along the CSR edges: every CSR has one producer, a
-producer may fan out.
-
-Searched op by op, each picks the tile that suits itself and the coupling
-is imposed afterwards -- a producer's narrow column tile then strangles its
-consumers.  Here the slice widths are chosen jointly: every op is searched
-under each candidate width it could be handed (its reduction tile) and
-could emit (its output tile), and a dynamic program from the leaves to the
-roots picks the widths minimizing the summed modeled runtime.  The winners
-are registered with the tiler, so the builders' own ``get_tiling`` calls
-land on them, and stamped on each producer as ``meta["csr_slice"]``.
+that width.  One number therefore couples each producer to its consumers.
+Searched op by op, each consumer would pick the reduction tile that suits
+itself, and they would disagree.  Here every consumer is searched under each
+candidate width, and each producer takes the width minimizing its consumers'
+summed modeled runtime.  The winners are registered with the tiler, so the
+builders' own ``get_tiling`` calls land on them, and stamped on each producer
+as ``meta["csr_slice"]``.
 """
 
 import logging
@@ -27,12 +19,9 @@ import interstellar
 from voyager_compiler.codegen.node_info import (
     csr_consumers,
     csr_quantize_node,
-    gemm_produces_csr,
     get_anchor_node,
-    is_gemm_op,
 )
 from voyager_compiler.codegen.transform.tiling.matrix_search import (
-    get_tiling,
     search_tilings,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import TileConstraint
@@ -66,13 +55,10 @@ def _slice_candidates(producer, consumers, min_slice):
     return widths or [depth]
 
 
-def _constraint(s_in, s_out):
-    """The constraint an op searches under when handed a ``s_in``-wide CSR
-    and emitting one ``s_out`` wide (either ``None`` = no such CSR)."""
-    return TileConstraint(
-        exact=() if s_in is None else ((le.IC, s_in),),
-        multiple=() if s_out is None else ((le.OC, s_out),),
-    )
+def _constraint(width):
+    """The constraint a consumer searches under when handed a ``width``-wide
+    CSR."""
+    return TileConstraint(exact=((le.IC, width),))
 
 
 def _explicit_extent(anchor):
@@ -128,18 +114,19 @@ def _search_costs(searches, tiler):
 
 
 def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
-    """Choose every CSR's slice width jointly with the ops it couples.
+    """Choose every CSR's slice width with the GEMMs that consume it.
 
     Args:
         nodes: The graph's nodes, before bufferization.
         tiler: The ``Tiler``; receives the winners' constraints and
-            their finished searches.  ``None`` when every coupled op is
+            their finished searches.  ``None`` when every consumer is
             tiled outright.
         min_slice: Narrowest slice a consumer is handed (see
             ``DEFAULT_MIN_CSR_SLICE``).
 
     Raises:
-        RuntimeError: No candidate width lets every op of some CSR tree fit.
+        RuntimeError: No candidate width lets every consumer of some CSR
+            fit.
     """
     consumers_of = {}
     for node in nodes:
@@ -148,144 +135,57 @@ def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
         consumers = csr_consumers(node)
         if consumers:
             consumers_of[node] = consumers
-    producers = list(consumers_of)
-    if not producers:
+    if not consumers_of:
         return
-    producer_of = {c: p for p in producers for c in consumers_of[p]}
     candidates = {
-        p: _slice_candidates(p, consumers_of[p], min_slice) for p in producers
+        p: _slice_candidates(p, consumers_of[p], min_slice)
+        for p in consumers_of
     }
+    producer_of = {c: p for p in consumers_of for c in consumers_of[p]}
 
-    def is_searched(node):
-        return is_gemm_op(get_anchor_node(node))
-
-    def constraints_of(node):
-        """Every constraint ``node``'s search may run under: each slice it
-        could be handed times each it could emit."""
-        ins = candidates[producer_of[node]] if node in producer_of else [None]
-        outs = candidates[node] if node in consumers_of else [None]
-        return [_constraint(s_in, s_out) for s_in in ins for s_out in outs]
-
-    coupled = [n for n in nodes if n in producer_of or n in consumers_of]
+    consumers = [n for n in nodes if n in producer_of]
     searches = [
-        (node, constraint)
-        for node in coupled
-        if is_searched(node)
-        for constraint in constraints_of(node)
+        (node, _constraint(width))
+        for node in consumers
+        for width in candidates[producer_of[node]]
     ]
     start = time.perf_counter()
     costs = _search_costs(searches, tiler)
     logger.info(
         "[csr] %d constrained searches over %d coupled ops in %.1fs",
         len(searches),
-        len(coupled),
+        len(consumers) + len(consumers_of),
         time.perf_counter() - start,
     )
 
-    def op_cost(node, constraint):
-        return costs.get((node, constraint), 0.0) if is_searched(node) else 0.0
-
-    best = {}
-
-    def subtree(node, s_in):
-        """Least summed runtime of ``node`` and everything downstream of its
-        CSR, given the slice it is handed; memoized with its choice."""
-        if (node, s_in) in best:
-            return best[node, s_in][0]
-        outs = candidates[node] if node in consumers_of else [None]
-        choice = (math.inf, None)
-        for s_out in outs:
-            total = op_cost(node, _constraint(s_in, s_out))
-            for child in consumers_of.get(node, ()):
-                total += subtree(child, s_out)
+    for producer, users in consumers_of.items():
+        best, best_width = math.inf, None
+        for width in candidates[producer]:
+            total = 0.0
+            for user in users:
+                total += costs.get((user, _constraint(width)), 0.0)
             logger.debug(
-                "[csr] %s handed %s emitting %s: subtree %.0f",
-                node.name,
-                s_in,
-                s_out,
+                "[csr] %s emitting %s: consumers %.0f",
+                producer.name,
+                width,
                 total,
             )
-            if total < choice[0]:
-                choice = (total, s_out)
-        best[node, s_in] = choice
-        return choice[0]
-
-    roots = [p for p in producers if p not in producer_of]
-    for root in roots:
-        if math.isinf(subtree(root, None)):
+            if total < best:
+                best, best_width = total, width
+        if math.isinf(best):
             raise RuntimeError(
-                f"{root.name}: no CSR slice width in "
-                f"{candidates[root]} fits every op coupled to it"
+                f"{producer.name}: no CSR slice width in "
+                f"{candidates[producer]} fits every op coupled to it"
             )
-        _commit(root, None, None, best, tiler, consumers_of)
-
-
-def _commit(node, s_in, rows, best, tiler, consumers_of):
-    """Register the winning constraint of ``node`` and its subtree, whose
-    searches ``_search_costs`` already cached.
-
-    ``rows`` is the row block of the CSR ``node`` is handed (``None`` for a
-    root, or below a row-swept producer, which sizes its blocks to its
-    consumers): the node's row tile is aligned to it before its own
-    consumers are committed against the row tile it ends up with.
-    """
-    total, s_out = best[node, s_in]
-    constraint = _constraint(s_in, s_out)
-    anchor = get_anchor_node(node)
-    if is_gemm_op(anchor) and tiler is not None:
-        tiler.constraints[anchor] = constraint
-        if rows is not None:
-            _align_rows(node, rows, tiler)
-    if s_out is not None:
-        node.meta["csr_slice"] = s_out
+        if tiler is not None:
+            for user in users:
+                tiler.constraints[get_anchor_node(user)] = _constraint(
+                    best_width
+                )
+        producer.meta["csr_slice"] = best_width
         logger.info(
             "[csr] %s: slice width %d (subtree runtime %.0f)",
-            node.name,
-            s_out,
-            total,
+            producer.name,
+            best_width,
+            best,
         )
-        block = None
-        if gemm_produces_csr(node) and tiler is not None:
-            block = _row_tile(node, tiler)
-        for child in consumers_of[node]:
-            _commit(child, s_out, block, best, tiler, consumers_of)
-
-
-def _row_tile(node, tiler):
-    """The row tile ``node``'s registered tiling gives it."""
-    anchor = get_anchor_node(node)
-    counts = get_tiling(node, tiler)[0]
-    return anchor.args[0].value.shape[-2] // counts[-3]
-
-
-def _align_rows(consumer, rows, tiler):
-    """Make ``consumer``'s row tile a whole number of ``rows``.
-
-    A GEMM epilogue emits its CSR in blocks of its own row tile, and a
-    consumer gathers whole blocks, so its row tile must be a multiple.  The
-    dynamic program does not see the producer's row tile (a search result),
-    so a consumer that lands short of it is searched again under the same
-    slice width plus that alignment.
-
-    Raises:
-        RuntimeError: No aligned tiling of the consumer fits on chip.
-    """
-    if _row_tile(consumer, tiler) % rows == 0:
-        return
-    anchor = get_anchor_node(consumer)
-    constraint = tiler.constraints[anchor].merged(
-        TileConstraint(multiple=((le.OX, rows),))
-    )
-    tiler.constraints[anchor] = constraint
-    pair = (consumer, constraint)
-    found = search_tilings([pair], tiler)
-    if pair not in found:
-        return  # an explicit tiling: ``get_tiling`` applies it
-    if found[pair] is None:
-        raise RuntimeError(
-            f"{consumer.name}: no tiling with a row tile of whole "
-            f"{rows}-row CSR blocks fits on chip"
-        )
-    logger.info(
-        "[csr] %s: row tile realigned to %d-row blocks", consumer.name, rows
-    )

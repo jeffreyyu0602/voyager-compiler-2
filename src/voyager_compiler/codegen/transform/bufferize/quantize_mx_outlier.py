@@ -549,9 +549,7 @@ def tag_base_table(gm, producer_name: str, shape: list) -> None:
     The producer and each consumer allocate the table independently, because
     neither can see the other's graph; a pass in ``bufferize_graph`` merges the
     tagged group once every nest has been spliced. Matching on the shape picks
-    it out from the nest's other integer buffers. A nest that both
-    consumes and produces a CSR holds two tables, so each call claims the
-    first untagged match and stops.
+    it out from the nest's other integer buffers.
     """
     for n in gm.graph.nodes:
         if n.op != "call_function" or n.target is not voyager.alloc.default:

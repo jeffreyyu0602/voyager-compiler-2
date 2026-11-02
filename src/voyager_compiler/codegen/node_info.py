@@ -1107,22 +1107,6 @@ def is_spmm(node: Node) -> bool:
     return node.kwargs.get("A_data") is not None
 
 
-def gemm_produces_csr(node) -> bool:
-    """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
-
-    Such a group is a producer as well as (possibly) a consumer: the quantize
-    runs on the accumulator tile, so its CSR is emitted per output tile and
-    has to be stored by hand rather than diced by the output grid.  A group
-    whose *anchor* is the quantize is not one -- that is the row-swept case.
-    """
-    anchor = get_anchor_node(node)
-    if anchor is None or not is_gemm_op(anchor):
-        return False
-    if csr_quantize_node(node) is None:
-        return False
-    return isinstance(node.value, (list, tuple)) and len(node.value) == 5
-
-
 def csr_consumers(producer):
     """The GEMMs that consume the outlier CSR ``producer`` emits.
 

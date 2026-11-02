@@ -1291,9 +1291,8 @@ def _split_stream_break(fused_gm):
     any) immediately before it.
 
     Args:
-        fused_gm: The fused tail ``[acc, *operands] -> output(s)``; a
-            non-``GraphModule`` tail (``None``, a sparse ``_EpilogueTail``)
-            is never split.
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``;
+            ``None`` is never split.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),

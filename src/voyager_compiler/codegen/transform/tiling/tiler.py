@@ -23,10 +23,8 @@ class TileConstraint:
     tile to one extent, ``multiple`` requires it to be a whole number of the
     value; both are ``((loop, value), ...)`` so a constraint can key the
     tiling cache.  A GEMM feeding an MHA relayout takes a ``le.OC``
-    multiple of the head; a CSR consumer an exact ``le.IC`` (the slice
-    width) and a CSR producer a ``le.OC`` multiple of it (its column tile
-    is cut into slices), which is how ``plan_csr_slices`` searches the two
-    under one width.
+    multiple of the head; a CSR consumer an exact ``le.IC``, the slice
+    width ``plan_csr_slices`` searches it under.
     """
 
     exact: Tuple[Tuple[int, int], ...] = ()

@@ -22,7 +22,6 @@ from voyager_compiler.codegen.node_info import (
     bound_operands,
     compute_output_tiled_shapes,
     compute_tiled_shape,
-    csr_quantize_node,
     dtype_byte_size,
     gemm_output_shape,
     get_anchor_node,
@@ -300,13 +299,7 @@ def tail_extra_passes(node):
     or the pipeline has no stage left for it (fusion's
     ``single_k_tail_fusible`` / ``split_k_tail_fusible``): after the drain
     on a single round, after the accumulate on a split one, which takes one
-    more.  A CSR-producing
-    epilogue (``_EpilogueTail``) re-dices its tile at the consumers' slice
-    width: ops between the anchor and the ``quantize_mx_outlier`` run once on
-    the whole tile, and their result is staged whenever a slice is finer
-    than the column tile.  The slice count is a consumer property the search
-    cannot see, so every prefixed producer tail takes the single round's
-    pass.
+    more.
     """
     anchor = get_anchor_node(node)
     sub_gm = node.meta.get("submodule")
@@ -315,12 +308,6 @@ def tail_extra_passes(node):
     batch_dims = anchor.value.ndim - 2 if is_bmm(anchor) else 0
     breaks_stream = stream_breaking_quantize(sub_gm, batch_dims) is not None
     single_k = breaks_stream or not node.meta.get("single_k_tail_fusible", True)
-    out_quant = csr_quantize_node(node)
-    if not single_k and out_quant is not None:
-        single_k = (
-            isinstance(out_quant.args[0], Node)
-            and out_quant.args[0].target is not anchor.target
-        )
     split_k_fusible = node.meta.get("split_k_tail_fusible", False)
     split_k = sub_gm is not None and (breaks_stream or not split_k_fusible)
     return single_k, split_k
@@ -387,11 +374,9 @@ def activation_k_major(anchor):
 
 
 def outlier_stats(node):
-    """``(outlier_pct, out_outlier_pct, outlier_rate)`` of a GEMM / conv
-    ``node``: the fraction of the activation an outlier CSR its anchor
-    consumes holds, the fraction of the output the CSR its fused tail emits
-    may hold (that quantize's ``max_pct``), and the consumed CSR's measured
-    outlier rate.  Each is 0 without such a CSR."""
+    """``(outlier_pct, outlier_rate)`` of a GEMM / conv ``node``: the
+    fraction of the activation an outlier CSR its anchor consumes holds, and
+    that CSR's measured outlier rate.  Each is 0 without such a CSR."""
     anchor = get_anchor_node(node)
     outlier_pct = 0.0
     outlier_rate = 0.0
@@ -401,12 +386,7 @@ def outlier_stats(node):
         elements = act.shape[-2] * act.shape[-1]
         outlier_pct = a_data.value.shape[-1] / elements
         outlier_rate = anchor.meta["outlier_rate"]
-
-    out_outlier_pct = 0.0
-    out_quant = csr_quantize_node(node)
-    if out_quant is not None:
-        out_outlier_pct = get_arg_value(out_quant, 9, "max_pct", 0.01)
-    return outlier_pct, out_outlier_pct, outlier_rate
+    return outlier_pct, outlier_rate
 
 
 def mha_head(node):

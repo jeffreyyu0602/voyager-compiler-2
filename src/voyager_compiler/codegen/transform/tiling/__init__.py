@@ -3,7 +3,7 @@
 ``matrix_search`` maps a GEMM / conv through ``interstellar``,
 ``grid_search`` tiles a vector, GEMV or pool op and ``attention_search`` a
 flash attention; ``csr_slice_planning`` chooses outlier-CSR slice widths
-jointly for the GEMMs they couple.  Each asks the backend's ``RuntimeModel``
+with the GEMMs that consume them.  Each asks the backend's ``RuntimeModel``
 (``runtime_model``) to prepare each op, then whether a candidate fits and
 what it costs, and stamps the winner as ``meta["tile_result"]``; ``tiler``
 holds what they share.  ``lowering`` and ``traversal`` hold the graph facts

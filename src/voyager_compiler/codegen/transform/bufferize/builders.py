@@ -16,7 +16,6 @@ from voyager_compiler.codegen.node_info import (
     NORM_OPS,
     SOFTMAX_OPS,
     csr_quantize_node,
-    gemm_produces_csr,
     is_axis_reduction,
     is_conv2d,
     is_elementwise_op,
@@ -128,9 +127,7 @@ SHARED_BUILDERS: tuple[BuilderRule, ...] = (
     # the per-step gather of the row tile's blocks.
     BuilderRule(
         "sparse_gemm",
-        lambda node, anchor: (
-            anchor.kwargs.get("A_indptr") is not None or gemm_produces_csr(node)
-        ),
+        lambda node, anchor: anchor.kwargs.get("A_indptr") is not None,
         build_sparse_gemm,
     ),
     BuilderRule("gemm", lambda node, anchor: is_gemm_op(anchor), build_gemm),
@@ -142,8 +139,7 @@ SHARED_BUILDERS: tuple[BuilderRule, ...] = (
     ),
     # A row-swept producer: the quantize needs a per-K-slice tiling its
     # anchor cannot give it, so it gets its own two-loop nest rather than
-    # build_pointwise's single grid.  A GEMM-anchored epilogue never reaches
-    # this rule — the sparse rule above takes it.
+    # build_pointwise's single grid.
     BuilderRule(
         "quantize_mx_outlier",
         lambda node, anchor: csr_quantize_node(node) is not None,
