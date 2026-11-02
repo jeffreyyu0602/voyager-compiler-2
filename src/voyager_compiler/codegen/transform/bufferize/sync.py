@@ -252,14 +252,38 @@ def _placeholders(gm: GraphModule) -> List[Node]:
     return [n for n in gm.graph.nodes if n.op == "placeholder"]
 
 
+def _is_host_op(node: Node) -> bool:
+    """An op the SoC emitter runs on the CPU instead of dispatching it (the
+    runtime's ``is_host_bookkeeping``): a ``clone``, or an ``add`` of an
+    int32 or int64 tensor."""
+    if node.op != "call_function":
+        return False
+    if node.target is torch.ops.aten.clone.default:
+        return True
+    if node.target not in (
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.add.Scalar,
+    ):
+        return False
+    arg = node.args[0]
+    value = getattr(arg, "value", None)
+    if value is None and isinstance(arg, Node):
+        value = arg.meta.get("val")
+    return isinstance(value, torch.Tensor) and value.dtype in (
+        torch.int32,
+        torch.int64,
+    )
+
+
 def _is_dispatch(node: Node) -> bool:
     """A dispatchable op: a compute op (a fused module, a matrix op, a
-    vector op) or a ``with_scratch`` region around one."""
+    vector op) or a ``with_scratch`` region around one, but not a host op
+    (``_is_host_op``)."""
     if node.op == "call_function" and node.target is WITH_SCRATCH:
         return True
     if node.op not in ("call_module", "call_function") or is_nop(node):
         return False
-    return _is_compute(node)
+    return _is_compute(node) and not _is_host_op(node)
 
 
 def _is_matrix_op(node: Node) -> bool:
@@ -1027,6 +1051,8 @@ class _Layer:
                 self._walk_copy(self.copies[node], state)
             elif node.target is _SCALAR_READ:
                 self._walk_read(node, region, state)
+            elif _is_host_op(node):
+                self._walk_host(node, region, state)
 
     def _graph(self, region) -> Graph:
         return (region.gm if region is not None else self.gm).graph
@@ -1098,6 +1124,36 @@ class _Layer:
                     continue
                 counter = self._thread(self._unit_counter(post), region)
                 self._wait(s.graph, copy.node, counter, value)
+
+    def _walk_host(self, node, region, state) -> None:
+        """A host op waits on the CPU for every unit's last writer of the
+        on-chip values it reads and last toucher of those it overwrites.
+        It posts nothing: the CPU issues what follows only once it is
+        done."""
+        accesses = [
+            (_WRITE, self._access(arg, region)) for arg in node.all_input_nodes
+        ]
+        written = [node] + [
+            user.args[1]
+            for user in node.users
+            if user.target is _INSERT and user.args[0] is node
+        ]
+        accesses += [(_TOUCH, self._access(w, region)) for w in written]
+        s = _Scalars(self.names, self._graph(region), node)
+        for kind, access in accesses:
+            if access is None:
+                continue
+            buffer, slot = access
+            if buffer in self.spmm_buffers:
+                self._drain(s.graph, node)
+            for unit in UNITS:
+                for post, value in self._lookup(
+                    s, state, kind, unit, buffer, slot, region
+                ):
+                    if value == 0:
+                        continue
+                    counter = self._thread(self._unit_counter(post), region)
+                    self._wait(s.graph, node, counter, value)
 
     def _walk_read(self, node, region, state) -> None:
         """A CPU read of an on-chip value waits for its last writer."""

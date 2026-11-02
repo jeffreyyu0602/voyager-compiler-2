@@ -2717,9 +2717,19 @@ def build_pointwise(
     else:
         in_tiling = reduced_input_tiling(anchor, tiling)
         in_grid = reduced_input_grid(anchor)
+        # A single-element operand passes whole (the mapper takes it as an
+        # immediate) only when it is a constant; one a graph input feeds is
+        # loaded like any operand.
         in_specs = [
             (
-                _compute_input_spec(in_tiling, tuple(n.shape), in_grid)
+                _compute_input_spec(
+                    in_tiling,
+                    tuple(n.shape),
+                    in_grid,
+                    whole_scalar=not any(
+                        a.op == "placeholder" for a in ancestors(n) | {n}
+                    ),
+                )
                 if n not in codebooks
                 else None
             )

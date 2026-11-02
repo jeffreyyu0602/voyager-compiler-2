@@ -301,11 +301,16 @@ class _ScratchSpec:
 
 
 def _compute_input_spec(
-    tiling: tuple, input_shape: tuple, grid_map: Optional[tuple] = None
+    tiling: tuple,
+    input_shape: tuple,
+    grid_map: Optional[tuple] = None,
+    whole_scalar: bool = True,
 ) -> Optional[_InputSpec]:
     """Derive the tile spec for one operand (NumPy/PyTorch right-align rules),
     or ``None`` for a 0-D / single-element operand that is passed whole (not
-    tiled / loaded).
+    tiled / loaded).  ``whole_scalar=False`` loads such an operand too, as a
+    broadcast tile: a value computed at run time, which the program can read
+    only once it is on chip.
 
     ``tiling`` is the per-output-dim tile-factor vector; the operand's tile is
     ``compute_tiled_shape(input_shape, tiling)``.  ``grid_map`` maps each output
@@ -316,7 +321,10 @@ def _compute_input_spec(
     doesn't span.
     """
     # 0-D or single-element tensors are passed through (no spec).
-    if len(input_shape) == 0 or (len(input_shape) == 1 and input_shape[0] == 1):
+    single = len(input_shape) == 0 or (
+        len(input_shape) == 1 and input_shape[0] == 1
+    )
+    if single and whole_scalar:
         return None
 
     ndim_in = len(input_shape)
