@@ -404,7 +404,6 @@ def build_generator(
     else:
         mark("freezing")
         lm.freeze()
-        lm.replay = device.type == "cuda"
     if device.type == "cuda":
         torch.cuda.empty_cache()
         mark(f"{torch.cuda.memory_allocated(device) / 2**30:.1f} GiB resident")

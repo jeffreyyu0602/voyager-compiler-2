@@ -486,13 +486,30 @@ class QuantizedLM(QuantizedModel):
     attention's residual halves unquantized, and the prefill must split
     its cache writes alike: it then writes the prompt's whole chunks into
     the main caches and the tail into the residuals, which both graphs
-    hold as one tensor.  ``freeze`` bakes, for evaluation, the fake-quants
-    of the weights and of a split cache's main halves.  On a GPU,
-    ``replay`` captures the decode step as a CUDA graph.  ``prompt_graph``,
-    when set, gives the prefill graph each prompt length runs instead of
-    ``graphs["prefill"]``; ``fold_step``, when set, completes the chunks of
-    a split cache after each decode step, for a decode graph that does
-    not.
+    hold as one tensor.
+
+    The inference graphs take one of four forms, along two paths from the
+    model as built -- prepared to frozen, and prepared to converted to
+    lowered; a form is never left, and ``convert`` rejects a frozen model:
+
+    - prepared, as built: every quantization is a fake-quant, calibrating
+      while its observer is on;
+    - frozen (``freeze``), for fast fake-quant evaluation: each weight's
+      fake-quant and the reads of a split cache's main halves are computed
+      once, the activations' every step;
+    - converted (``convert``): real quantize and dequantize ops, each
+      weight stored as its codes and scales -- the graphs the compiler's
+      ``transform`` and ``compile`` take;
+    - lowered (``voyager_compiler.lower``): converted, then ``transform``
+      with no hardware, so the KV cache is stored and read as the compiled
+      programs store and read it.
+
+    A frozen or lowered model on a GPU replays its decode step as a CUDA
+    graph (``replay``).  ``prompt_graph``, when set, gives the prefill graph
+    each prompt length runs instead of ``graphs["prefill"]``;
+    ``fold_step``, when set, completes the chunks of a split cache after
+    each decode step, for a decode graph that does not: both are how a
+    lowered model runs.
 
     Args:
         model: The causal LM, with eager attention for the training lowering.
@@ -640,7 +657,7 @@ class QuantizedLM(QuantizedModel):
         # Called with each decode step's position when the decode graph
         # leaves its cache folds to the caller; None when it does not.
         self.fold_step = None
-        self.replay = False
+        self._replay = False
         self.cuda_graph = None
         self.samples = 0
         self.prefill_seconds = 0.0
@@ -660,6 +677,18 @@ class QuantizedLM(QuantizedModel):
         """Where the LM and its graphs live."""
         return self.model.device
 
+    @property
+    def replay(self) -> bool:
+        """Whether ``step`` replays the decode step as a CUDA graph."""
+        return self._replay
+
+    @replay.setter
+    def replay(self, on: bool) -> None:
+        # A CUDA graph exists only on a GPU; a capture of the old step is
+        # stale.
+        self._replay = on and self.device.type == "cuda"
+        self.cuda_graph = None
+
     @staticmethod
     def _residuals(
         decode: GraphModule,
@@ -671,11 +700,14 @@ class QuantizedLM(QuantizedModel):
                 main = name[: -len(_RESIDUAL)]
                 yield main, decode.get_buffer(main), residual
 
-    def freeze(self) -> None:
+    def freeze(self, replay: bool = True) -> None:
         """Freeze the weights (``QuantizedModel.freeze``), then what the
         decode graph computes from a split cache's main halves
         (``freeze_cache_reads``).  From then on ``prefill`` and ``fold``
         write the main halves and recompute those reads.
+
+        Args:
+            replay: On a GPU, replay the decode step as a CUDA graph.
 
         Raises:
             RuntimeError: The model was built without inference graphs.
@@ -686,6 +718,7 @@ class QuantizedLM(QuantizedModel):
             decode = self.graphs["decode"]
             caches = [name for name, _, _ in self._residuals(decode)]
             self._refresh = freeze_cache_reads(decode, caches)
+        self.replay = replay
 
     def prefill(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Write a prompt into the emptied cache and return the logits of

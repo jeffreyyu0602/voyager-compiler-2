@@ -735,7 +735,6 @@ def test_gpu_replay_generates_the_cpu_tokens():
         lm.eval()
         lm.prefill(torch.randint(0, VOCAB, (1, 320), device=device))
         lm.freeze()
-        lm.replay = device == "cuda"
         torch.manual_seed(2)
         tokens[device] = [
             lm.generate(torch.randint(0, VOCAB, (1, n)).to(device), 16).cpu()

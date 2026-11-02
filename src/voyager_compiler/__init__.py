@@ -418,7 +418,7 @@ def transform(
     return model
 
 
-def lower(lm: QuantizedLM) -> None:
+def lower(lm: QuantizedLM, replay: bool = True) -> None:
     """Convert ``lm`` and lower its inference graphs (``transform``, no
     hardware), so ``prefill`` and ``generate`` run them on the device they
     live on, the cache stored as the compiled programs store it.
@@ -426,14 +426,15 @@ def lower(lm: QuantizedLM) -> None:
     The decode graph is lowered in place, its index arithmetic kept on the
     device and its cache folds moved into ``lm.fold_step``
     (``move_folds_out``), so every step runs the same ops and, on a GPU,
-    replays as a CUDA graph.  Its stored cache formats are what each prefill
-    writes the prompt in.  The prefill is lowered once per prompt length,
-    the first time a prompt runs it: a copy of the converted graph holding
-    its weights and cache, not copies of them.  Each lowered graph's
-    deferred constants are computed and installed.
+    can replay as a CUDA graph.  Its stored cache formats are what each
+    prefill writes the prompt in.  The prefill is lowered once per prompt
+    length, the first time a prompt runs it: a copy of the converted graph
+    holding its weights and cache, not copies of them.  Each lowered
+    graph's deferred constants are computed and installed.
 
     Args:
         lm: A prepared, unfrozen model; converted and lowered in place.
+        replay: On a GPU, replay the decode step as a CUDA graph.
     """
     lm.convert()
     device = lm.device
@@ -478,7 +479,7 @@ def lower(lm: QuantizedLM) -> None:
             return lowered[length]
 
         lm.prompt_graph = prompt_graph
-    lm.replay = device.type == "cuda"
+    lm.replay = replay
 
 
 def compile(
