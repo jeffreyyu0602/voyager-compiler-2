@@ -19,9 +19,8 @@ the list of completion cycles of what has been added to it, in order; a wait
 for ``counter >= threshold`` resolves at the ``threshold``-th of them,
 whether that post came from a DMA or an async compute.  ``async_wait``
 blocks the program clock until its wait resolves; a commit's passes wait
-per unit before they start.  A pass frees its unit(s) at the end of its
-charged cycles but is done ``OpInfo.completion_cycles`` later, and its post
-carries the done.
+per unit before they start.  A pass is done, and frees its unit(s), at the
+end of its charged cycles, and its post carries that end.
 
 Every timestamp the machine holds -- the clocks, the unit-free cycles, the
 posted completions and the parked commits' floors -- is exposed by
@@ -184,19 +183,12 @@ class ResourceState:
             # the program clock: its start floors on the issue cycle
             # (commit_now, advanced by each body op), on the cycle its
             # unit(s)' waits resolved at, and on its unit(s), never on
-            # self.now.  A fused op's vector pass works on the matrix output,
-            # so the vector waits floor the end of its cycles, not the start.
-            floors = []
-            for u in op.units:
-                floor = self.commit_floors[_WAIT_UNIT[u]]
-                if u == "vector" and "mma" in op.units:
-                    floor -= op.effective_cycles
-                floors.append(floor)
+            # self.now.
+            floors = [self.commit_floors[_WAIT_UNIT[u]] for u in op.units]
             start = max(self.commit_now, *units_free, *floors)
         else:
             start = max(self.now, *units_free)
         end = start + op.effective_cycles
-        done = end + op.completion_cycles
         rec = TimingRecord(
             eid=self._eid(),
             node_name=node.name,
@@ -214,12 +206,12 @@ class ResourceState:
             self._occupy(u, end)
         if self.in_commit:
             # A committed op occupies its unit(s) but leaves the program clock;
-            # its post carries the done.  A sync one advances the clock to it.
+            # its post carries its end.  A sync one advances the clock to it.
             self.commit_now = end
             self.last_commit_node = node
-            self.pending_post[id(node)] = done
+            self.pending_post[id(node)] = end
         else:
-            self.now = done
+            self.now = end
         if self.trace is not None:
             base = self.trace_base
             self.trace.append(

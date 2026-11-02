@@ -55,20 +55,14 @@ class OpInfo:
     ``ceil(ideal_cycles / utilization)`` cycles.  It is compute-only (DRAM
     is modeled separately, as ``async_copy`` events) and pre-computed by
     ``cost.py``.  A calibrated op carries the RTL-derived ``measured_cycles``
-    instead, with ``calibration`` saying how it was derived (``exact`` for
-    a one-op period, ``shared`` when the period's ops split one
-    measurement pro rata, ``per-op`` when the op's own RTL runtime priced
-    it).
+    instead, with ``calibration`` set to ``per-op``: the op's own RTL
+    runtime priced it.
 
     ``slot`` is the op's 0-based ordinal within its kernel, in the order
     the scheduler first walks the kernel's ops.  Kernels built from one
     nest walk their ops in the same order, so ``(build_key, slot)`` names
     the same op in every one of them; that is what a per-op measurement is
     keyed by.
-
-    ``completion_cycles`` is how long after its charged cycles the op is
-    done: its units free at the end of the charged cycles, while the
-    counter it posts sees the done.
     """
 
     key: str
@@ -81,7 +75,6 @@ class OpInfo:
     slot: int = -1
     measured_cycles: Optional[int] = None
     calibration: str = ""
-    completion_cycles: int = 0
 
     @property
     def analytic_cycles(self) -> int:

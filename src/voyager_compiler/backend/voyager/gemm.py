@@ -662,15 +662,6 @@ class RuntimeCalculator:
             stall = max(stall, fraction * excess)
         return stall
 
-    def matrix_cycles(self, mapping, banks):
-        """Cycles of one L3 grid step (``matrix_timing``'s first value).
-
-        Args:
-            mapping: The interstellar mapping to price.
-            banks: Its placement's banks (``_banks``), or ``None``.
-        """
-        return self.matrix_timing(mapping, banks)[0]
-
     def matrix_timing(self, mapping, banks):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
@@ -1081,7 +1072,7 @@ class RuntimeCalculator:
             total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
             if num_k > 1 or self.single_k_tail_extra_pass:
                 total_time += output_tiles * vector_cycles
-            return Cost(total_time, dram_bytes, matrix_cycles, completion)
+            return Cost(total_time, dram_bytes, matrix_cycles)
 
         if num_k == 1:
             # Every step finishes a tile: one schedule covers the sweep.  A
@@ -1093,7 +1084,7 @@ class RuntimeCalculator:
             if self.single_k_tail_extra_pass and not self.tail_keeps_shape:
                 step += vector_cycles
             total_time = sweep_cycles(dmas, l3_blocks, step)
-            return Cost(total_time, dram_bytes, matrix_cycles, completion)
+            return Cost(total_time, dram_bytes, matrix_cycles)
 
         load = input_load + weight_load
         # The sweep's last step has no tile after it to prefetch, so it costs
@@ -1134,7 +1125,7 @@ class RuntimeCalculator:
             dma = max(matrix_cycles + vector_cycles, prefetch) + store + load
             total_time += count * max(compute, dma)
         total_time += matrix_cycles + vector_cycles + store
-        return Cost(total_time, dram_bytes, matrix_cycles, completion)
+        return Cost(total_time, dram_bytes, matrix_cycles)
 
 
 @dataclass(frozen=True)

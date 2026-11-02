@@ -14,20 +14,16 @@ the same cached nest.  It records that twice:
 
 The sheet is keyed by the first and shows the second.
 
-Calibration maps a group to the cycles one steady-state iteration took in
-RTL, measured with no DRAM model, so it replaces the *compute* term of the
-estimate and nothing else: the analytic DMA cost and the scheduler's
-overlap stay.  ``Calibration.apply`` prices every compute op of a measured
-kernel by the ratio of measured to analytic cycles per iteration -- exact
-for a one-op period, pro rata (``shared``) when a period runs several ops.
-
-A finer measurement takes precedence: the ``Op calibration`` sheet gives
-one op's own steady-state cycles per invocation, keyed by build key and the
-op's ``slot`` in its kernel, and the op is priced at exactly that; the
-scheduler then works out how the kernel's ops overlap.  The build key does
-not cover tiling, so a row also carries the shapes it was measured at, and
-an op tiled otherwise ignores it.  An op with no usable row keeps the ratio
-path, and the kernel's launch term applies either way.
+Calibration replaces the *compute* term of the estimate and nothing else,
+measured in RTL with no DRAM model: the analytic DMA cost and the
+scheduler's overlap stay.  The ``Op calibration`` sheet gives one op's own
+steady-state cycles per invocation, keyed by build key and the op's
+``slot`` in its kernel, and ``Calibration.apply`` prices the op at exactly
+that; the scheduler then works out how the kernel's ops overlap.  The build
+key does not cover tiling, so a row also carries the shapes it was measured
+at; an op tiled otherwise, or with no row, keeps its analytic price.  The
+``Calibration`` sheet's per-group cycles per iteration are reported beside
+the estimate, and its launch term is charged once per kernel.
 
 The same sheet carries the group's measured **power**, which corrects
 nothing: the compiler has no power model, and the number exists only so the
@@ -114,7 +110,6 @@ class Measurement:
     measured_per_iteration: float
     analytic_per_iteration: float
     launch_cycles: int = 0
-    exact: bool = False  # the period runs one op, so the ratio is exact
     power: float = 0.0  # W, measured on silicon; not a correction
     # The cells it was read from, so a calibrated compile can write the
     # measurement back onto its own sheet.
@@ -122,10 +117,6 @@ class Measurement:
     t1: float = 0.0
     n2: float = 0.0
     t2: float = 0.0
-
-    @property
-    def ratio(self) -> float:
-        return self.measured_per_iteration / self.analytic_per_iteration
 
 
 @dataclass
@@ -166,8 +157,8 @@ def op_shapes(op: OpInfo) -> str:
 class Calibration:
     """Build group -> measurement, applied to each ``OpInfo`` as it is
     priced.  ``power`` is carried through untouched for the reporting
-    workbook; only the per-op cycles, ``ratio`` and ``launch_cycles``
-    change a schedule."""
+    workbook; only the per-op cycles and ``launch_cycles`` change a
+    schedule."""
 
     def __init__(
         self,
@@ -182,26 +173,19 @@ class Calibration:
         self.shape_mismatches: Dict[Tuple[str, int], Tuple[str, str]] = {}
 
     def apply(self, op: OpInfo, group: Optional[str]) -> None:
-        """Price ``op``: by its own measurement when the ``Op calibration``
-        sheet has a row for ``(group, op.slot)`` measured at the op's shapes,
-        else by the group's ratio, else not at all (the analytic price
-        stands)."""
+        """Price ``op`` by its own measurement when the ``Op calibration``
+        sheet has a row for ``(group, op.slot)`` measured at the op's
+        shapes; otherwise the analytic price stands."""
         per_op = self.op_measurements.get((group, op.slot)) if group else None
         if per_op is not None and per_op.shapes:
             shapes = op_shapes(op)
             if shapes != per_op.shapes:
                 self._shape_mismatch(per_op, shapes)
                 per_op = None
-        if per_op is not None:
-            op.measured_cycles = max(1, round(per_op.cycles))
-            op.calibration = "per-op"
-            self.applied[group] = self.applied.get(group, 0) + 1
+        if per_op is None:
             return
-        m = self.measurements.get(group) if group else None
-        if m is None or not m.measured_per_iteration:
-            return
-        op.measured_cycles = max(1, round(op.analytic_cycles * m.ratio))
-        op.calibration = "exact" if m.exact else "shared"
+        op.measured_cycles = max(1, round(per_op.cycles))
+        op.calibration = "per-op"
         self.applied[group] = self.applied.get(group, 0) + 1
 
     def _shape_mismatch(self, row: "OpMeasurement", shapes: str) -> None:
@@ -212,7 +196,7 @@ class Calibration:
         self.shape_mismatches[where] = (row.shapes, shapes)
         logger.warning(
             "Op calibration %s slot %d (%s) was measured at %s; this compile "
-            "has %s, so the op keeps the ratio path",
+            "has %s, so the op keeps its analytic price",
             row.key,
             row.slot,
             row.op,
@@ -377,8 +361,9 @@ OP_HEADERS = [
     "Source",
     "Shapes",
 ]
-# Fewer steady-state samples than this is no measurement: the op keeps the
-# ratio path.  A row with Samples left blank was written by hand and counts.
+# Fewer steady-state samples than this is no measurement: the op keeps its
+# analytic price.  A row with Samples left blank was written by hand and
+# counts.
 _MIN_OP_SAMPLES = 2
 
 
@@ -496,12 +481,10 @@ def load_calibration(path: str) -> Calibration:
                 launch = float(t1) - float(n1) * per_iteration
             else:
                 per_iteration = float(t1) / float(n1)
-        ops = str(cell(cells, "Ops per iteration") or "")
         measurements[str(group)] = Measurement(
             measured_per_iteration=per_iteration,
             analytic_per_iteration=analytic,
             launch_cycles=max(0, round(launch)),
-            exact=len(ops.split()) == 1,
             power=float(power) if power is not None else 0.0,
             n1=float(n1 or 0),
             t1=float(t1 or 0),
@@ -516,8 +499,8 @@ def load_op_measurements(wb) -> Dict[Tuple[str, int], OpMeasurement]:
     ``(Key, Slot)``; empty when the sheet is absent.
 
     A row needs a key, a slot and a positive ``Measured cycles``; one with
-    fewer than two ``Samples`` is dropped, so its op stays on the ratio
-    path, and so is one whose numbers do not read as numbers.  A repeated
+    fewer than two ``Samples`` is dropped, so its op keeps its analytic
+    price, and so is one whose numbers do not read as numbers.  A repeated
     ``(Key, Slot)`` means a hand edit; the last row wins.
     """
     if OP_SHEET not in wb.sheetnames:

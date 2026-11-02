@@ -78,14 +78,13 @@ def _busy_cycles(recs) -> int:
 
 
 # The order a kernel's mixed calibration labels are joined in, finest first.
-_LABEL_ORDER = ("per-op", "exact", "shared", "analytic")
+_LABEL_ORDER = ("per-op", "analytic")
 
 
 def _calibration_label(period_ops: List[OpInfo]) -> str:
     """How a kernel's period was priced: one label when its ops agree, else
-    the distinct labels finest first, for example ``per-op+shared`` when
-    some ops had their own measurement and the rest fell back to the ratio,
-    or ``per-op+analytic`` when some were left unpriced."""
+    ``per-op+analytic`` when some ops had their own measurement and the
+    rest kept the analytic price."""
     present = {op.calibration or "analytic" for op in period_ops}
     labels = [label for label in _LABEL_ORDER if label in present]
     return "+".join(labels)
@@ -163,8 +162,8 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
         }
         # Per iteration, the time the schedule spends computing, overlaps
         # counted once.  Analytic cyc/iter scales it back by analytic over
-        # effective: exact under the ratio, which scales ops alike, but only
-        # an effective-weighted approximation under per-op prices.
+        # effective, an effective-weighted approximation under per-op
+        # prices.
         busy = _busy_cycles(compute)
         analytic = sum(ops[k].analytic_cycles * v for k, v in counts.items())
         effective = sum(ops[k].effective_cycles * v for k, v in counts.items())
@@ -176,7 +175,7 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
         ]
         if measured:
             # The busy time comes out of the schedule, so it is the measured
-            # figure under per-op prices as much as under the ratio.
+            # figure under per-op prices.
             period_ops = [ops[k] for k in counts]
             row.calibration = _calibration_label(period_ops)
             row.measured_per_iteration = busy / iterations
