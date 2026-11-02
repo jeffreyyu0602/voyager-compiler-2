@@ -1195,14 +1195,10 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         # A split reduction's tail reads the partial sum from scratch, on the
         # finalize pass or on an extra pass after it.  A second region lets
         # the next tile's first round start before that read is done, so
-        # ``fit`` offers it beside one, except under the chained tail of an
-        # outlier GEMM, which keeps one (``_SparseGemm``).  A sync nest keeps
-        # one region.
+        # ``fit`` offers it beside one.  A sync nest keeps one region.
         consumes_csr = anchor.kwargs.get("A_data") is not None
         scratch_regions = 1
-        if config.async_pipeline and (
-            split_k_extra_pass or (has_tail and not consumes_csr)
-        ):
+        if config.async_pipeline and has_tail:
             scratch_regions = 2
         outlier_pct, outlier_rate = outlier_stats(node)
         if isinstance(out_dtype, (list, tuple)):
@@ -1406,7 +1402,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         # The gathered CSR shares the input's bank: a block's (value, index)
         # pairs, at the fraction of the activation the stream is sized for.
         # Its staging ping-pongs exactly when the input does -- a sweep that
-        # gathers once keeps one slot (``_SparseGemm.forward``).
+        # gathers once keeps one slot (``_SparseGemm.gather_slots``).
         gathered = if_count * self.outlier_pct
         sizes = {
             Role.INPUT: self._alloc_bytes(if_count, self.input_dtype_width),

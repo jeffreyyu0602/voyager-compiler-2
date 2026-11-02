@@ -43,6 +43,7 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _split_stream_break,
     _stamp_anchor_meta,
     _stamp_bank_groups,
+    get_slot,
     PipelinedKernel,
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
@@ -88,8 +89,9 @@ class _SparseGemm(torch.nn.Module):
     the row dim, changes block with every step and gathers per step.
 
     The stores trail their compute by ``lag`` steps (``PipelinedKernel``).
-    The gather staging has one slot, so a gather overwrites it only once the
-    SpMM before it has read it; the sync pass derives that wait.
+    The gather staging takes the pointer operand's pipeline depth, the
+    input's, and each gather fills the next slot, so a gather overlaps the
+    SpMM reading the slot before it; the sync pass derives the waits.
     """
 
     def __init__(
@@ -120,9 +122,12 @@ class _SparseGemm(torch.nn.Module):
         self.reuse_gathers = plan.num_k == 1 and self.row_steps > 1
         self.split_k_tail_fusible = split_k_tail_fusible
         self.single_k_tail_fusible = single_k_tail_fusible
-        # The K accumulator, when the reduction needs one, and the dense
-        # per-step kernel.
-        self.scratch_specs, self.dense_kernel = self._scratch_and_kernel()
+        # Classified once: the traced per-step kernel rebuild cannot walk a
+        # graph.
+        self.tail_split = _split_stream_break(plan.fused_gm)
+        # The K accumulator, when the reduction needs one.  The kernel built
+        # alongside it is rebuilt per step, over that step's gather slot.
+        self.scratch_specs = self._scratch_and_kernel(None)[0]
         self.inner = PipelinedKernel(
             self._kernel,
             grid=plan.grid,
@@ -132,13 +137,20 @@ class _SparseGemm(torch.nn.Module):
             num_slots=num_slots,
             lag=lag,
         )
+        self.gather_slots = self.inner._num_slots(
+            plan.in_specs[plan.kw_idx["A_indptr"]]
+        )
 
     # --- kernel assembly ----------------------------------------------------
 
-    def _scratch_and_kernel(self):
+    def _scratch_and_kernel(self, gather):
         """The dense path's scratch and kernel, over a ``gemm_kernel`` that
         reads the gathered CSR, in its staging buffers, instead of the raw
         operands.
+
+        Args:
+            gather: The step's ``(data, indices)`` staging slot, or ``None``
+                when only the scratch specs are wanted.
 
         Returns:
             ``(scratch_specs, kernel)``, the kernel matching the arity of
@@ -153,8 +165,7 @@ class _SparseGemm(torch.nn.Module):
 
         def gemm_kernel(in_tiles, first):
             tiles = list(in_tiles[:num_operands])
-            tiles[data_idx] = self._bufs.gather_data
-            tiles[indices_idx] = self._bufs.gather_indices
+            tiles[data_idx], tiles[indices_idx] = gather
             # One call consumes one K slice, so the slice axis is addressing,
             # not data: the op wants a plain [*batch, tm+1] pointer array.
             ptr = in_tiles[indptr_idx]
@@ -175,12 +186,28 @@ class _SparseGemm(torch.nn.Module):
             anchor=plan.anchor,
             accumulate_fp32=self.accumulate_fp32,
             lag=self.lag,
-            split=_split_stream_break(plan.fused_gm),
+            split=self.tail_split,
             single_k_tail_fusible=self.single_k_tail_fusible,
             split_k_tail_fusible=self.split_k_tail_fusible,
         )
 
-    def _gather_rolled(self, idx, slots):
+    def _gather_slot(self, idx):
+        """The staging slot step ``idx`` gathers into and reads, as
+        ``(data, indices)``: its gather's ordinal modulo the depth.  A sweep
+        that reuses gathers counts row tiles (the grid dims up to the row
+        dim), any other counts steps."""
+        grid = self.plan.grid
+        last = self.grid_m if self.reuse_gathers else len(grid) - 1
+        ordinal = 0
+        for d in range(last + 1):
+            ordinal = ordinal * grid[d] + idx[d]
+        slot = ordinal % self.gather_slots
+        return (
+            get_slot(self._bufs.gather_data, slot),
+            get_slot(self._bufs.gather_indices, slot),
+        )
+
+    def _gather_rolled(self, idx, slots, gather):
         """Gather a row tile's ``R`` blocks, in a ``while_loop`` over them.
 
         Unrolled this would be ``R`` copies of the same block fetch, one
@@ -193,6 +220,7 @@ class _SparseGemm(torch.nn.Module):
         Args:
             idx: The grid coordinate.
             slots: The operand tiles, positionally.
+            gather: The ``(data, indices)`` staging slot the blocks land in.
         """
         plan, g, bufs = self.plan, self.geom, self._bufs
         nb, ones = g.nb, g.ones
@@ -202,8 +230,8 @@ class _SparseGemm(torch.nn.Module):
         p = slots[plan.kw_idx["A_indptr"]].reshape(ones + (plan.tile_m + 1,))
         lo = _scalar(_entry(p, 0, nb, ones))
         pairs = (
-            (slots[plan.kw_idx["A_data"]], bufs.gather_data),
-            (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
+            (slots[plan.kw_idx["A_data"]], gather[0]),
+            (slots[plan.kw_idx["A_indices"]], gather[1]),
         )
 
         def cond_fn(j):
@@ -259,14 +287,15 @@ class _SparseGemm(torch.nn.Module):
         return first
 
     def _kernel(self, idx, *slots):
+        gather = self._gather_slot(idx)
         if self.reuse_gathers:
             effect_cond(
                 self._row_tile_start(idx),
-                lambda: self._gather_rolled(idx, slots),
+                lambda: self._gather_rolled(idx, slots, gather),
             )
         else:
-            self._gather_rolled(idx, slots)
-        self.dense_kernel(idx, *slots)
+            self._gather_rolled(idx, slots, gather)
+        self._scratch_and_kernel(gather)[1](idx, *slots)
 
     # --- entry --------------------------------------------------------------
 
@@ -285,10 +314,16 @@ class _SparseGemm(torch.nn.Module):
         # ``merge_base_tables`` collapses the group onto its alloc.
         bufs.base_table_dram = voyager.alloc(base_table_shape(g), torch.int32)
         bufs.gather_data = voyager.alloc(
-            list(g.ones) + [self.span], self.data_dtype, _SRAM
+            list(g.ones) + [self.span],
+            self.data_dtype,
+            _SRAM,
+            num_slots=self.gather_slots,
         )
         bufs.gather_indices = voyager.alloc(
-            list(g.ones) + [self.span], torch.int32, _SRAM
+            list(g.ones) + [self.span],
+            torch.int32,
+            _SRAM,
+            num_slots=self.gather_slots,
         )
         bufs.base_table = voyager.alloc(base_table_shape(g), torch.int32, _SRAM)
         self._bufs = bufs
