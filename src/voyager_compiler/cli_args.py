@@ -25,6 +25,9 @@ from voyager_compiler.ops.layout import (
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
 )
+from voyager_compiler.codegen.transform.tiling.tiler import (
+    DEFAULT_RUNTIME_TOLERANCE,
+)
 from voyager_compiler.utils import SLURM_ARGS
 
 __all__ = [
@@ -484,11 +487,11 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--runtime_tolerance",
         type=float,
-        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()
+        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE in compile()
         help="How much longer than the best modeled runtime an interstellar "
         "tiling may take and still be chosen, as a fraction; among those, the "
-        "one with the least DRAM traffic wins.  0 = only the fastest "
-        "(default: 0.01).",
+        "one with the least energy (mostly DRAM traffic) wins.  0 = only the "
+        f"fastest (default: {DEFAULT_RUNTIME_TOLERANCE}).",
     )
 
     # -- reporting (timing / DRAM-traffic estimator) ------------------------
