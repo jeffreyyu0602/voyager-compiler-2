@@ -162,7 +162,8 @@ def vmap(
     # kernel computes each index as it gathers, so it needs no chunks.
     if torch.compiler.is_dynamo_compiling():
         output = qmap[indices.to(torch.int32) & 0xFFFF].to(input.dtype)
-        return output.to(input_dtype)
+        # In the input's layout, as the loop below writes it.
+        return torch.empty_like(input, dtype=input_dtype).copy_(output)
 
     # Walked in memory order, the output keeps the input's layout; an input
     # that is not densely packed, as a broadcast one, has none.

@@ -30,6 +30,7 @@ from quantization_configs import (
 from voyager_compiler import (
     QuantizedLM,
     get_default_quantizer,
+    lower,
     split_kv_cache,
 )
 from voyager_compiler.codegen import (
@@ -267,6 +268,15 @@ def add_quantization_args(parser):
         default=None,
         help="JSON of fitted tables to install, as codebook_eval.py dumps",
     )
+    parser.add_argument(
+        "--lower",
+        action="store_true",
+        help=(
+            "Convert and lower the graphs (voyager_compiler.lower) rather "
+            "than freeze their fake-quants: the KV cache is stored and read "
+            "as the compiled programs do it"
+        ),
+    )
 
 
 def build_quantizer(qconfig, decode, kivi):
@@ -339,33 +349,28 @@ def build_generator(
     context_length,
     cache_len,
     device,
+    lowered=False,
 ):
-    """Load the model and quantize it into a ``QuantizedLM`` with its
-    prefill and decode graphs frozen.
+    """Load the model and quantize it into a ``QuantizedLM``
+    (``quantize_generator``), its prefill and decode graphs frozen
+    (``QuantizedLM.freeze``) or lowered (``voyager_compiler.lower``).
 
-    The graphs are quantized the way ``compile_model.py``'s ``llama_prefill``
-    / ``llama_decode_kivi`` paths quantize them, except that the softmax and
-    RMS norm stay unquantized.  Both stay prepared, their observers on, and
-    frozen (``QuantizedLM.freeze``): every weight is fake-quantized once,
-    and what the decode graph reads from a split cache's main half once per
-    chunk.  The training graphs the class captures take the prefill's
-    quantizer.
+    Frozen, every weight is fake-quantized once, and what the decode graph
+    reads from a split cache's main half once per chunk; on a GPU the
+    decode step replays as a CUDA graph.
 
     Args:
         model_id: Hub id or local path of the checkpoint.
         torch_dtype: ``"auto"`` or a torch dtype name, as on the CLI.
-        qconfig: Name in ``QUANTIZATION_CONFIGS``; ``BF16_CONFIG`` leaves
-            everything but the cache alone.
-        decode_qconfig: The decode graph's scheme, or None for ``qconfig``.
-        kivi: Quantize the decode KV cache to KIVI's 2-bit layout.
-        residual_length: Positions of that cache kept in full precision
-            while their chunk fills.
-        codebooks: JSON of fitted tables to install, or None.
-        context_length: Longest prompt the prefill graph takes, a multiple
-            of ``SEQ_BLOCK``.
-        cache_len: Slots in the KV cache, covering the longest prompt plus
-            generation.
+        qconfig: As ``quantize_generator`` takes.
+        decode_qconfig: As ``quantize_generator`` takes.
+        kivi: As ``quantize_generator`` takes.
+        residual_length: As ``quantize_generator`` takes.
+        codebooks: As ``quantize_generator`` takes.
+        context_length: As ``quantize_generator`` takes.
+        cache_len: As ``quantize_generator`` takes.
         device: Where everything runs.
+        lowered: Lower the graphs rather than freeze them.
 
     Returns:
         ``(lm, tokenizer)``.
@@ -377,14 +382,73 @@ def build_generator(
             "### %s (%.0f min)", what, (time.monotonic() - started) / 60
         )
 
-    quantized = qconfig != BF16_CONFIG
-    decode_qconfig = decode_qconfig or qconfig
-    decode_quantized = decode_qconfig != BF16_CONFIG
     mark("loading the checkpoint")
     model, tokenizer = load_model_and_tokenizer(
         model_id, torch_dtype, attn_implementation="eager"
     )
     model.to(device)
+    mark(f"exporting the graphs over {cache_len} cache slots")
+    lm = quantize_generator(
+        model,
+        qconfig,
+        decode_qconfig,
+        kivi,
+        residual_length,
+        codebooks,
+        context_length,
+        cache_len,
+    )
+    if lowered:
+        mark("converting and lowering")
+        lower(lm)
+    else:
+        mark("freezing")
+        lm.freeze()
+        lm.replay = device.type == "cuda"
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        mark(f"{torch.cuda.memory_allocated(device) / 2**30:.1f} GiB resident")
+    return lm, tokenizer
+
+
+def quantize_generator(
+    model,
+    qconfig,
+    decode_qconfig,
+    kivi,
+    residual_length,
+    codebooks,
+    context_length,
+    cache_len,
+):
+    """Quantize ``model`` into a ``QuantizedLM`` with prefill and decode
+    graphs, prepared and calibrating.
+
+    The graphs are quantized the way ``compile_model.py``'s ``llama_prefill``
+    / ``llama_decode_kivi`` paths quantize them, except that the softmax and
+    RMS norm stay unquantized.  The training graphs the class captures take
+    the prefill's quantizer.
+
+    Args:
+        model: The causal LM, with eager attention, on its device.
+        qconfig: Name in ``QUANTIZATION_CONFIGS``; ``BF16_CONFIG`` leaves
+            everything but the cache alone.
+        decode_qconfig: The decode graph's scheme, or None for ``qconfig``.
+        kivi: Quantize the decode KV cache to KIVI's 2-bit layout.
+        residual_length: Positions of that cache kept in full precision
+            while their chunk fills.
+        codebooks: JSON of fitted tables to install, or None.
+        context_length: Longest prompt the prefill graph takes, a multiple
+            of ``SEQ_BLOCK``.
+        cache_len: Slots in the KV cache, covering the longest prompt plus
+            generation.
+
+    Returns:
+        The ``QuantizedLM``.
+    """
+    quantized = qconfig != BF16_CONFIG
+    decode_qconfig = decode_qconfig or qconfig
+    decode_quantized = decode_qconfig != BF16_CONFIG
     text_config = model.config.get_text_config()
 
     # A quantized cache -- KIVI's 2-bit one, or the int6 re-encode a
@@ -408,7 +472,6 @@ def build_generator(
                     f"annotated {caches} KV caches, expected {expected}"
                 )
 
-    mark(f"exporting the graphs over {cache_len} cache slots")
     lm = QuantizedLM(
         model,
         {
@@ -422,13 +485,6 @@ def build_generator(
         phases=("prefill", "decode"),
         rewrite=rewrite,
     )
-    prefill, decode = lm.graphs["prefill"], lm.graphs["decode"]
     if codebooks:
-        install_codebooks(prefill, decode, codebooks)
-    mark("freezing")
-    lm.freeze()
-    lm.replay = device.type == "cuda"
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-        mark(f"{torch.cuda.memory_allocated(device) / 2**30:.1f} GiB resident")
-    return lm, tokenizer
+        install_codebooks(lm.graphs["prefill"], lm.graphs["decode"], codebooks)
+    return lm

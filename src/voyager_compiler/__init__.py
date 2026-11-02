@@ -6,12 +6,13 @@ operate in place and leave the graph executable, so every stage can be checked
 numerically against the original.
 """
 
+import copy
 import os
 from typing import Callable, Optional, Tuple
 
 import torch
 from google.protobuf import text_format
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 from torch.utils._pytree import tree_flatten
 
 # Defines torch.ops.quantized_ops.* (and the hardware-layout twins).  This must
@@ -33,6 +34,7 @@ from voyager_compiler.codegen import (
     gen_compute_graph,
     inline_autocast_modules,
     match_and_fuse_rms_norm,
+    move_folds_out,
     normalize_activation_layout,
     normalize_attention_operands,
     normalize_conv2d_layout,
@@ -172,6 +174,7 @@ __all__ = [
     "get_node_name_to_scope",
     "gradient_program",
     "insert_align_device_nodes",
+    "lower",
     "match_and_fuse_rms_norm",
     "merge_sibling_linears",
     "normalize_attention_operands",
@@ -297,6 +300,7 @@ def transform(
     fuse_reshape=True,
     keep_fp32=True,
     cache_formats=None,
+    host_scalars=True,
 ):
     """Lower ``model`` in place through the graph-level passes.
 
@@ -335,6 +339,11 @@ def transform(
             whole chunks in the decode's quantized format, into the
             decode's own buffers (``store_prompt_chunks``).  None for any
             other graph.
+        host_scalars: Turn index arithmetic on one-element tensors into
+            control-processor scalars (``scalarize_index_arithmetic``), as
+            the Voyager program runs it.  False keeps it in device tensors,
+            so a GPU step reads nothing back to the host and can replay as
+            a CUDA graph.
 
     Returns:
         ``model``.
@@ -365,7 +374,8 @@ def transform(
     inline_autocast_modules(model)
     remove_prunable_ops(model)
     normalize_attention_operands(model)
-    scalarize_index_arithmetic(model)
+    if host_scalars:
+        scalarize_index_arithmetic(model)
     fuse_quantize_dequantize_with_producer(model)
     if cache_formats is not None:
         store_prompt_chunks(model, cache_formats)
@@ -406,6 +416,69 @@ def transform(
     deduplicate_nodes(model)
 
     return model
+
+
+def lower(lm: QuantizedLM) -> None:
+    """Convert ``lm`` and lower its inference graphs (``transform``, no
+    hardware), so ``prefill`` and ``generate`` run them on the device they
+    live on, the cache stored as the compiled programs store it.
+
+    The decode graph is lowered in place, its index arithmetic kept on the
+    device and its cache folds moved into ``lm.fold_step``
+    (``move_folds_out``), so every step runs the same ops and, on a GPU,
+    replays as a CUDA graph.  Its stored cache formats are what each prefill
+    writes the prompt in.  The prefill is lowered once per prompt length,
+    the first time a prompt runs it: a copy of the converted graph holding
+    its weights and cache, not copies of them.  Each lowered graph's
+    deferred constants are computed and installed.
+
+    Args:
+        lm: A prepared, unfrozen model; converted and lowered in place.
+    """
+    lm.convert()
+    device = lm.device
+
+    def install_constants(graph):
+        for node in graph.graph.nodes:
+            if node.op == "get_attr":
+                constant_value(graph, node)
+
+    formats = None
+    if "decode" in lm.graphs:
+        decode = lm.graphs["decode"]
+        end = lm.context_length + lm.decode_tokens
+        step = {
+            "input_ids": torch.zeros(
+                1, lm.decode_tokens, dtype=torch.long, device=device
+            ),
+            "cache_position": torch.arange(
+                lm.context_length, end, device=device
+            ),
+        }
+        transform(decode, (), step, host_scalars=False)
+        install_constants(decode)
+        formats = decode.meta.get("cache_formats") or None
+        lm.fold_step = move_folds_out(decode)
+    if "prefill" in lm.graphs:
+        prefill = lm.graphs["prefill"]
+        lowered = {}
+
+        def prompt_graph(length):
+            if length not in lowered:
+                graph = GraphModule(prefill, copy.deepcopy(prefill.graph))
+                prompt = {
+                    "input_ids": torch.zeros(
+                        1, length, dtype=torch.long, device=device
+                    ),
+                    "cache_position": torch.arange(length, device=device),
+                }
+                transform(graph, (), prompt, cache_formats=formats)
+                install_constants(graph)
+                lowered[length] = graph
+            return lowered[length]
+
+        lm.prompt_graph = prompt_graph
+    lm.replay = device.type == "cuda"
 
 
 def compile(

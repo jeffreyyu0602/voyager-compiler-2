@@ -51,6 +51,7 @@ from models.compile_steps import (  # noqa: E402
 )
 
 # ``models.llama`` puts examples/language_modeling on the path.
+from common import quantize_generator  # noqa: E402
 from quantization_configs import (  # noqa: E402
     annotate_kivi_cache,
     set_kivi_attention_qconfig,
@@ -63,6 +64,7 @@ from voyager_compiler import (  # noqa: E402
     add_quantization_args,
     compile,
     get_default_quantizer,
+    lower,
     merge_sibling_linears,
     planned_buffer_layout,
     quantizes_kv_cache,
@@ -741,3 +743,50 @@ def test_gpu_replay_generates_the_cpu_tokens():
         ]
     for cpu, gpu in zip(tokens["cpu"], tokens["cuda"]):
         assert torch.equal(cpu, gpu)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_lowered_kivi_cache_runs_on_gpu():
+    """LongBench's fully quantized KIVI arm (``longbench.py --lower``),
+    converted and lowered on a GPU: the prefill stores the prompt in the
+    decode's 2-bit cache, and each decode step reads it through the
+    dequantize fused with the attention's int6 quantize.  The lowered step,
+    its folds run by the caller, replays as a CUDA graph.  Fed the same
+    tokens across two residual folds, it stays within the KIVI tolerance of
+    the converted decode, whose cache is not stored quantized; ``generate``
+    lowers a prefill for each new prompt length."""
+    torch.manual_seed(1)
+    tokens = torch.randint(0, VOCAB, (1, 600), device="cuda")
+    prompt = 256
+    lms = []
+    for lowered in (False, True):
+        lm = quantize_generator(
+            tiny_llama(False, "eager").to("cuda"),
+            "mxlut4_int6_e5m3_attn_head_int6",
+            "mxlut4_int6_e5m3_a_int6",
+            True,
+            128,
+            None,
+            512,
+            1024,
+        )
+        if lowered:
+            lower(lm)
+        else:
+            lm.convert()
+        lms.append(lm)
+    converted, lowered = lms
+    assert lowered.replay
+    # Every layer's key and value cache is stored quantized.
+    assert len(lowered.graphs["decode"].meta["cache_formats"]) == 4
+    assert torch.equal(
+        lowered.prefill(tokens[:, :prompt]),
+        converted.prefill(tokens[:, :prompt]),
+    )
+    for position in range(prompt, tokens.shape[1]):
+        token = tokens[0, position].item()
+        got = lowered.step(token, position).float()
+        expected = converted.step(token, position).float()
+        assert (got - expected).abs().max() <= TOLERANCE["kivi"], position
+    generated = lowered.generate(tokens[:, :320], 8)
+    assert torch.equal(generated[:, :320], tokens[:, :320])

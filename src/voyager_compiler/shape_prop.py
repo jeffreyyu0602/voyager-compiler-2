@@ -138,28 +138,18 @@ def fetch_attr(module, target):
     return attr_itr
 
 
-def _record(value: torch.Tensor) -> torch.Tensor:
-    """The tensor stored for ``value``: itself, on CPU.  A fake tensor has
-    no storage to move."""
-    return value if isinstance(value, FakeTensor) else value.cpu()
-
-
 def set_node_value(node: Node, value):
     """Record ``value`` on ``node`` as ``.value`` (plus ``.shape``)."""
     if isinstance(value, torch.Tensor):
         node.shape = value.shape
-        node.value = _record(value)
     elif isinstance(value, (tuple, list)):
         # A tuple may mix tensors with scalars (e.g. the integer loop counters
         # carried by a while_loop); keep non-tensor elements as-is.
         node.shape = tuple(
             x.shape if isinstance(x, torch.Tensor) else None for x in value
         )
-        node.value = tuple(
-            _record(x) if isinstance(x, torch.Tensor) else x for x in value
-        )
-    else:
-        node.value = value
+        value = tuple(value)
+    node.value = value
 
 
 def constant_value(module, node: Node):

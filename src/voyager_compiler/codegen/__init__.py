@@ -24,6 +24,7 @@ from voyager_compiler.codegen.transform.padding import (
 from voyager_compiler.codegen.transform.quant_folding import (
     CacheFormat,
     fuse_quantize_dequantize_with_producer,
+    move_folds_out,
     quantizes_kv_cache,
     sink_cache_folds,
     split_kv_cache,
@@ -65,6 +66,7 @@ __all__ = [
     "gen_compute_graph",
     "inline_autocast_modules",
     "match_and_fuse_rms_norm",
+    "move_folds_out",
     "normalize_activation_layout",
     "normalize_attention_operands",
     "normalize_conv2d_layout",

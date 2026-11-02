@@ -488,7 +488,11 @@ class QuantizedLM(QuantizedModel):
     the main caches and the tail into the residuals, which both graphs
     hold as one tensor.  ``freeze`` bakes, for evaluation, the fake-quants
     of the weights and of a split cache's main halves.  On a GPU,
-    ``replay`` captures the decode step as a CUDA graph.
+    ``replay`` captures the decode step as a CUDA graph.  ``prompt_graph``,
+    when set, gives the prefill graph each prompt length runs instead of
+    ``graphs["prefill"]``; ``fold_step``, when set, completes the chunks of
+    a split cache after each decode step, for a decode graph that does
+    not.
 
     Args:
         model: The causal LM, with eager attention for the training lowering.
@@ -630,6 +634,12 @@ class QuantizedLM(QuantizedModel):
         eos = model.generation_config.eos_token_id
         self.eos_token_ids = [eos] if isinstance(eos, int) else list(eos or [])
         self._refresh = None
+        # The prefill graph for a prompt length, when one graph does not
+        # take every length; None to run ``graphs["prefill"]``.
+        self.prompt_graph = None
+        # Called with each decode step's position when the decode graph
+        # leaves its cache folds to the caller; None when it does not.
+        self.fold_step = None
         self.replay = False
         self.cuda_graph = None
         self.samples = 0
@@ -709,7 +719,12 @@ class QuantizedLM(QuantizedModel):
                     buffer.zero_()
         logits = None
         if done:
-            logits = self.graphs["prefill"](
+            prefill = (
+                self.graphs["prefill"]
+                if self.prompt_graph is None
+                else self.prompt_graph(done)
+            )
+            logits = prefill(
                 input_ids=input_ids[:, :done],
                 cache_position=torch.arange(done, device=self.device),
             )[0, -1]
@@ -791,7 +806,9 @@ class QuantizedLM(QuantizedModel):
             with torch.cuda.device(self.device):
                 self.cuda_graph.replay()
             logits = self.static_logits
-        if self._refresh is not None:
+        if self.fold_step is not None:
+            self.fold_step(position)
+        elif self._refresh is not None:
             self.fold(position)
         return logits
 

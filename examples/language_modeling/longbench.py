@@ -544,6 +544,7 @@ def main(args):
             context_length,
             cache_len,
             device,
+            args.lower,
         )
     elif args.gpu is None:
         model, tokenizer = load_model_and_tokenizer(
@@ -558,6 +559,7 @@ def main(args):
     tag = [args.qconfig] if args.qconfig else []
     tag += [f"decode-{args.decode_qconfig}"] if args.decode_qconfig else []
     tag += ["kivi"] if args.kivi else []
+    tag += ["lowered"] if args.lower else []
     output_dir = args.output_dir or os.path.join(
         "pred_e" if args.e else "pred",
         "-".join([args.model_id.rstrip("/").split("/")[-1], *tag]),

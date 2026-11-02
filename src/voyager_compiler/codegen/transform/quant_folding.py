@@ -14,7 +14,8 @@ cache write, recording the stored format (``CacheFormat``), and collapses a
 ``get_attr -> dequantize -> layout ops -> quantize`` chain into a single
 ``dequantize`` with pre-multiplied scales.  ``store_prompt_chunks`` then
 makes a prefill graph fill the decode graph's cache buffers in those
-formats.
+formats, and ``move_folds_out`` moves a decode graph's folds out, for a
+caller that runs them after each step and replays the step itself.
 
 Both work purely on the ``quantized_ops`` schema and FX, not on the
 quantizer that produced the graph.
@@ -26,7 +27,7 @@ import math
 import operator
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -2185,7 +2186,8 @@ class _PromptStore:
         span = source.value.shape[axis]
         if (start, span) not in self.offsets:
             self.offsets[start, span] = self.constant(
-                "prompt_positions", torch.arange(start, start + span)
+                "prompt_positions",
+                torch.arange(start, start + span, device=source.value.device),
             )
         return self.call(
             _INDEX_COPY,
@@ -2613,3 +2615,64 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
     model.recompile()
 
     return model
+
+
+def move_folds_out(model: GraphModule) -> Optional[Callable[[int], None]]:
+    """Move each split cache's fold out of a transformed decode graph, so
+    every step runs the same ops, as a replayed CUDA graph needs.
+
+    The decode graph then writes each token into its residual and attends,
+    and never folds.  The returned function, called with a step's cache
+    position right after the step, runs the fold of each cache whose chunk
+    that position completes -- the branch its ``cond`` ran: it quantizes
+    the residual and stores it as that chunk of the stored cache.
+
+    Args:
+        model: Decode graph ``transform`` lowered; rewritten in place.
+
+    Returns:
+        The function, or None when the graph folds no cache.
+
+    Raises:
+        ValueError: A fold reads a tensor the step computes other than its
+            residual write.
+    """
+    graph = model.graph
+    # (residual length, branch, operands), None standing for the chunk index.
+    folds = []
+    for cond in [n for n in graph.nodes if n.target is _COND]:
+        length = None
+        operands = []
+        for node in cond.args[3]:
+            # The residual write the step made: the fold reads its buffer.
+            if node.target is _INDEX_COPY and node.args[0].op == "get_attr":
+                residual = fetch_attr(model, node.args[0].target)
+                length = residual.shape[node.args[1]]
+                operands.append(residual)
+            elif node.op == "get_attr":
+                operands.append(fetch_attr(model, node.target))
+            elif not isinstance(node.value, torch.Tensor):
+                operands.append(None)
+            else:
+                raise ValueError(
+                    f"the fold of {cond.name} reads {node.name}, which the "
+                    "decode step computes"
+                )
+        if length is None:
+            raise ValueError(f"the fold of {cond.name} reads no residual")
+        branch = fetch_attr(model, cond.args[1].target)
+        folds.append((length, branch, operands))
+        graph.erase_node(cond)
+    if not folds:
+        return None
+    graph.eliminate_dead_code()
+    model.delete_all_unused_submodules()
+    model.recompile()
+
+    def run(position: int) -> None:
+        for length, branch, operands in folds:
+            if position % length == length - 1:
+                chunk = position // length
+                branch(*(chunk if o is None else o for o in operands))
+
+    return run
