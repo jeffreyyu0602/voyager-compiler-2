@@ -475,6 +475,13 @@ def add_compile_args(parser=None):
         "output dtype, as training needs.",
     )
     parser.add_argument(
+        "--bool_mask",
+        action="store_true",
+        help="Store a causal flash attention's mask table as int1 codes plus "
+        "a scale, for hardware whose vector unit reads int1 (MXNF4); "
+        "otherwise as the additive fill at the accumulation dtype.",
+    )
+    parser.add_argument(
         "--runtime_tolerance",
         type=float,
         default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()

@@ -67,7 +67,6 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _lenient_verifier,
     _tag_loop_extents,
     effect_cond,
-    new_counter,
     outline_dps_ops,
     stamp_csr_fill,
     voyager,
@@ -77,11 +76,6 @@ from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import set_node_value, ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
-
-# Stores ``_store_staged_csr`` issues per staged sub-slice (the CSR's
-# indptr, packed data and packed indices, then the dense scale and
-# inliers), each adding 1 to the store stream's counter once landed.
-_CSR_STORES = 5
 
 
 class _EpilogueTail(torch.nn.Module):
@@ -137,10 +131,6 @@ class _EpilogueTail(torch.nn.Module):
             voyager.insert(res, tile)
         if not o.chain_epilogue:
             o._store_staged_csr(self.idx, j)
-            # Every sub-slice stored so far, this one included, has to
-            # land before the staging tiles are written again.
-            stored = o._ordinal(self.idx, o.grid_k) * o.n_sub + j + 1
-            o._wait_csr_stores(stored)
 
     def forward(self, acc, *operands):
         o = self.owner
@@ -209,10 +199,7 @@ class _SparseGemm(torch.nn.Module):
     (``reuse_gathers``).  A split reduction, or a sweep with nothing inside
     the row dim, changes block with every step and gathers per step.
 
-    The nest stores each tile on its own step (``lag`` 0) and waits every
-    operand inline: the gathered blocks, the staged CSR's stores and the
-    base table each add 1 to a counter of their own per landed copy, and
-    the step that reads or overwrites them waits for the count it needs.
+    The nest stores each tile on its own step (``lag`` 0).
     """
 
     def __init__(
@@ -371,13 +358,10 @@ class _SparseGemm(torch.nn.Module):
 
         Unrolled this would be ``R`` copies of the same block fetch, one
         per row block; the loop spells it once.  The pointer tile's first
-        entry, which every block subtracts, is picked before the loop.
-        Every copy adds 1 to the gather stream's counter and is waited for
-        inline: copy ``b`` of block ``j`` is the stream's ``2R`` copies per
-        gather before this one, plus ``2j + b + 1``.  A trip reads both of
-        its own block's bounds rather than carrying the boundary it shares
-        with the next one, so the loop carries nothing but its index, at
-        one extra scalar read per block.
+        entry, which every block subtracts, is picked before the loop.  A
+        trip reads both of its own block's bounds rather than carrying the
+        boundary it shares with the next one, so the loop carries nothing
+        but its index, at one extra scalar read per block.
 
         Args:
             idx: The grid coordinate.
@@ -394,10 +378,6 @@ class _SparseGemm(torch.nn.Module):
             (slots[plan.kw_idx["A_data"]], bufs.gather_data),
             (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
         )
-        gathers_before = self._ordinal(
-            idx, self.grid_m + 1 if self.reuse_gathers else len(plan.grid)
-        )
-        landed_before = 2 * self.R * gathers_before
 
         def cond_fn(j):
             return j < self.R
@@ -431,13 +411,10 @@ class _SparseGemm(torch.nn.Module):
                     window,
                     bidx + [at],
                     ones + (g.budget,),
-                    bufs.gather_counter,
+                    None,
                     None,
                     [1] * (nb + 1),
                     count=[1] * nb + [count],
-                )
-                voyager.async_wait(
-                    bufs.gather_counter, landed_before + 2 * j + b + 1
                 )
             return (j + 1,)
 
@@ -464,20 +441,6 @@ class _SparseGemm(torch.nn.Module):
         torch._check(off >= 0)
         return off
 
-    def _wait_csr_stores(self, stored):
-        """The CPU waits until the first ``stored`` staged sub-slice stores
-        have landed."""
-        voyager.async_wait(self._bufs.store_counter, _CSR_STORES * stored)
-
-    def _ordinal(self, idx, dims):
-        """``idx``'s position in the sweep, counted over its first ``dims``
-        grid dims: the whole grid counts steps, ``grid_k`` (the reduction,
-        last) output tiles, ``grid_m + 1`` row tiles."""
-        ordinal = 0
-        for d in range(dims):
-            ordinal = ordinal * self.plan.grid[d] + idx[d]
-        return ordinal
-
     def _store_staged_csr(self, idx, j):
         """Store one staged sub-slice: its CSR block and its dense pair.
 
@@ -485,11 +448,7 @@ class _SparseGemm(torch.nn.Module):
         the row pointers land in their slice's continuous array, the data and
         indices at the stream position ``base`` names, the scale and inliers
         at the sub-slice's own place in the grid, and the block's position
-        goes into the shared table for its consumer.  The ``_CSR_STORES``
-        copies add to the store stream's counter unwaited; the caller waits
-        (``_wait_csr_stores``) -- the chained mode before the next finalize
-        reuses the staging tiles and after the sweep, the interleaved mode
-        inline (``_EpilogueTail._sub_slice``).
+        goes into the shared table for its consumer.
         """
         g, bufs = self.out_geom, self._bufs
         nb, ones = g.nb, g.ones
@@ -511,7 +470,7 @@ class _SparseGemm(torch.nn.Module):
             bufs.csr_indptr,
             bidx + [k, m],
             ones + (1, g.rows + 1),
-            bufs.store_counter,
+            None,
             None,
             [1] * nb + [1, g.rows],
         )
@@ -531,7 +490,7 @@ class _SparseGemm(torch.nn.Module):
                 dst,
                 bidx + [at],
                 ones + (g.budget,),
-                bufs.store_counter,
+                None,
                 None,
                 [1] * (nb + 1),
                 count=[1] * nb + [nnz],
@@ -546,7 +505,7 @@ class _SparseGemm(torch.nn.Module):
                 dst,
                 bidx + [m, k],
                 ones + (g.rows, width),
-                bufs.store_counter,
+                None,
                 None,
                 [1] * nb + [g.rows, width],
             )
@@ -591,12 +550,6 @@ class _SparseGemm(torch.nn.Module):
             # this nest declares no scheduler-managed output.
             scratch = slots[len(self.plan.in_specs) :]
             tail = _EpilogueTail(self, idx, scratch[0] if scratch else None)
-        if self.chain_epilogue:
-            # The finalizes before this tile's stored their CSRs from the
-            # staging tiles; their DMAs ran under the rounds between, so
-            # the wait costs nothing, and the tiles are free to be written
-            # again.  The last round's stores are waited for in ``forward``.
-            self._wait_csr_stores(self._ordinal(idx, self.grid_k))
         self._scratch_and_kernel(tail)[1](idx, *slots)
         if self.chain_epilogue:
             # The chained pass staged this tile's CSR; its DMAs and
@@ -616,8 +569,7 @@ class _SparseGemm(torch.nn.Module):
         stamps their bank groups positionally, by zipping them against its
         own ``hand_groups`` list, so adding, removing or reordering one
         here silently misassigns banks unless that list is changed to
-        match. Counters and DRAM allocations are skipped and may move
-        freely.
+        match. DRAM allocations are skipped and may move freely.
         """
         bufs = _Bufs()
         g = self.geom
@@ -636,8 +588,6 @@ class _SparseGemm(torch.nn.Module):
             bufs.base_table = voyager.alloc(
                 base_table_shape(g), torch.int32, _SRAM
             )
-            bufs.gather_counter = new_counter()
-            bufs.table_counter = new_counter()
 
         og = self.out_geom
         if og is not None:
@@ -669,8 +619,6 @@ class _SparseGemm(torch.nn.Module):
             bufs.out_base_table = voyager.alloc(
                 base_table_shape(og), torch.int32, _SRAM
             )
-            bufs.store_counter = new_counter()
-            bufs.out_table_counter = new_counter()
             # Per-sub-slice staging: a compute result reaches DRAM through
             # a scratchpad tile, never straight from the op.
             bufs.store_data_tile = voyager.alloc(
@@ -695,24 +643,13 @@ class _SparseGemm(torch.nn.Module):
             # The gather reads the table's scalars to address its copies, so
             # the whole table lands on chip before the loop runs.
             copy_base_table(
-                bufs.base_table_dram,
-                bufs.base_table,
-                base_table_shape(g),
-                bufs.table_counter,
+                bufs.base_table_dram, bufs.base_table, base_table_shape(g)
             )
         dense = self.inner(*inputs)
         if og is None:
             return dense
-        # Every sub-slice's stores have landed before the consumer's nest
-        # reads the CSR: a tile stores on its last round, so the steps the
-        # loop ran completed ``steps // num_k`` tiles.
-        tiles = self.inner.steps_run // self.plan.num_k
-        self._wait_csr_stores(tiles * self.n_sub)
         copy_base_table(
-            bufs.out_base_table,
-            bufs.out_base_table_dram,
-            base_table_shape(og),
-            bufs.out_table_counter,
+            bufs.out_base_table, bufs.out_base_table_dram, base_table_shape(og)
         )
         return (
             bufs.csr_data,

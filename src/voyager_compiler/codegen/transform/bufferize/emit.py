@@ -102,9 +102,6 @@ COMMIT = torch.ops.higher_order.commit
 WITH_SCRATCH = torch.ops.higher_order.with_scratch
 _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
-# The SpMM pass fetches before it starts: a dispatch of one waits on and
-# posts nothing.
-_SPMM = torch.ops.quantized_ops.spmm_csr.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 
@@ -1142,31 +1139,13 @@ class _Emitter:
         wrapping the body region (whose ops keep destination-passing, exactly
         like a top-level op), its waits -- per unit, the counter and the
         threshold that unit's pass checks before it starts -- and the counter
-        its last pass posts.
-
-        Raises:
-            ValueError: The dispatch is an SpMM pass with a wait or a post;
-                SpMM fetches before it starts and cannot honour either.
-        """
+        its last pass posts."""
         sub = named[str(node.args[0].target)]
         op = Operation(name=node.name)
         async_op = getattr(op, "async")  # ``async`` is a Python keyword
         self.emit_region(sub, async_op.body.ops)
         dependencies = node.kwargs.get("dependencies") or {}
         post = node.kwargs.get("post")
-        synchronized = post is not None or any(dependencies.values())
-        if synchronized and any(
-            n.target is _SPMM
-            for region in [sub, *sub.modules()]
-            if isinstance(region, GraphModule)
-            for n in region.graph.nodes
-        ):
-            scope = node.meta.get("scope")
-            layer = scope[0] if scope else node.name
-            raise ValueError(
-                f"{layer}: {node.name} waits on or posts a counter from an "
-                f"SpMM dispatch, which fetches before it starts"
-            )
         for unit, waits in dependencies.items():
             for counter, threshold in waits:
                 wait = async_op.waits.add()

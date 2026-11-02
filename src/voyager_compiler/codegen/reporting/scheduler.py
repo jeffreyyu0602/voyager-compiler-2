@@ -19,9 +19,9 @@ the list of completion cycles of what has been added to it, in order; a wait
 for ``counter >= threshold`` resolves at the ``threshold``-th of them,
 whether that post came from a DMA or an async compute.  ``async_wait``
 blocks the program clock until its wait resolves; a commit's passes wait
-per unit before they start; ``drain`` blocks the program clock until every
-pass is done.  A pass frees its unit(s) at the end of its charged cycles but
-is done ``OpInfo.completion_cycles`` later, and its post carries the done.
+per unit before they start.  A pass frees its unit(s) at the end of its
+charged cycles but is done ``OpInfo.completion_cycles`` later, and its post
+carries the done.
 
 Every timestamp the machine holds -- the clocks, the unit-free cycles, the
 posted completions and the parked commits' floors -- is exposed by
@@ -55,7 +55,6 @@ T_COMMIT = 5
 T_WAIT = 6
 T_LOOP = 7
 T_SKIP = 8
-T_DRAIN = 9
 
 # The unit an ``OpInfo`` names -> the unit its commit waits are listed under.
 _WAIT_UNIT = {"mma": "matrix", "vector": "vector"}
@@ -97,7 +96,6 @@ class ResourceState:
         self.mma_free = 0
         self.vector_free = 0
         self.dram_free = 0
-        self.passes_done = 0  # the cycle every pass so far is done by
         self.cur_loop = -1  # id() of the while_loop currently being walked
         self.cur_kernel = ""  # the bufferized nest being walked
         self.kernel_groups: Dict[str, str] = {}
@@ -214,7 +212,6 @@ class ResourceState:
         self.records.append(rec)
         for u in op.units:
             self._occupy(u, end)
-        self.passes_done = max(self.passes_done, done)
         if self.in_commit:
             # A committed op occupies its unit(s) but leaves the program clock;
             # its post carries the done.  A sync one advances the clock to it.
@@ -410,37 +407,6 @@ class ResourceState:
             self.trace.append((T_WAIT, id(node), key, start - base, end - base))
         return rec
 
-    def drain(self, node, path) -> TimingRecord:
-        """The program clock blocks until no unit has a pass running or
-        queued and every pass is done: every parked commit must be able to
-        run."""
-        self._resolve_commits()
-        if self.pending_commits:
-            raise ValueError(
-                f"drain {node.name} waits for a dispatch whose counter wait "
-                f"nothing issued so far satisfies -- the emitted schedule "
-                f"would deadlock"
-            )
-        start = self.now
-        end = max(self.now, self.passes_done)
-        rec = TimingRecord(
-            eid=self._eid(),
-            node_name=node.name,
-            kind="drain",
-            resource=("control",),
-            start=start,
-            end=end,
-            iteration_path=tuple(path),
-            loop_uid=self.cur_loop,
-            kernel=self.cur_kernel,
-        )
-        self.records.append(rec)
-        self.now = end
-        if self.trace is not None:
-            base = self.trace_base
-            self.trace.append((T_DRAIN, id(node), start - base, end - base))
-        return rec
-
     def launch(self, kernel: str) -> None:
         """Charge a calibrated kernel's launch overhead once, as a synchronous
         control event at its entry."""
@@ -514,7 +480,6 @@ class ResourceState:
                 self.mma_free,
                 self.vector_free,
                 self.dram_free,
-                self.passes_done,
             ),
             tuple(
                 (k, tuple(self.counter_posts[k]))
@@ -541,7 +506,6 @@ class ResourceState:
             self.mma_free,
             self.vector_free,
             self.dram_free,
-            self.passes_done,
         ) = clocks
         for k, values in counters:
             self.counter_posts[k] = list(values)
@@ -558,7 +522,6 @@ class ResourceState:
                 self.mma_free,
                 self.vector_free,
                 self.dram_free,
-                self.passes_done,
             ),
             counter_posts={k: list(v) for k, v in self.counter_posts.items()},
             posts=dict(self.pending_post),
@@ -586,7 +549,6 @@ class ResourceState:
             self.mma_free,
             self.vector_free,
             self.dram_free,
-            self.passes_done,
         ) = cp.clocks
         self.counter_posts = {k: list(v) for k, v in cp.counter_posts.items()}
         self.pending_post = dict(cp.posts)

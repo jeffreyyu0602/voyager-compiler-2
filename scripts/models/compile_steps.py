@@ -36,6 +36,7 @@ def get_compile_args(args):
         "dump_tensors": args.dump_tensors,
         "runtime_tolerance": args.runtime_tolerance,
         "accumulate_fp32": args.accumulate_fp32,
+        "bool_mask": args.bool_mask,
     }
 
 

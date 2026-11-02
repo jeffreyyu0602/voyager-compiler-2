@@ -68,7 +68,7 @@ class OpInfo:
 
     ``completion_cycles`` is how long after its charged cycles the op is
     done: its units free at the end of the charged cycles, while the
-    counter it posts and a drain see the done.
+    counter it posts sees the done.
     """
 
     key: str

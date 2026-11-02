@@ -202,6 +202,7 @@ def main():
         output_dir=args.out,
         output_file=args.kernel,
         dump_tensors=False,
+        bool_mask=True,
     )
     values = immediates(gm, ir)
     with open(os.path.join(args.out, "immediates.json"), "w") as f:

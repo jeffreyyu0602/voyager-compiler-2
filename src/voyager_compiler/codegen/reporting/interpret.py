@@ -9,7 +9,7 @@ and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
 compute on the systolic array, ``async_copy`` on the DRAM interface, and
-waits and drains as zero-time control. A DPS ``insert`` writes a compute
+waits as zero-time control. A DPS ``insert`` writes a compute
 result into its buffer and is pure bookkeeping (skipped). An asynchronous
 compute is dispatched by ``voyager.commit``, which adds to its counter when
 it finishes -- so ``async_wait`` can reconcile compute the same way it does
@@ -78,7 +78,6 @@ _ONES = torch.ops.voyager.ones.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
-_DRAIN = torch.ops.voyager.drain.default
 _INSERT = torch.ops.voyager.insert.default
 
 
@@ -382,8 +381,6 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif t is _ASYNC_WAIT:
             key = _counter_key(node.args[0], ctx.bind)
             rs.async_wait(node, key, _resolve(node.args[1], env), path)
-        elif t is _DRAIN:
-            rs.drain(node, path)
         elif t is _INSERT:
             # Destination-passing write: pure bookkeeping, zero-time -- the
             # producing compute already carries its destination.  (An async

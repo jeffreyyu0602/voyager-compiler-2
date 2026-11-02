@@ -99,17 +99,6 @@ def effect_cond(
     torch.cond(pred, true_branch, false_branch)
 
 
-def new_counter() -> torch.Tensor:
-    """A fresh hardware counter at 0: a 0-d int64 ``voyager.alloc`` at the
-    register level, followed by the ``voyager.zeros`` that resets it.  Every
-    copy of a stream adds 1 to its counter when it has landed, and a CPU
-    ``voyager.async_wait(counter, threshold)`` blocks until it has reached
-    ``threshold``."""
-    counter = voyager.alloc([], torch.int64, int(MemoryLevel.REGISTER))
-    voyager.zeros(counter)
-    return counter
-
-
 def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
     """The GraphModule attribute named ``target`` on ``gm`` (a loop body/cond
     or fused submodule), or None if ``target`` is not a submodule."""
@@ -209,12 +198,6 @@ class _InputSpec:
                        the scheduler's default.  Lets a reused / low-reuse
                        operand pick a shallower or deeper pipeline than its
                        peers.
-      ``first_use_at_exit``
-                       guarded operand first read at its sweep's **last** step,
-                       so the load-wait is deferred to block-exit (overlaps the
-                       sweep with a single buffer).  Builder-set only where
-                       exit-only use is provable; default ``False`` =
-                       wait-at-entry.
       ``load``         issues the tile's copy in place of ``voyager.async_copy``
                        (``_BufferedRef._load_tile``): called with what
                        ``load_buffers`` returned, the slot, then
@@ -232,7 +215,6 @@ class _InputSpec:
     pad_value: Optional[float] = None
     transposed: bool = False
     num_slots: Optional[int] = None
-    first_use_at_exit: bool = False
     load: Optional[Callable] = None
     load_buffers: Optional[Callable] = None
 
@@ -257,12 +239,6 @@ class _OutputSpec:
       ``dtype``      output dtype.
       ``num_slots``  per-output software-pipeline depth (``None`` inherits the
                      scheduler default); see ``_InputSpec.num_slots``.
-      ``first_use_at_exit``
-                     guarded output first written at its sweep's **last** step
-                     (e.g. a reduction's ``post_process``), so the reuse-drain
-                     is deferred to block-exit (lets the store overlap the next
-                     tile's sweep with a single buffer).  Builder-set; default
-                     ``False`` = drain-at-entry.  See ``_InputSpec``.
     """
 
     shape: Tuple[int, ...]
@@ -270,7 +246,6 @@ class _OutputSpec:
     index_map: Tuple[int, ...]
     dtype: torch.dtype
     num_slots: Optional[int] = None
-    first_use_at_exit: bool = False
 
 
 @dataclass(frozen=True)

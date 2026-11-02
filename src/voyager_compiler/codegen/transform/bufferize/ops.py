@@ -16,9 +16,9 @@ Primitives
 ``voyager.subview(src, o, s, st)``   strided window onto a buffer (a slot).
 ``voyager.insert(src, dst)``         destination-passing compute-result write.
 ``voyager.async_copy(..., c)``       async tile DMA; adds 1 to counter ``c``
-                                     when the tile has landed.
+                                     when the tile has landed (the sync
+                                     pass assigns ``c``).
 ``voyager.async_wait(c, thr)``       the CPU blocks until ``c >= thr``.
-``voyager.drain()``                  the CPU blocks until every unit is idle.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
 ``voyager.delinearize_index(...)``   linear loop counter -> multi-dim index.
 ``commit(subgraph, operands, ...)``  one asynchronous dispatch (a higher-order
@@ -130,8 +130,8 @@ def _alloc_fake(
 # counter it adds to and the count it brings it to.  Per storage range the
 # check keeps the last writer and the readers since; an access must be
 # covered against each producer it depends on -- by a wait of the commit on
-# that counter at or above the count, a CPU wait already made at or above
-# it, or a drain since -- or the run raises.  A sequential run satisfies
+# that counter at or above the count, or a CPU wait already made at or
+# above it -- or the run raises.  A sequential run satisfies
 # every wait however few there are; this checks that the waits are there.
 # Only contiguous views are audited (every on-chip slot and tile): a strided
 # DRAM tile's byte span runs across its neighbours.
@@ -146,7 +146,6 @@ class _RaceCheck:
         # on it since the last.  A reset closes what posted before it.
         self.generation = {}
         self.posted = {}
-        self.drained = 0  # every producer at or below this seq is done
 
     @staticmethod
     def key(counter):
@@ -164,7 +163,7 @@ class _RaceCheck:
 
     def covered(self, producer, waits):
         seq, key, count, _, generation = producer
-        if seq <= self.drained or self.cpu.get(key, 0) >= count:
+        if self.cpu.get(key, 0) >= count:
             return True
         if generation < self.generation.get(key, 0):
             return True
@@ -182,22 +181,18 @@ class _RaceCheck:
         hits = [v for (a, b), v in table.items() if a < end and start < b]
         return table.setdefault((start, end), [None, []]), hits
 
-    def access(self, what, t, write, waits, unit_key, stream=None):
+    def access(self, what, t, write, waits, stream=None):
         """Check one access against the producers it depends on: the last
-        writer (RAW, WAW) and, for a write, the readers since on another
-        unit (WAR; ``unit_key`` is the posting counter, ``None`` for a
-        copy, which every unit's readers bind).  A copy on counter
-        ``stream`` is ordered behind the earlier copies on it: copies on
-        one counter land in issue order."""
+        writer (RAW, WAW) and, for a write, every reader since, on any unit
+        (WAR).  A copy on counter ``stream`` is ordered behind the earlier
+        copies on it: copies on one counter land in issue order."""
         if not t.is_contiguous():
             return
         _, hits = self._entries(t)
         for writer, readers in hits:
             needed = [writer] if writer is not None else []
             if write:
-                needed += [
-                    r for r in readers if unit_key is None or r[3] != unit_key
-                ]
+                needed += readers
             for producer in needed:
                 same_stream = producer[3] is None and producer[1] == stream
                 if (stream is not None and same_stream) or self.covered(
@@ -348,16 +343,17 @@ def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# voyager.async_copy / voyager.async_wait / voyager.drain — the asynchronous
-# DMA and the CPU's waits.
+# voyager.async_copy / voyager.async_wait — the asynchronous DMA and the CPU's
+# waits.
 #
 # ``async_copy(..., counter)`` copies a tile and adds 1 to ``counter`` once
-# the tile has landed; the copies on one counter land in issue order.
+# the tile has landed; the copies on one counter land in issue order.  The
+# builders issue every copy with no counter; the sync pass gives each its
+# stream's.
 # ``async_wait(counter, threshold)`` blocks the CPU until ``counter >=
-# threshold``.  Both take a 0-d int64 ``counter``, **return nothing**, and
-# declare it **mutable** (``Tensor(a!)`` / ``Tensor(b!)``) so the graph keeps
-# their order.  ``drain()`` blocks the CPU until no unit has a pass running
-# or queued; it says nothing about copies, which counters cover.
+# threshold``.  Both take a 0-d int64 ``counter`` (``None`` for a copy no
+# pass has synchronized), **return nothing**, and declare it **mutable**
+# (``Tensor(a!)`` / ``Tensor(b!)``) so the graph keeps their order.
 #
 # The eager impls are the counter oracle: ``async_copy`` adds its 1 at once
 # and ``async_wait`` asserts the threshold is already met, so running the
@@ -371,7 +367,7 @@ def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
-    "Tensor(b!) counter, SymInt[]? dims=None, SymInt[]? strides=None, "
+    "Tensor(b!)? counter=None, SymInt[]? dims=None, SymInt[]? strides=None, "
     "bool transposed=False, SymInt[]? pad=None, float? pad_value=None, "
     "SymInt[]? count=None) -> ()"
 )
@@ -383,7 +379,7 @@ def async_copy(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
-    counter: torch.Tensor,
+    counter: Optional[torch.Tensor] = None,
     dims: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
@@ -433,11 +429,13 @@ def async_copy(
         else:
             dst[block][payload] = src[payload]
 
+    if counter is None:
+        return
     if _race_check is not None:
         rc = _race_check
         key = rc.key(counter)
-        rc.access("an async_copy's source", src, False, (), None, key)
-        rc.access("an async_copy's destination", dst, True, (), None, key)
+        rc.access("an async_copy's source", src, False, (), key)
+        rc.access("an async_copy's destination", dst, True, (), key)
     counter.add_(1)
     if _race_check is not None:
         rc.seq += 1
@@ -453,7 +451,7 @@ def _async_copy_fake(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
-    counter: torch.Tensor,
+    counter: Optional[torch.Tensor] = None,
     dims: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
@@ -514,27 +512,6 @@ def async_wait(counter: torch.Tensor, threshold: int) -> None:
 @torch.library.register_fake("voyager::async_wait")
 def _async_wait_fake(counter: torch.Tensor, threshold: int) -> None:
     return None
-
-
-voyager_lib.define("drain() -> ()")
-
-
-@impl(voyager_lib, "drain", "CompositeExplicitAutograd")
-def drain() -> None:
-    # Dispatches run to completion in the eager model: nothing to wait for.
-    if _race_check is not None:
-        _race_check.drained = _race_check.seq
-    return None
-
-
-@torch.library.register_fake("voyager::drain")
-def _drain_fake() -> None:
-    return None
-
-
-# A drain reads and writes nothing the graph names; keep it through dead
-# code elimination.
-torch.fx.node._side_effectful_functions.add(torch.ops.voyager.drain.default)
 
 
 # ---------------------------------------------------------------------------
@@ -674,10 +651,9 @@ class AsyncOp(BaseHOP):
                 for pairs in (dependencies or {}).values()
                 for c, t in pairs
             ]
-            unit = _race_check.key(post) if post is not None else None
             name = f"a commit ({type(subgraph).__name__})"
             for t, write in accesses:
-                _race_check.access(name, t, write, waits, unit)
+                _race_check.access(name, t, write, waits)
         out = subgraph(*operands)
         if post is not None:
             post.add_(1)
@@ -686,8 +662,8 @@ class AsyncOp(BaseHOP):
             rc.seq += 1
             rc.kind[rc.seq] = f"a commit ({type(subgraph).__name__})"
             if post is None:
-                # Nothing can wait on a dispatch that posts nothing: what
-                # depends on it has to drain.
+                # Nothing can wait on a dispatch that posts nothing, so
+                # whatever depends on it is reported as a race.
                 producer = (rc.seq, None, 1, None, 0)
             else:
                 producer = rc.producer(post, rc.key(post))

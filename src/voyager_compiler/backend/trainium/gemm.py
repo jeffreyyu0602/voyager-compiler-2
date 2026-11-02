@@ -1369,11 +1369,10 @@ def transposed_load_buffers(staging, psum):
     )
 
 
-def load_transposed(buffers, slot, src, dst, indices, sizes, counter, **copy):
+def load_transposed(buffers, slot, src, dst, indices, sizes, **copy):
     """Load an operand stored transposed into its slot ``dst``
     (``_InputSpec.load``): its tile as stored into staging slot ``slot``
-    by DMA, adding 1 to the operand's stream ``counter`` once landed, then
-    TensorE transposing it into ``dst`` through the PSUM box
+    by DMA, then TensorE transposing it into ``dst`` through the PSUM box
     (``transpose_through``).  NKI orders the transpose behind the DMA by
     their dependence.
 
@@ -1384,7 +1383,6 @@ def load_transposed(buffers, slot, src, dst, indices, sizes, counter, **copy):
         dst: The slot's tile.
         indices: The DMA's block indices, of the tile as stored.
         sizes: The tile as stored.
-        counter: The operand's stream counter.
         **copy: The rest of ``voyager.async_copy``'s arguments; its
             ``transposed`` is the contract's, true.
     """
@@ -1394,7 +1392,7 @@ def load_transposed(buffers, slot, src, dst, indices, sizes, counter, **copy):
         stage = get_slot(staging.view(slots, *sizes), slot)
     else:
         stage = staging.view(sizes)
-    voyager.async_copy(src, stage, indices, sizes, counter, **copy)
+    voyager.async_copy(src, stage, indices, sizes, **copy)
     transpose_through(stage, dst, psum, slot)
 
 

@@ -494,7 +494,7 @@ def compile(
     runtime_tolerance=None,
     dram_layout=None,
     accumulate_fp32=False,
-    bool_mask=True,
+    bool_mask=False,
 ):
     """Bufferize ``model``, plan its memory, synchronize its dispatches
     and write its ``voyager`` IR.
@@ -528,8 +528,9 @@ def compile(
         accumulate_fp32: Accumulate a GEMM split along K in float32 rather
             than its output dtype.
         bool_mask: Store an ``is_causal`` flash attention's mask table as
-            int1 codes plus a scale; off, as the additive fill at the
-            accumulation dtype.
+            int1 codes plus a scale, for hardware whose vector unit reads
+            int1 (MXNF4); off, as the additive fill at the accumulation
+            dtype.
 
     Returns:
         The ``voyager`` IR ``Model`` written to ``model.txt``.

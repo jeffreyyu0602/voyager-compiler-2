@@ -165,6 +165,8 @@ _LLM = (
     "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask "
     + _FP16
 )
+# MXNF4's vector unit reads a causal flash attention's mask table as int1.
+_BOOL_MASK = " --bool_mask"
 _LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
 # A prompt of 960 tokens leaves a 64-token tail past its 128-position chunks.
 _LLM_TAIL = _LLM.replace("--context_length 1024", "--context_length 960")
@@ -209,36 +211,64 @@ COMMANDS = [
     Command("mobilebert", "MXINT8", "16,16", "mobilebert_encoder", _SINGLE),
     Command("mobilenet_v2", "MXINT8", "16,16"),
     # -- MXNF4 (llama) --
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill", _LLM),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
-    Command("llama_decode", "MXNF4", "64,64", "llama_decode", _LLM),
+    Command(
+        "llama_prefill", "MXNF4", "64,64", "llama_prefill", _LLM + _BOOL_MASK
+    ),
+    Command(
+        "llama_prefill",
+        "MXNF4",
+        "64,64",
+        "llama_prefill_mp",
+        _LLM_MP + _BOOL_MASK,
+    ),
+    Command(
+        "llama_prefill",
+        "MXNF4",
+        "64,64",
+        "llama_prefill_spmm",
+        _LLM_SPMM + _BOOL_MASK,
+    ),
+    Command(
+        "llama_decode", "MXNF4", "64,64", "llama_decode", _LLM + _BOOL_MASK
+    ),
     Command(
         "llama_decode_kivi",
         "MXNF4",
         "64,64",
         "llama_decode_kivi",
-        _LLM + _RESIDUAL,
+        _LLM + _RESIDUAL + _BOOL_MASK,
     ),
     # -- the prefill that fills the decode's KV cache, compiled with it: a
     # 128-position residual with a tail of 0 and of 64 tokens, the latter
     # under flash attention too, and the split each cache's blocks ask for --
-    Command("llama_cache", "MXNF4", "64,64", "llama_cache", _LLM + _RESIDUAL),
+    Command(
+        "llama_cache",
+        "MXNF4",
+        "64,64",
+        "llama_cache",
+        _LLM + _RESIDUAL + _BOOL_MASK,
+    ),
     Command(
         "llama_cache",
         "MXNF4",
         "64,64",
         "llama_cache_tail",
-        _LLM_TAIL + _RESIDUAL,
+        _LLM_TAIL + _RESIDUAL + _BOOL_MASK,
     ),
     Command(
         "llama_cache",
         "MXNF4",
         "64,64",
         "llama_cache_sdpa",
-        _LLM_TAIL + _RESIDUAL + " --attn_implementation sdpa",
+        _LLM_TAIL + _RESIDUAL + " --attn_implementation sdpa" + _BOOL_MASK,
     ),
-    Command("llama_cache", "MXNF4", "64,64", "llama_cache_blocks", _LLM),
+    Command(
+        "llama_cache",
+        "MXNF4",
+        "64,64",
+        "llama_cache_blocks",
+        _LLM + _BOOL_MASK,
+    ),
     # -- BF16 (an unquantized KV cache stays whole) --
     Command("llama_decode", "BF16", "64,64", "llama_decode", _LLM),
     # -- MXNF4 (vision / bert) --
@@ -249,10 +279,26 @@ COMMANDS = [
     # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
     # pipeline apart) --
     Command("resnet18", "MXNF4", "64,64", "resnet18_db", _DB),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
-    Command("llama_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
     Command(
-        "llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
+        "llama_prefill",
+        "MXNF4",
+        "64,64",
+        "llama_prefill_db",
+        _LLM_DB + _BOOL_MASK,
+    ),
+    Command(
+        "llama_decode",
+        "MXNF4",
+        "64,64",
+        "llama_decode_db",
+        _LLM_DB + _BOOL_MASK,
+    ),
+    Command(
+        "llama_prefill",
+        "MXNF4",
+        "64,64",
+        "llama_prefill_spmm_db",
+        _LLM_SPMM_DB + _BOOL_MASK,
     ),
     # -- training: one AdamW step, compiled into gradient/ and update/ --
     Command("llama_prefill", "BF16", "64,64", "llama_train", _LLM_TRAIN),

@@ -56,12 +56,12 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     rescale that folds the context in.  A one-row query tile makes the products
     matrix-vector, run on the vector unit like any (``gemv_compute_cycles``), so
     its step is the plain sum.  A query block's first step is a boundary: beside
-    the context the vector unit resets its state and runs the softmax, and once
-    that context has landed it finishes the previous block in the rescale's
-    place -- the accumulate, a split cache's residual, the finalize and the
-    zeroing.  A sweep whose every step is a boundary prices each step as one.
-    The products are priced by their searches (``matrix``, at the head
-    ``pad_head`` pads to); each vector pass at the bandwidth-bound rate
+    the context the vector unit runs the softmax, writing the block's fresh
+    running sum, and once that context has landed it finishes the previous
+    block in the rescale's place -- the accumulate, a split cache's residual
+    and the finalize.  A sweep whose every step is a boundary prices each
+    step as one.  The products are priced by their searches (``matrix``, at
+    the head ``pad_head`` pads to); each vector pass at the bandwidth-bound rate
     ``vector_op_utilization`` charges, plus its launch, P's quantize bound by
     the writes of its codes and scales.  Query and output move once per query
     block, while key, value, mask and every block scale reload on each step --
@@ -118,35 +118,33 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
 
     rows, tile, out = tq, tq * tkv, tq * head_dim
     # The softmax chain: rowmax, exponentials and rowsum over the score tile;
-    # the running max, the rescale factor, its copy and the running sum over
-    # a column.  Under MX, P's quantize writes its codes and a block scale
-    # per lane group.  Then the fused rescale-accumulate over the output
-    # tile, or at a boundary the reset of the two columns (and the residual's
-    # max snapshot) before the softmax and, after it, the accumulate, the
-    # finalize and the zeroing of the output tile.
-    softmax = passes(3, tile) + passes(4, rows)
+    # the running max, the rescale factor and the running sum over a column.
+    # Under MX, P's quantize writes its codes and a block scale per lane
+    # group.  Then the fused rescale-accumulate over the output tile, or at a
+    # boundary, where the tile's first block writes the running sum as its
+    # rowsum (one column pass fewer), the accumulate and the finalize.
+    softmax = passes(3, tile) + passes(3, rows)
     if node.kwargs.get("block_size"):
         beat = max(1, round(bpc))
         codes = record_writes(lanes * node_dtype_bits(query), beat)
         softmax += passes(1, tile, max(read, codes + 1))
     rescale = passes(1, out)
-    reset = passes(2, rows)
-    finish = passes(3, out)
+    first = softmax - passes(1, rows)
+    finish = passes(2, out)
     residual = get_arg_value(node, 7, "key_residual", None)
     if residual is not None:
         length = tiles[residual][-1]
-        reset += passes(1, rows)
         finish += matrix["residual_scores"] + matrix["residual_context"]
-        finish += passes(3, tq * length) + passes(4, rows) + rescale
+        finish += passes(3, tq * length) + passes(3, rows) + rescale
     scores, context = matrix["scores"], matrix["context"]
     if tq == 1:
         # One query row: the products are matrix-vector and run on the
         # vector unit beside the softmax, so nothing overlaps.
         interior = scores + context + softmax + rescale
-        boundary_step = scores + context + reset + softmax + finish
+        boundary_step = scores + context + first + finish
     else:
         interior = scores + max(context, softmax) + rescale
-        boundary_step = scores + max(context, reset + softmax) + finish
+        boundary_step = scores + max(context, first) + finish
     if steps == boundaries:
         # Every step starts a query block, so the sweep runs boundaries only.
         interior = boundary_step
@@ -295,10 +293,11 @@ class VoyagerAttention(OpModel):
                 config.vector_lanes,
             )
 
-        # m, row_tmp, alpha and the two slots of l; o, pv_buf; the
-        # double-buffered s_buf.
-        total += 5 * acc_bytes((tq, 1))
-        total += acc_bytes((tq, head_dim)) + acc_bytes((tq, head_pad))
+        # The three slots of m, row_tmp, alpha and the two slots of l; o and
+        # P@V's result, two slots of the padded head; the double-buffered
+        # s_buf.
+        total += 7 * acc_bytes((tq, 1))
+        total += 2 * acc_bytes((tq, head_pad))
         total += 2 * acc_bytes((tq, tkv))
         if block_size is not None:
             total += 2 * tensor_bytes(query, (tq, tkv), config)

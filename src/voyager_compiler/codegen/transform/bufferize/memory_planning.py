@@ -536,8 +536,11 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
                 outs = list(out) if isinstance(out, (list, tuple)) else [out]
                 for ph, o in zip(phs, operands):
                     bind(ph, o)
+                # A carried tensor is a buffer the body returns; a carried
+                # scalar (a cursor, a count) names none, and two may share
+                # the body's value.
                 for i, c in enumerate(carried):
-                    if isinstance(c, Node) and i < len(outs):
+                    if _val(c) is not None and i < len(outs):
                         bind(outs[i], c)
                 walk(body)
             elif n.op == "call_function" and n.target is _COND:

@@ -157,8 +157,8 @@ SCALAR_OPS = {
 }
 ALLOCATIONS = ("voyager::alloc",)
 # The CPU's synchronization, which NKI's own dependence order replaces: the
-# waits, the drains and the counter resets.
-SYNC_OPS = ("voyager::async_wait", "voyager::drain", "voyager::zeros")
+# waits and the counter resets.
+SYNC_OPS = ("voyager::async_wait", "voyager::zeros")
 
 # Elementwise ops: target -> NKI ALU op, or activation.
 BINARY_OPS = {

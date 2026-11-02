@@ -5,11 +5,9 @@ array with the vector unit: each iteration runs the current block's QKᵀ matmul
 and the previous block's P@V matmul on the matrix unit while the vector unit
 softmaxes, a one-step skew fused across Q-tile / head boundaries.  The pipeline
 is peeled — a prologue, ``num_steps - 1`` uniform loop iterations, an epilogue.
-Every op is emitted inline; the DMA is asynchronous, each stream (Q, K, V,
-the mask, the scales, the output) adding 1 to its own counter per landed
-copy, and a CPU ``voyager.async_wait(counter, n)`` gates an op on the block
-it reads having landed (the n-th copy of the stream) or on the output slot
-it writes being free.
+Every op is emitted inline and every copy bare: the DMA is asynchronous, and
+the sync pass derives each wait, an op's on the block it reads having landed
+or on the slot it writes being free.
 
 The loop walks the live (Q tile, KV block) pairs: every pair under an
 explicit mask; under ``is_causal`` only the blocks up to each Q tile's last
@@ -24,17 +22,27 @@ Per iteration (``N = num_kv_blocks``), in program order:
       broadcast along every dim the walk steps over is one tile, loaded
       once in the prologue (``mask_once``).
   [B] pv_buf = p_buf[(step-1) % 2] @ V_prev, once V_prev has landed
-  [C] kv == 0 only (a Q-tile boundary): fresh state for the new tile, m =
-      -inf and l[sweep % 2] = 0.  The sum ``l`` is double-buffered by sweep
-      parity so the tile that just ended keeps its own for [E]; m and o are
-      not, since [E] never reads m and zeroes o before the next [F].
-  [D] softmax chain (rowmax, m, alpha, P, rowsum, l).
+  [D] softmax chain (rowmax, m, alpha, P, rowsum, l).  The running max ``m``
+      alternates between two slots by step parity: step ``t`` reads slot ``t
+      % 2`` and writes slot ``(t + 1) % 2``, so the previous max needs no
+      copy.  A step starting a tile reads a third slot instead, which the
+      prologue copies a -inf constant into, as its fresh max.  The sum ``l``
+      is double-buffered by sweep parity so the tile that just ended keeps
+      its own for [E]; a tile's first block writes it (l = rowsum), later
+      blocks accumulate into it.
   [E] kv == 0 only: o += pv_buf; wait for the previous output store;
       (o / l[(sweep + 1) % 2]) -> o_slots; store o_slots to the PREVIOUS
-      tile's DRAM rows (the finalize belongs to the tile that just ended);
-      o = 0.
+      tile's DRAM rows (the finalize belongs to the tile that just ended).
+      When that tile had one block, o holds nothing of it and the finalize
+      reads pv_buf instead.
   [F] kv >= 1 only (after [D]): the deferred rescale fused with the
-      accumulate, o = alpha·(o + pv_buf).
+      accumulate, o = alpha·(o + pv_buf), or o = alpha·pv_buf at kv == 1,
+      the tile's first P@V.
+
+No state is reset or zeroed: each running value is written by its tile's
+first block, so the kernel needs no fill.  A subclass whose steps keep their
+state in place instead (``zeroes_state``) resets it at each tile ([C],
+``_reset``) and zeroes ``o`` after each finalize.
 
 The probabilities ``p_buf`` are ``s_buf`` itself -- [D] exponentiates the
 scores in place -- unless the softmax runs at a different dtype than the
@@ -68,8 +76,8 @@ unquantized) and ``residual_mask`` (the chunk's slice of the mask; the main
 mask drops the chunk's window).  An online softmax is additive over key
 blocks, so the residual is folded in at the sweep's boundary, after [E] has
 landed the sweep's last P@V and before the finalize: its QKᵀ, the softmax
-chain over the running state the sweep leaves -- its max snapshotted before
-[C] resets it for the next tile -- and P@V, then ``o = alpha·o + pv``.  Both
+chain over the running state the sweep leaves -- its max still in the slot
+the boundary step's [D] read past -- and P@V, then ``o = alpha·o + pv``.  Both
 products are plain matmuls, ``R`` (the residual's positions) wide, and the
 residual's P is not quantized.  The residual's tiles stream through slots
 of their own, one per sweep parity: a sweep's residual is fetched on its
@@ -114,7 +122,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
-    new_counter,
+    effect_cond,
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling import (
@@ -177,9 +185,9 @@ class _FA3Pipeline(torch.nn.Module):
     ``out_tile``, ``fold_query``, ``out_shape``), its buffers
     (``_alloc_state``), its loads and store (``_load_q``, ``_load_key``,
     ``_store_out``), its steps -- [A] ``_matmul_qk``, [B] ``_matmul_pv``,
-    [D] ``_softmax_step``, [E]'s ``_land_pv`` and ``_finalize``, [F]
-    ``_accumulate_pv`` -- and the fusion of its ops (``fuse_ops``), and
-    hands the class to ``build_attention_fa3``.
+    [C] ``_reset``, [D] ``_softmax_step``, [E]'s ``_land_pv`` and
+    ``_finalize``, [F] ``_accumulate_pv`` -- and the fusion of its ops
+    (``fuse_ops``), and hands the class to ``build_attention_fa3``.
 
     Attributes:
         ops: The attention ops the kernel lowers.
@@ -196,6 +204,10 @@ class _FA3Pipeline(torch.nn.Module):
         torch.ops.quantized_ops.sdpa_mx.default,
     )
     runs_mapped_products = True
+    # The kernel starts each Q tile from reset state (``_reset``, ``o``
+    # zeroed) and accumulates every block into it, rather than writing it
+    # on the tile's first block.
+    zeroes_state = False
 
     def __init__(
         self,
@@ -300,6 +312,44 @@ class _FA3Pipeline(torch.nn.Module):
         self.num_steps = math.prod(self.grid[: self.gq]) * sum(
             self._kv_last(q) + 1 for q in range(self.grid[self.gq])
         )
+        # The running max a tile starts from, copied once into ``m``'s
+        # third slot (``_alloc_state``).
+        self.register_buffer(
+            "max_fill",
+            torch.full((1,) * self.nb + (tq, 1), _MASK_FILL, dtype=acc_dtype),
+        )
+
+    def register_pad_rows(self, operands):
+        """Register the zero tiles that clear the pad rows of the row-padded
+        Kᵀ slots (a head narrower than the products, module docstring), one
+        per slot shape, copied in once by the prologue.  ``operands`` are
+        ``forward``'s."""
+        if self.d_pad == self.d:
+            return
+        unit = (1,) * self.nb
+        index = self.operand_index
+        key = operands[index["key"]]
+        self.register_buffer(
+            "key_pad_rows",
+            torch.zeros(unit + (self.d_pad, self.tkv), dtype=key.dtype),
+        )
+        bs = self.block_size
+        if bs is not None and math.ceil(self.d_pad / bs) != math.ceil(
+            self.d / bs
+        ):
+            scale = operands[index["key_scale"]]
+            rows = math.ceil(self.d_pad / bs)
+            self.register_buffer(
+                "key_scale_pad_rows",
+                torch.zeros(unit + (rows, self.tkv), dtype=scale.dtype),
+            )
+        if "key_residual" in index:
+            residual = operands[index["key_residual"]]
+            length = residual.shape[-2]
+            self.register_buffer(
+                "residual_key_pad_rows",
+                torch.zeros(unit + (self.d_pad, length), dtype=residual.dtype),
+            )
 
     @staticmethod
     def logical_operands(query, key):
@@ -336,19 +386,17 @@ class _FA3Pipeline(torch.nn.Module):
             idx.append(coords[grid_dim])
         return dims, idx
 
-    def _load_sweep(self, src, slots, slot, counter, coords, tile, pad=False):
+    def _load_sweep(self, src, slots, slot, coords, tile, pad=False):
         """DMA ``src``'s ``tile`` at ``coords``' query block into
-        ``slots[slot]``, adding 1 to the stream's ``counter`` once landed:
-        the block of sweep ``s`` is the stream's copy ``s + 1``.  ``pad``
-        has the DMA zero-fill what ``tile`` extends past the source's edge
-        (a column-padded head)."""
+        ``slots[slot]``.  ``pad`` has the DMA zero-fill what ``tile`` extends
+        past the source's edge (a column-padded head)."""
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         voyager.async_copy(
             src,
             get_slot(slots, slot),
             idx,
             (1,) * self.nb + tuple(tile),
-            counter,
+            None,
             dims,
             pad=[0] * (self.nb + len(tile)) if pad else None,
         )
@@ -358,7 +406,6 @@ class _FA3Pipeline(torch.nn.Module):
         src,
         slots,
         slot,
-        counter,
         coords,
         tile,
         transposed,
@@ -366,9 +413,7 @@ class _FA3Pipeline(torch.nn.Module):
         rows=None,
     ):
         """DMA ``src``'s ``tile`` at ``coords``' key block into
-        ``slots[slot]``, adding 1 to the stream's ``counter`` once landed
-        (the block of step ``t`` is copy ``t + 1``).  ``tile`` is the DRAM
-        block in the buffer's own
+        ``slots[slot]``.  ``tile`` is the DRAM block in the buffer's own
         order; ``transposed`` has the DMA ``.mT`` it into the slot (the Kᵀ
         tiles, as ``PipelinedKernel._load_tile`` does).  ``pad`` has the
         DMA zero-fill what ``tile`` extends past the source's edge (a
@@ -384,17 +429,17 @@ class _FA3Pipeline(torch.nn.Module):
             dst,
             idx,
             (1,) * self.nb + tuple(tile),
-            counter,
+            None,
             dims,
             transposed=transposed,
             pad=[0] * (self.nb + len(tile)) if pad else None,
         )
 
-    def _load_mask(self, mask, slots, slot, counter, coords):
+    def _load_mask(self, mask, slots, slot, coords):
         """DMA the mask tile of the pair at ``coords`` into
         ``slots[slot]``: the explicit mask's block, or under ``is_causal``
         the ``causal_mask`` entry for the pair's offset (module
-        docstring), adding 1 to the stream's ``counter`` once landed."""
+        docstring)."""
         if self.causal:
             q, kv = coords[self.gq], coords[self.gkv]
             offset = (q * self.tq) % self.sq_orig + self.tq - kv * self.tkv
@@ -408,31 +453,22 @@ class _FA3Pipeline(torch.nn.Module):
             get_slot(slots, slot),
             idx,
             munit + (self.tq, self.tkv),
-            counter,
+            None,
             dims,
         )
 
-    def _store_out(self, tile, out, counter, coords):
+    def _store_out(self, tile, out, coords):
         """DMA the finished output ``tile`` of the sweep at ``coords`` into
-        ``out``, adding 1 to the output stream's ``counter`` once landed."""
+        ``out``."""
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
-        voyager.async_copy(
-            tile, out, idx, unit + (self.tq, self.d), counter, dims
-        )
+        voyager.async_copy(tile, out, idx, unit + (self.tq, self.d), None, dims)
 
-    @staticmethod
-    def _wait_landed(waits):
-        """The CPU waits until every stream in ``waits`` -- ``(counter,
-        count)`` pairs -- has landed its ``count``-th copy."""
-        for counter, count in waits:
-            voyager.async_wait(counter, count)
-
-    def _finalize(self, b, l):
+    def _finalize(self, b, l, o):
         """The finished output tile, ``o / l`` at the output dtype, into
-        the output slot.  ``b`` holds the buffers (``_alloc``) and ``l`` is
-        the tile's running sum."""
-        voyager.insert((b.o / l).to(self.out_dtype), get_slot(b.out_slots, 0))
+        the output slot.  ``b`` holds the buffers (``_alloc``), ``l`` is
+        the tile's running sum and ``o`` its output (``_finish``)."""
+        voyager.insert((o / l).to(self.out_dtype), get_slot(b.out_slots, 0))
 
     @staticmethod
     def _rows(tile, rows):
@@ -452,8 +488,6 @@ class _FA3Pipeline(torch.nn.Module):
         return voyager.subview(
             tile, [0] * len(shape), shape[:-1] + [cols], [1] * len(shape)
         )
-
-    # --- compute helpers (shared by prologue / loop / epilogue) ---------
 
     def _matmul(self, *tiles):
         """The matrix unit's product of two tiles, ``a @ b``: ``(a, b)``, or
@@ -475,10 +509,10 @@ class _FA3Pipeline(torch.nn.Module):
             weight_code=b_code,
         )
 
-    def _matmul_qk(self, b, operands, slot, waits, masked=True):
-        """[A]: S = (Q @ Kᵀ)·scale (+ mask) -> the scores slot ``slot``,
-        once the tiles have landed (``waits``, see ``_wait_landed``).  ``b``
-        holds the buffers (``_alloc``); ``operands`` are the product's tiles
+    def _matmul_qk(self, b, operands, slot, masked=True):
+        """[A]: S = (Q @ Kᵀ)·scale (+ mask) -> the scores slot ``slot``.
+        ``b`` holds the buffers (``_alloc``); ``operands`` are the product's
+        tiles
         (``_matmul``), then the mask tile when there is one and, for int1
         codes, its scale, which a dequantize in the same pass turns into
         the additive fill.  The mask is added unless ``masked`` is false --
@@ -486,7 +520,6 @@ class _FA3Pipeline(torch.nn.Module):
         (``_crosses``), whose mask tile is all zeros.  The op branches on
         ``has_mask`` and ``masked`` at build time, so the traced graph
         carries no runtime cond."""
-        self._wait_landed(waits)
         tiles = list(operands)
         if self.mask_scaled:
             *tiles, mask, mask_scale = tiles
@@ -508,18 +541,31 @@ class _FA3Pipeline(torch.nn.Module):
         q, kv = coords[self.gq], coords[self.gkv]
         return attention_crosses(q, kv, self.tq, self.tkv, self.sq_orig)
 
-    def _matmul_pv(self, b, operands, waits, slot):
-        """[B]: pv_buf = P @ V, once V has landed (``waits``).  ``b`` holds
-        the buffers (``_alloc``); ``operands`` are the product's tiles
-        (``_matmul``).  ``slot`` is the parity of the step whose P it
-        multiplies, for a kernel keeping two results; the single ``pv_buf``
-        takes no slot."""
-        self._wait_landed(waits)
-        voyager.insert(self._matmul(*operands), b.pv_buf)
+    def _matmul_pv(self, b, operands, slot):
+        """[B]: pv_buf = P @ V.  ``b`` holds the buffers (``_alloc``);
+        ``operands`` are the product's tiles (``_matmul``).  ``slot`` is the
+        parity of the step whose P it multiplies, for a kernel keeping two
+        results; the single ``pv_buf`` takes no slot."""
+        voyager.insert(self._matmul(*operands), get_slot(b.opv, 1))
 
-    def _softmax(self, s_slot, p_slot, m, l, row_tmp, alpha, p_scale, probs):
+    def _softmax(
+        self,
+        s_slot,
+        p_slot,
+        m_old,
+        m_new,
+        l,
+        row_tmp,
+        alpha,
+        p_scale,
+        probs,
+        first,
+    ):
         """[D]'s chain: rowmax / m / alpha / P / rowsum / l (the baseline
-        passes 2-7).  Unquantized, P lands in ``p_slot``
+        passes 2-7), from the running max ``m_old`` to ``m_new``, a region
+        of its own.  ``first`` (a bool, or the loop's SymBool) marks a
+        tile's first block, which writes ``l`` as the rowsum; a later block
+        adds the rowsum to ``alpha·l``.  Unquantized, P lands in ``p_slot``
         -- ``s_slot`` itself unless the probabilities have their own buffer
         -- and the rowsum reads it back, so ``l`` sums the P the matmul
         will see.  Under MX, S is exponentiated in place and summed exact,
@@ -528,13 +574,24 @@ class _FA3Pipeline(torch.nn.Module):
         the midpoints -- into ``p_slot``'s codes and ``p_scale``."""
         mx = probs is not None
         voyager.insert(torch.amax(s_slot, dim=-1, keepdim=True), row_tmp)
-        voyager.insert(torch.maximum(m, row_tmp), row_tmp)
-        voyager.insert(torch.exp(m - row_tmp), alpha)
-        voyager.insert(row_tmp.clone(), m)
+        voyager.insert(torch.maximum(m_old, row_tmp), m_new)
+        voyager.insert(torch.exp(m_old - m_new), alpha)
         exp_slot = s_slot if mx else p_slot
-        voyager.insert(torch.exp(s_slot - row_tmp), exp_slot)
-        voyager.insert(torch.sum(exp_slot, dim=-1, keepdim=True), row_tmp)
-        voyager.insert(alpha * l + row_tmp, l)
+        voyager.insert(torch.exp(s_slot - m_new), exp_slot)
+
+        def start():
+            voyager.insert(torch.sum(exp_slot, dim=-1, keepdim=True), l)
+
+        def accumulate():
+            voyager.insert(torch.sum(exp_slot, dim=-1, keepdim=True), row_tmp)
+            voyager.insert(alpha * l + row_tmp, l)
+
+        if first is True:
+            start()
+        elif first is False:
+            accumulate()
+        else:
+            effect_cond(first, start, accumulate)
         if mx:
             qmap, scale_qmap, code = probs
             scale, codes = torch.ops.quantized_ops.quantize_mx(
@@ -550,93 +607,106 @@ class _FA3Pipeline(torch.nn.Module):
             voyager.insert(scale, p_scale)
             voyager.insert(codes, p_slot)
 
-    def _reset(self, m, l):
-        """[C]: the running max and sum a new Q tile starts from."""
-        voyager.insert(torch.full_like(m, _MASK_FILL), m)
-        voyager.insert(torch.zeros_like(l), l)
-
-    def _softmax_step(self, b, slot, sweep_slot, probs):
+    def _softmax_step(self, b, slot, sweep_slot, probs, kv):
         """[D] on the scores of step parity ``slot``, into the running sum
-        of sweep parity ``sweep_slot`` (``_softmax``).  ``b`` holds the
-        buffers (``_alloc``); ``probs`` is what P's ``quantize_mx`` takes
-        under MX, else ``None``."""
+        of sweep parity ``sweep_slot`` (``_softmax``), the running max read
+        from ``m``'s slot ``slot`` -- the -inf slot 2 at ``kv`` 0, a new Q
+        tile, whose block writes ``l`` -- and written to the other.  ``b``
+        holds the buffers (``_alloc``); ``probs`` is what P's
+        ``quantize_mx`` takes under MX, else ``None``; ``kv`` is the step's
+        block in its tile, the loop's SymInt, or ``None`` for the
+        prologue's step 0, a first block."""
+        if kv is None:
+            fresh, first = 1, True
+        else:
+            # 1 at a tile's first block, else 0 (``kv`` is below ``N``).
+            fresh, first = 1 - (kv + self.N - 1) // self.N, kv == 0
+        read = slot + (2 - slot) * fresh
+        torch._check(read < 3)
         self._softmax(
             get_slot(b.s_buf, slot),
             get_slot(b.p_buf, slot),
-            b.m,
+            get_slot(b.m, read),
+            get_slot(b.m, 1 - slot),
             get_slot(b.l, sweep_slot),
             b.row_tmp,
             b.alpha,
             get_slot(b.p_scale, slot) if probs is not None else None,
             probs,
+            first,
         )
 
-    def _pv_cols(self, b):
-        """What the accumulate reads of ``b.pv_buf``: its real columns.
-        Taken where it is read -- a view captured beside its buffer would
-        alias a ``while_loop`` input."""
+    def _opv(self, b, slot):
+        """The real columns of ``b.opv``'s slot ``slot``: ``o`` (0) or P@V's
+        result (1).  Taken where it is read -- a view captured beside its
+        buffer would alias a ``while_loop`` input."""
+        tile = get_slot(b.opv, slot)
         if self.d_pad != self.d:
-            return self._cols(b.pv_buf, self.d)
-        return b.pv_buf
+            return self._cols(tile, self.d)
+        return tile
+
+    def _o(self, b):
+        """The running output ``o`` (``_opv``)."""
+        return self._opv(b, 0)
+
+    def _pv_cols(self, b):
+        """What the accumulate reads of P@V's result (``_opv``)."""
+        return self._opv(b, 1)
 
     def _land_pv(self, b, slot):
         """[E]'s first part: add a Q tile's last P@V into ``o``.  ``b``
         holds the buffers (``_alloc``); ``slot`` is the parity of the step
         whose P it multiplied, for a kernel keeping two results
         (``_matmul_pv``)."""
-        voyager.insert(b.o + self._pv_cols(b), b.o)
+        o = self._o(b)
+        voyager.insert(o + self._pv_cols(b), o)
 
     def _accumulate_pv(self, b, slot):
         """[F]: the deferred rescale fused with the P@V accumulate, ``o =
         alpha·(o + pv)``.  ``b`` holds the buffers (``_alloc``); ``slot`` is
         the parity of the step whose P it multiplied, for a kernel keeping
         two results (``_matmul_pv``)."""
-        voyager.insert(b.alpha * (b.o + self._pv_cols(b)), b.o)
+        o = self._o(b)
+        voyager.insert(b.alpha * (o + self._pv_cols(b)), o)
 
-    def _finish_tile(self, b, res, sweep, prev_sweep_slot, pv_slot, prev):
-        """[E]: land the previous Q tile's last P@V into ``o``
-        (``_land_pv``), fold in its residual, finalize ``o / l`` into ITS
-        rows and zero ``o`` for the new tile.
+    def _start_pv(self, b):
+        """[F] at a tile's second step: its first P@V rescaled, ``o =
+        alpha·pv``, written rather than added to ``o``.  ``b`` holds the
+        buffers (``_alloc``)."""
+        voyager.insert(b.alpha * self._pv_cols(b), self._o(b))
+
+    def _finish(self, b, res, l, m, res_tiles, pv_slot, src, land):
+        """[E]'s compute for the tile that ended: land its last P@V into
+        ``o`` (``_land_pv``), fold in its residual and finalize its output,
+        ``b.opv``'s slot ``src``, divided by ``l``, into the output slot.
+        The output is ``o`` (``src`` 0, after the land), or for a tile of
+        one block, which has nothing in ``o``, its P@V (``src`` 1, no land
+        needed).  Every slot but ``src`` comes in as a view.
 
         Args:
             b: The buffers (``_alloc``).
             res: The residual's (``_residual_setup``), or ``None``.
-            sweep: The new tile's sweep; the one that ended is ``sweep -
-                1``, whose residual is the residual stream's copy ``sweep``
-                and whose store is the output stream's copy ``sweep``.
-            prev_sweep_slot: The parity of the sweep that ended, whose
-                ``l`` the tile divides by.
+            l: The tile's running sum, which it divides by.
+            m: The running max the tile left (the residual's start).
+            res_tiles: The residual's tiles of the tile's sweep
+                (``_residual_tiles``), or ``None``.
             pv_slot: The parity of the step whose P the last P@V
                 multiplied.
-            prev: The coords of the sweep that ended, which the finished
-                tile is stored to.
+            src: ``b.opv``'s slot holding the output, an int or a SymInt.
+            land: Whether to land the last P@V into ``o``.
         """
-        self._land_pv(b, pv_slot)
+        if land:
+            self._land_pv(b, pv_slot)
+        o = self._opv(b, src)
         if res is not None:
-            self._residual_step(
-                res,
-                prev_sweep_slot,
-                get_slot(b.l, prev_sweep_slot),
-                b.o,
-                b.row_tmp,
-                b.alpha,
-                sweep,
-            )
-        # The previous boundary's store has to have left the slot before the
-        # finalize overwrites it (nothing is in flight at the first).
-        voyager.async_wait(b.out_counter, sweep - 1)
-        self._finalize(b, get_slot(b.l, prev_sweep_slot))
-        self._store_out(get_slot(b.out_slots, 0), b.out, b.out_counter, prev)
-        voyager.insert(torch.zeros_like(b.o), b.o)
-
-    # --- the kernel's buffers -------------------------------------------
+            self._residual_step(res, b, res_tiles, l, o, m)
+            o = self._o(b)
+        self._finalize(b, l, o)
 
     def _stream(self, src, tile):
-        """Two SRAM slots of ``tile`` for ``src``'s blocks, and the
-        stream's counter."""
+        """Two SRAM slots of ``tile`` for ``src``'s blocks."""
         unit = (1,) * self.nb
-        slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
-        return slots, new_counter()
+        return voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
 
     def _alloc(self, b):
         """Allocate the kernel's buffers into ``b``, which holds its
@@ -648,47 +718,48 @@ class _FA3Pipeline(torch.nn.Module):
         tq, tkv, d_pad = self.tq, self.tkv, self.d_pad
         bs = self.block_size
         b.out = voyager.alloc(self.out_shape, self.out_dtype)
-        b.q_slots, b.q_counter = self._stream(b.q, self.q_tile)
-        b.k_slots, b.k_counter = self._stream(b.k, (d_pad, tkv))
-        b.v_slots, b.v_counter = self._stream(b.v, (tkv, d_pad))
+        b.q_slots = self._stream(b.q, self.q_tile)
+        b.k_slots = self._stream(b.k, (d_pad, tkv))
+        b.v_slots = self._stream(b.v, (tkv, d_pad))
         if bs is not None:
             # A block wider than the head is one truncated block.
             d_blocks_pad = math.ceil(d_pad / bs)
-            b.q_scale_slots, b.q_scale_counter = self._stream(
-                b.q_scale, (tq, d_blocks_pad)
-            )
-            b.k_scale_slots, b.k_scale_counter = self._stream(
-                b.k_scale, (d_blocks_pad, tkv)
-            )
-            b.v_scale_slots, b.v_scale_counter = self._stream(
-                b.v_scale, (tkv // bs, d_pad)
-            )
+            b.q_scale_slots = self._stream(b.q_scale, (tq, d_blocks_pad))
+            b.k_scale_slots = self._stream(b.k_scale, (d_blocks_pad, tkv))
+            b.v_scale_slots = self._stream(b.v_scale, (tkv // bs, d_pad))
         if self.has_mask:
             munit = (1,) * (b.mask.ndim - 2)
             m_count = 1 if self.mask_once else 2
             b.m_slots = voyager.alloc(
                 [*munit, tq, tkv], b.mask.dtype, _SRAM, m_count
             )
-            b.m_counter = new_counter()
         # The output slot is single-slotted (written once per Q tile).
         b.out_slots = voyager.alloc(
             [*unit, *self.out_tile], b.out.dtype, _SRAM, 1
         )
-        b.out_counter = new_counter()
         self._alloc_state(b)
 
     def _alloc_state(self, b):
         """Allocate into ``b`` what the steps compute in: the running
-        softmax state -- the sum per sweep parity, the rest single-buffered
-        (module docstring) -- the scores per step parity, P's buffer
+        softmax state -- the max in three slots, the sum per sweep parity,
+        the rest single-buffered (module docstring) -- the scores per step
+        parity, P's buffer
         (``p_buf``, with its block scales ``p_scale`` under MX), P@V's
         result and the per-row temporaries."""
         unit = (1,) * self.nb
         tq, tkv, d = self.tq, self.tkv, self.d
         acc = self.acc_dtype
-        b.m = voyager.alloc([*unit, tq, 1], acc, _SRAM)
+        b.m = voyager.alloc([*unit, tq, 1], acc, _SRAM, 3)
+        voyager.async_copy(
+            self.max_fill,
+            get_slot(b.m, 2),
+            [0] * (self.nb + 2),
+            list(self.max_fill.shape),
+        )
         b.l = voyager.alloc([*unit, tq, 1], acc, _SRAM, 2)
-        b.o = voyager.alloc([*unit, tq, d], acc, _SRAM)
+        # ``o`` (slot 0) and P@V's result (slot 1) share a buffer, so a
+        # finalize picks its source by slot (``_finish``).
+        b.opv = voyager.alloc([*unit, tq, self.d_pad], acc, _SRAM, 2)
         b.s_buf = voyager.alloc([*unit, tq, tkv], acc, _SRAM, 2)
         # P: under MX its codes and block scales (module docstring); else S
         # exponentiated in place, unless the softmax runs at a dtype the
@@ -706,7 +777,6 @@ class _FA3Pipeline(torch.nn.Module):
             b.p_buf = voyager.alloc([*unit, tq, tkv], b.v.dtype, _SRAM, 2)
         else:
             b.p_buf = b.s_buf
-        b.pv_buf = voyager.alloc([*unit, tq, self.d_pad], acc, _SRAM)
         b.row_tmp = voyager.alloc([*unit, tq, 1], acc, _SRAM)
         b.alpha = voyager.alloc([*unit, tq, 1], acc, _SRAM)
 
@@ -719,7 +789,6 @@ class _FA3Pipeline(torch.nn.Module):
             b.q,
             b.q_slots,
             slot,
-            b.q_counter,
             coords,
             (tq, d_pad),
             pad=d_pad != d,
@@ -731,7 +800,6 @@ class _FA3Pipeline(torch.nn.Module):
                 b.q_scale,
                 b.q_scale_slots,
                 slot,
-                b.q_scale_counter,
                 coords,
                 (tq, d_blocks_pad),
                 pad=d_blocks_pad != d_blocks,
@@ -746,14 +814,11 @@ class _FA3Pipeline(torch.nn.Module):
             b.k,
             b.k_slots,
             slot,
-            b.k_counter,
             coords,
             (self.tkv, d),
             True,
             rows=d if self.d_pad != d else None,
         )
-
-    # --- the split cache's residual (module docstring) ------------------
 
     def _residual_setup(self, operands, acc, q):
         """The residual's operands and on-chip state, or ``None`` without
@@ -783,12 +848,11 @@ class _FA3Pipeline(torch.nn.Module):
         unit = (1,) * self.nb
         tq, d_pad = self.tq, self.d_pad
 
-        q_slots, q_counter = self._stream(q, (tq, d_pad))
-        k_slots, k_counter = self._stream(k, (d_pad, length))
-        v_slots, v_counter = self._stream(v, (length, d_pad))
+        q_slots = self._stream(q, (tq, d_pad))
+        k_slots = self._stream(k, (d_pad, length))
+        v_slots = self._stream(v, (length, d_pad))
         munit = (1,) * (mask.ndim - 2)
         m_slots = voyager.alloc([*munit, tq, length], mask.dtype, _SRAM, 2)
-        m_counter = new_counter()
         s = voyager.alloc([*unit, tq, length], acc, _SRAM)
         p = s
         if acc != v.dtype:
@@ -800,24 +864,19 @@ class _FA3Pipeline(torch.nn.Module):
             mask=mask,
             length=length,
             q_slots=q_slots,
-            q_counter=q_counter,
             k_slots=k_slots,
-            k_counter=k_counter,
             v_slots=v_slots,
-            v_counter=v_counter,
             m_slots=m_slots,
-            m_counter=m_counter,
             s=s,
             p=p,
             pv=voyager.alloc([*unit, tq, d_pad], acc, _SRAM),
-            m_prev=voyager.alloc([*unit, tq, 1], acc, _SRAM),
+            m=voyager.alloc([*unit, tq, 1], acc, _SRAM),
         )
 
     def _residual_prefetch(self, res, slot, coords):
         """DMA the residual's tiles of the sweep at ``coords`` into slot
         ``slot``: the query tile like Q's, K and V whole (K transposed),
-        and the mask's block, whole along the keys.  Each stream's copy for
-        sweep ``s`` is its ``s + 1``-th."""
+        and the mask's block, whole along the keys."""
         unit = (1,) * self.nb
         tq, d, d_pad, length = self.tq, self.d, self.d_pad, res.length
         pad = [0] * (self.nb + 2) if d_pad != d else None
@@ -827,7 +886,7 @@ class _FA3Pipeline(torch.nn.Module):
             get_slot(res.q_slots, slot),
             idx,
             unit + (tq, d_pad),
-            res.q_counter,
+            None,
             dims,
             pad=pad,
         )
@@ -840,7 +899,7 @@ class _FA3Pipeline(torch.nn.Module):
             k_tile,
             idx,
             unit + (length, d),
-            res.k_counter,
+            None,
             dims,
             transposed=True,
         )
@@ -849,7 +908,7 @@ class _FA3Pipeline(torch.nn.Module):
             get_slot(res.v_slots, slot),
             idx,
             unit + (length, d_pad),
-            res.v_counter,
+            None,
             dims,
             pad=pad,
         )
@@ -860,36 +919,34 @@ class _FA3Pipeline(torch.nn.Module):
             get_slot(res.m_slots, slot),
             [coords[g] for _, g in dyn],
             munit + (tq, length),
-            res.m_counter,
+            None,
             [j for j, _ in dyn],
         )
 
-    def _residual_snapshot(self, res, m):
-        voyager.insert(m.clone(), res.m_prev)
+    def _residual_tiles(self, res, slot):
+        """The residual's query, key, mask and value tiles in its slots of
+        sweep parity ``slot``."""
+        return tuple(
+            get_slot(slots, slot)
+            for slots in (res.q_slots, res.k_slots, res.m_slots, res.v_slots)
+        )
 
-    def _residual_step(self, res, slot, l_slot, o, row_tmp, alpha, landed):
-        """Fold the residual block of the sweep that just ended into its
-        state once its tiles have landed (``landed``: the number of
-        residual fetches they are the last of): S = (q @ Kᵀ)·scale + mask,
-        the softmax chain from the snapshotted max, P @ V, then ``o =
-        alpha·o + pv``."""
-        self._wait_landed(
-            [
-                (res.q_counter, landed),
-                (res.k_counter, landed),
-                (res.m_counter, landed),
-            ]
-        )
-        q, k = get_slot(res.q_slots, slot), get_slot(res.k_slots, slot)
-        mask = get_slot(res.m_slots, slot)
+    def _residual_step(self, res, b, tiles, l, o, m):
+        """Fold the residual block of the sweep that just ended, its
+        ``tiles`` (``_residual_tiles``), into its state: S = (q @ Kᵀ)·scale
+        + mask, the softmax chain from the max ``m`` the sweep left (its new
+        max into ``res.m``) into its sum ``l``, P @ V, then the running
+        output ``alpha·o + pv``, ``o`` the sweep's output (``_finish``).
+        ``b`` holds the buffers (``_alloc``)."""
+        q, k, mask, v = tiles
         voyager.insert(torch.matmul(q, k) * self.scale + mask, res.s)
+        row_tmp, alpha = b.row_tmp, b.alpha
         self._softmax(
-            res.s, res.p, res.m_prev, l_slot, row_tmp, alpha, None, None
+            res.s, res.p, m, res.m, l, row_tmp, alpha, None, None, False
         )
-        self._wait_landed([(res.v_counter, landed)])
-        voyager.insert(torch.matmul(res.p, get_slot(res.v_slots, slot)), res.pv)
+        voyager.insert(torch.matmul(res.p, v), res.pv)
         pv = self._cols(res.pv, self.d) if self.d_pad != self.d else res.pv
-        voyager.insert(alpha * o + pv, o)
+        voyager.insert(alpha * o + pv, self._o(b))
 
     def _fold_mask(self, mask):
         return fold_mask_tensor(
@@ -899,8 +956,6 @@ class _FA3Pipeline(torch.nn.Module):
             g_head=self.g_head,
             mask_fold_shape=self.mask_fold_shape,
         )
-
-    # --------------------------------------------------------------------
 
     def forward(self, *operands):
         index = self.operand_index
@@ -969,21 +1024,19 @@ class _FA3Pipeline(torch.nn.Module):
                     k_scale,
                     b.k_scale_slots,
                     slot,
-                    b.k_scale_counter,
                     coords,
                     (tkv, d_blocks),
                     True,
                     rows=d_blocks if blocks_padded else None,
                 )
             if self.has_mask and not self.mask_once:
-                self._load_mask(mask, b.m_slots, slot, b.m_counter, coords)
+                self._load_mask(mask, b.m_slots, slot, coords)
 
         def load_v(slot, coords):
             self._load_step(
                 v,
                 b.v_slots,
                 slot,
-                b.v_counter,
                 coords,
                 (tkv, d_pad),
                 False,
@@ -994,21 +1047,16 @@ class _FA3Pipeline(torch.nn.Module):
                     v_scale,
                     b.v_scale_slots,
                     slot,
-                    b.v_scale_counter,
                     coords,
                     (tkv // bs, d_pad),
                     False,
                     pad=padded,
                 )
 
-        # The tiles each product reads at the given slots, and the copies
-        # of their streams that have to have landed: K's (and the mask's)
-        # block of step ``t`` is copy ``t + 1``, Q's tile of sweep ``s`` is
-        # copy ``s + 1``, V's block of step ``t`` is copy ``t + 1``.
-        def qk_operands(q_slot, k_slot, k_landed, q_landed):
+        # The tiles each product reads at the given slots.
+        def qk_operands(q_slot, k_slot):
             q_tile = get_slot(b.q_slots, q_slot)
             k_tile = get_slot(b.k_slots, k_slot)
-            waits = [(b.k_counter, k_landed), (b.q_counter, q_landed)]
             if mx:
                 tiles = [
                     q_tile,
@@ -1017,24 +1065,18 @@ class _FA3Pipeline(torch.nn.Module):
                     get_slot(b.k_scale_slots, k_slot),
                     *codes,
                 ]
-                waits += [
-                    (b.k_scale_counter, k_landed),
-                    (b.q_scale_counter, q_landed),
-                ]
             else:
                 tiles = [q_tile, k_tile]
             if self.has_mask:
                 m_slot = 0 if self.mask_once else k_slot
                 tiles.append(get_slot(b.m_slots, m_slot))
-                waits.append((b.m_counter, 1 if self.mask_once else k_landed))
             if self.mask_scaled:
                 tiles.append(self.mask_scale)
-            return tiles, waits
+            return tiles
 
-        def pv_operands(p_slot, v_slot, v_landed):
+        def pv_operands(p_slot, v_slot):
             p_tile = get_slot(b.p_buf, p_slot)
             v_tile = get_slot(b.v_slots, v_slot)
-            waits = [(b.v_counter, v_landed)]
             if mx:
                 tiles = [
                     p_tile,
@@ -1043,10 +1085,9 @@ class _FA3Pipeline(torch.nn.Module):
                     get_slot(b.v_scale_slots, v_slot),
                     *codes,
                 ]
-                waits.append((b.v_scale_counter, v_landed))
             else:
                 tiles = [p_tile, v_tile]
-            return tiles, waits
+            return tiles
 
         # ---- prologue: prime the DMA and run step 0's [A] + [D] --------
         # The walk's first two steps: the second is sweep 0's next block,
@@ -1056,19 +1097,24 @@ class _FA3Pipeline(torch.nn.Module):
         sweep1 = int(self._kv_last(0) == 0)
         c1 = (*_unravel(sweep1, basis), 1 - sweep1)
         # The row-padded Kᵀ tiles' pad rows, zeroed once before any load
-        # lands in the slots (module docstring).
-        row_padded = [b.k_slots] if padded else []
+        # lands in the slots (module docstring), by a copy of a zero tile.
+        row_padded = [(b.k_slots, "key_pad_rows")] if padded else []
         if blocks_padded:
-            row_padded.append(b.k_scale_slots)
+            row_padded.append((b.k_scale_slots, "key_scale_pad_rows"))
         if padded and res is not None:
-            row_padded.append(res.k_slots)
-        for slots in row_padded:
+            row_padded.append((res.k_slots, "residual_key_pad_rows"))
+        for slots, name in row_padded:
+            zeros = getattr(self, name)
             for slot in range(2):
-                tile = get_slot(slots, slot)
-                voyager.insert(torch.zeros_like(tile), tile)
+                voyager.async_copy(
+                    zeros,
+                    get_slot(slots, slot),
+                    [0] * zeros.dim(),
+                    list(zeros.shape),
+                )
         self._load_q(b, 0, c0)
         if self.mask_once:
-            self._load_mask(mask, b.m_slots, 0, b.m_counter, c0)
+            self._load_mask(mask, b.m_slots, 0, c0)
         load_k(0, c0)
         if num_steps > 1:
             load_k(1, c1)
@@ -1083,11 +1129,12 @@ class _FA3Pipeline(torch.nn.Module):
         # consumes no V.
         load_v(1 % 2, c0)
 
-        self._reset(b.m, get_slot(b.l, 0))
-        voyager.insert(torch.zeros_like(b.o), b.o)
-        tiles, waits = qk_operands(0, 0, 1, 1)
-        self._matmul_qk(b, tiles, 0, waits, self._crosses(c0))
-        self._softmax_step(b, 0, 0, probs)
+        if self.zeroes_state:
+            self._reset(b, 0)
+            o = self._o(b)
+            voyager.insert(torch.zeros_like(o), o)
+        self._matmul_qk(b, qk_operands(0, 0), 0, self._crosses(c0))
+        self._softmax_step(b, 0, 0, probs, None)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
         # Carried beside the step: the (sweep, kv) pair it runs, which the
@@ -1150,10 +1197,8 @@ class _FA3Pipeline(torch.nn.Module):
             # flight.  The sweep's parity picks its Q slot and its ``l``.
             def qk(masked):
                 def run():
-                    tiles, waits = qk_operands(
-                        sweep_slot, cur_slot, step + 1, sweep + 1
-                    )
-                    self._matmul_qk(b, tiles, cur_slot, waits, masked)
+                    tiles = qk_operands(sweep_slot, cur_slot)
+                    self._matmul_qk(b, tiles, cur_slot, masked)
                     return 1
 
                 return run
@@ -1164,104 +1209,135 @@ class _FA3Pipeline(torch.nn.Module):
                 qk(True)()
 
             # [B] the lagged P@V on the matrix unit: previous step's
-            # probabilities × its V block (in this step's V read slot, the
-            # stream's copy ``step``) into pv_buf.
+            # probabilities × its V block (in this step's V read slot) into
+            # pv_buf.
             prev_slot = (step - 1) % 2
             torch._check(prev_slot < 2)
-            tiles, waits = pv_operands(prev_slot, cur_slot, step)
-            self._matmul_pv(b, tiles, waits, prev_slot)
+            tiles = pv_operands(prev_slot, cur_slot)
+            self._matmul_pv(b, tiles, prev_slot)
 
-            # [C] Q-tile boundary, first half: fresh m and l for the new
-            # tile.  The tile that just ended keeps its sum in the other l
-            # slot for the finalize, which waits until after [D].
+            # [C] Q-tile boundary, first half, under ``zeroes_state``: fresh
+            # state for the new tile.  The tile that just ended keeps its
+            # sum in the other l slot for the finalize, which waits until
+            # after [D].
             def reset():
-                if res is not None:
-                    self._residual_snapshot(res, b.m)
-                self._reset(b.m, get_slot(b.l, sweep_slot))
+                self._reset(b, sweep_slot)
                 return 1
 
-            torch.cond(kv == 0, reset, lambda: 0)
+            if self.zeroes_state:
+                torch.cond(kv == 0, reset, lambda: 0)
 
             # [D] softmax of the current block on the vector unit — runs
             # (synchronously) while the matrix [B] matmul is still in flight.
-            self._softmax_step(b, cur_slot, sweep_slot, probs)
+            self._softmax_step(b, cur_slot, sweep_slot, probs, kv)
 
             # [E] Q-tile boundary, second half: land the previous tile's last
             # P@V into o, finalize (o / its l) to ITS rows, zero o for the
-            # new tile.
+            # new tile under ``zeroes_state``.
             prev_sweep_slot = (sweep + 1) % 2
             torch._check(prev_sweep_slot < 2)
 
-            def finish():
-                self._finish_tile(
-                    b, res, sweep, prev_sweep_slot, prev_slot, prev
-                )
-                return 1
+            def finish(single):
+                def run():
+                    self._finish(
+                        b,
+                        res,
+                        get_slot(b.l, prev_sweep_slot),
+                        get_slot(b.m, cur_slot),
+                        (
+                            self._residual_tiles(res, prev_sweep_slot)
+                            if res is not None
+                            else None
+                        ),
+                        prev_slot,
+                        1 if single else 0,
+                        not single,
+                    )
+                    self._store_out(get_slot(b.out_slots, 0), b.out, prev)
+                    if self.zeroes_state:
+                        o = self._o(b)
+                        voyager.insert(torch.zeros_like(o), o)
+                    return 1
 
-            torch.cond(kv == 0, finish, lambda: 0)
+                return run
+
+            # Whether the tile that ended had one block, which decides
+            # where its output is (``_finish``).  A SymBool predicate
+            # cannot be captured into an outer cond, so a runtime one
+            # splits the boundary into two flat conds.
+            boundary = kv == 0
+            prev_last = 1 if self.zeroes_state else self._kv_last(prev[self.gq])
+            if self.causal and not self.zeroes_state:
+                single = boundary & (prev_last == 0)
+                torch.cond(single, finish(True), lambda: 0)
+                torch.cond(boundary & (prev_last > 0), finish(False), lambda: 0)
+            else:
+                torch.cond(boundary, finish(prev_last == 0), lambda: 0)
 
             # [F] deferred rescale fused with the P@V accumulate: o = alpha·(o
-            # + pv), after the softmax (kv >= 1 only).
+            # + pv), after the softmax (kv >= 1 only); at kv == 1 the tile's
+            # first P@V, o = alpha·pv, unless under ``zeroes_state``.
             def rescale():
                 self._accumulate_pv(b, prev_slot)
                 return 1
 
-            torch.cond(kv > 0, rescale, lambda: 0)
+            def start():
+                self._start_pv(b)
+                return 1
+
+            if self.zeroes_state:
+                torch.cond(kv > 0, rescale, lambda: 0)
+            else:
+                torch.cond(kv == 1, start, lambda: 0)
+                torch.cond(kv > 1, rescale, lambda: 0)
             return (step + 1, nxt_sweep, nxt_kv)
 
-        while_loop(cond_fn, body_fn, (1, sweep1, 1 - sweep1))
+        steps, sweep, kv = while_loop(cond_fn, body_fn, (1, sweep1, 1 - sweep1))
 
         # ---- epilogue: the final tile's leftover P@V + finalize --------
-        c_last = _unravel(sweeps - 1, basis)
-        c_last = (*c_last, self._kv_last(c_last[self.gq]))
-        v_slot = num_steps % 2
-        pv_slot = (num_steps - 1) % 2
+        # It reads only what the loop returns, so it is right for however
+        # many steps ran (a ``MAX_TILES`` cut): the last step ran in the
+        # sweep the loop left, or in the one before when it ended a sweep
+        # (``kv`` back at 0; ``kv <= N``, so the floor is 1 iff ``kv > 0``).
+        last_sweep = sweep - 1 + (kv + self.N - 1) // self.N
+        c_last = (*voyager.delinearize_index(last_sweep, basis), 0)
+        v_slot = steps % 2
+        pv_slot = (steps - 1) % 2
+        last_sweep_slot = last_sweep % 2
+        torch._check(v_slot < 2)
+        torch._check(pv_slot < 2)
+        torch._check(last_sweep_slot < 2)
         # [B] the final block's P@V on the matrix unit, landed into o.
-        tiles, waits = pv_operands(pv_slot, v_slot, num_steps)
-        self._matmul_pv(b, tiles, waits, pv_slot)
-        self._land_pv(b, pv_slot)
-        last_sweep_slot = (sweeps - 1) % 2
-        if res is not None:
-            self._residual_snapshot(res, b.m)
-            self._residual_step(
-                res,
-                last_sweep_slot,
-                get_slot(b.l, last_sweep_slot),
-                b.o,
-                b.row_tmp,
-                b.alpha,
-                sweeps,
-            )
-        # The previous boundary's store leaves the slot, then the final
-        # tile goes out and the kernel ends with every stream landed.
-        voyager.async_wait(b.out_counter, sweeps - 1)
-        self._finalize(b, get_slot(b.l, last_sweep_slot))
-        self._store_out(get_slot(b.out_slots, 0), b.out, b.out_counter, c_last)
-        streams = [
-            (b.q_counter, sweeps),
-            (b.k_counter, num_steps),
-            (b.v_counter, num_steps),
-            (b.out_counter, sweeps),
-        ]
-        if mx:
-            streams += [
-                (b.q_scale_counter, sweeps),
-                (b.k_scale_counter, num_steps),
-                (b.v_scale_counter, num_steps),
-            ]
-        if self.has_mask:
-            streams.append((b.m_counter, 1 if self.mask_once else num_steps))
-        if res is not None:
-            streams += [
-                (c, sweeps)
-                for c in (
-                    res.q_counter,
-                    res.k_counter,
-                    res.v_counter,
-                    res.m_counter,
-                )
-            ]
-        self._wait_landed(streams)
+        self._matmul_pv(b, pv_operands(pv_slot, v_slot), pv_slot)
+        # The output is in ``o`` after the land, or in P@V's result when
+        # the tile had one block: its last step's block, ``kv - 1`` or the
+        # tile's last block when the step ended its sweep, is then 0.  The
+        # slot is picked by arithmetic, as no cond can take the loop's
+        # results; a land on a tile of one block computes from a stale
+        # ``o`` and is not read.
+        src = 0
+        if not self.zeroes_state:
+            tile_last = self._kv_last(c_last[self.gq])
+            ended = 1 - (kv + self.N - 1) // self.N
+            last_kv = kv - 1 + ended * (tile_last + 1)
+            src = 1 - (last_kv + self.N - 1) // self.N
+            torch._check(src < 2)
+        self._finish(
+            b,
+            res,
+            get_slot(b.l, last_sweep_slot),
+            get_slot(b.m, v_slot),
+            (
+                self._residual_tiles(res, last_sweep_slot)
+                if res is not None
+                else None
+            ),
+            pv_slot,
+            src,
+            True,
+        )
+        # Then the final tile goes out.
+        self._store_out(get_slot(b.out_slots, 0), b.out, c_last)
         out = b.out
         if self.g_head > 1:
             out = out.reshape(self.out_unfold_shape)
@@ -1498,6 +1574,7 @@ def build_attention_fa3(
     # ``all_input_nodes`` is the order ``forward`` takes its operands
     # (``_operand_index``).
     inputs = tuple(n.value.clone() for n in node.all_input_nodes)
+    pattern.register_pad_rows(inputs)
     with _lenient_verifier():
         gm = export_model(pattern, inputs)
     gm = _finalize_exported_gm(gm)

@@ -1,27 +1,32 @@
-"""The sync pass: every dispatch a ``commit``, every dependency a hardware
-counter wait.
+"""The sync pass: every dispatch a ``commit``, every dependency a counter
+wait.
 
 Runs after memory planning, on each layer the builders emitted -- its tile
-loop(s) with their prologue and epilogue -- and leaves the graph the
-program the hardware runs: each compute op wrapped in a ``commit`` whose
-waits, grouped by unit, the pass derived, and whose last pass adds 1 to
-that unit's counter; a CPU ``async_wait`` before every copy or scalar read
-that depends on a dispatch; the unit counters waited at their totals when
-the layer ends.
+loop(s) with their prologue and epilogue, every op inline and every copy
+bare -- and leaves the graph the program the hardware runs: each compute op
+wrapped in a ``commit`` whose waits, grouped by unit, the pass derived, and
+whose last pass adds 1 to that unit's counter; each copy adding 1 to its
+stream's counter; a CPU ``async_wait`` before every copy, scalar read or
+host op that depends on a dispatch or a copy; every counter waited at its
+total when the layer ends.
 
-The pass identifies each wait's producer; the counts come from the
-program itself.  Per unit it keeps the number of posts issued so far, and
-per buffer slot and unit the count at which the last dispatch touching it
-(reading or writing) and the last one writing it posted: scalars the CPU
-updates beside each dispatch, carried through the loops and out of the
-conds like the builders' own cursors.  A consumer waits ``counter >=``
-the saved count of its producer: the other unit's last writer of what it
-reads and last toucher of what it overwrites, and its own unit's last
-writer of either (a pipelined unit starts a pass before the previous one
-has finished writing).  The builders' CPU waits on stream counters move
-into the commits they guard.  An SpMM dispatch fetches before it starts,
-so it takes CPU waits before its dispatch and posts nothing; whatever
-depends on it drains.
+A producer is a dispatch, posting on the counter of its last pass's unit,
+or a copy, posting on its stream's: the loads into one on-chip buffer, or
+the stores out of one.  Posts on one counter complete in issue order.  The
+pass identifies each wait's producer; the counts come from the program
+itself.  Per counter it keeps the number of posts issued so far, and per
+buffer slot and producer (a unit or a stream) the count at which the last
+one touching it (reading or writing) and the last one writing it posted:
+scalars the CPU updates beside each dispatch and copy, carried through the
+loops and out of the conds.  Every access, by a dispatch or a copy, waits
+``counter >=`` the saved count of every producer it depends on: the last
+writer of what it reads and the last toucher of what it overwrites, on
+every unit, its own included (passes of one unit may overlap), and on every
+stream but its own.  A dispatch takes them as hardware waits in its commit
+(an SpMM dispatch's matrix-class waits gate the systolic array and the SpMM
+unit alike); a copy, a scalar read and a host op as CPU waits right before
+it.  A wait the CPU has already made where the consumer runs is not made
+again.
 """
 
 import logging
@@ -63,8 +68,8 @@ COND = torch.ops.higher_order.cond
 WITH_SCRATCH = torch.ops.higher_order.with_scratch
 _ASYNC_COPY = voyager.async_copy.default
 _ASYNC_WAIT = voyager.async_wait.default
-_DRAIN = voyager.drain.default
 _INSERT = voyager.insert.default
+_ALLOC = voyager.alloc.default
 _SUBVIEW = voyager.subview.default
 _SCALAR_READ = torch.ops.aten._local_scalar_dense.default
 _SPMM = torch.ops.quantized_ops.spmm_csr.default
@@ -75,10 +80,11 @@ MATRIX, VECTOR = UNITS
 _COUNTER_NAMES = {MATRIX: "mu", VECTOR: "vu"}
 # Waits one unit's pass can queue.
 _WAITS_PER_UNIT = 16
-# The state keys: a unit's post count, and per buffer slot, pass unit and
-# posting counter the count at which the last dispatch reading-or-writing
-# the slot on that unit, and the last writing it, posted on that counter (a
-# dispatch's completion is seen only on the counter it posts).
+# The state keys: a counter's post count, and per buffer slot, accessor (a
+# pass unit or a stream) and posting counter the count at which the last
+# access reading-or-writing the slot, and the last writing it, posted on
+# that counter (a dispatch's completion is seen only on the counter it
+# posts).
 _POSTS, _TOUCH, _WRITE = "posts", "touch", "write"
 
 
@@ -101,26 +107,25 @@ class _Region:
 
 @dataclass
 class _Pass:
-    """One pass of a dispatch: its unit, and the on-chip buffers it reads
-    and writes, in operand order, each with the slot it accesses (an int, a
-    ``(node, region)`` or ``None`` for every slot)."""
+    """One pass of a dispatch: its unit (for a copy, its stream), and the
+    on-chip buffers it reads and writes, in operand order, each with the
+    slot it accesses (an int, a ``(node, region)`` or ``None`` for every
+    slot)."""
 
-    unit: str
+    unit: object
     reads: List[tuple] = field(default_factory=list)
     writes: List[tuple] = field(default_factory=list)
 
     def buffers(self, accesses):
         return [b for b, _ in accesses]
 
-    def touches(self, buffer) -> bool:
-        return buffer in self.buffers(self.reads + self.writes)
-
 
 @dataclass
 class _Dispatch:
     """A dispatchable op: the node, the region it runs in (``None``: the
-    layer's graph), the ``insert``s of its results, its passes, and the unit
-    of its last pass, which posts."""
+    layer's graph), the ``insert``s of its results, its passes, the unit of
+    its last pass, which posts, and whether its matrix-class pass runs on
+    the SpMM unit."""
 
     node: Node
     region: Optional[_Region]
@@ -130,18 +135,25 @@ class _Dispatch:
     spmm: bool = False
 
 
+@dataclass(frozen=True)
+class _Stream:
+    """A copy stream, one counter: the loads into on-chip ``buffer``
+    (``load``), or the stores out of it."""
+
+    buffer: Node
+    load: bool
+
+
 @dataclass
 class _Copy:
     """A ``voyager.async_copy``: its node and region (``None`` outside every
-    loop), the on-chip buffer it fills or drains with the slot, the counter
-    it adds to, and whether it is a load."""
+    loop), its stream, and its on-chip accesses as the one pass of a
+    producer whose unit is the stream."""
 
     node: Node
     region: Optional[_Region]
-    buffer: Node
-    slot: object
-    counter: Node
-    load: bool
+    stream: _Stream
+    access: _Pass
 
 
 class _Names:
@@ -180,8 +192,10 @@ def synchronize(model: GraphModule) -> int:
     Raises:
         SyncError: A layer whose dispatches the pass cannot read (a result
             leaving one other than through a store, a wait on a unit a
-            dispatch has no pass on, more waits than a unit queues), or more
-            counters live at once than ``plan_counters`` has ids.
+            dispatch has no pass on, more waits than a unit queues), a
+            builder's synchronization (a wait, a copy's counter), a copy in
+            no layer, or more counters live at once than ``plan_counters``
+            has ids.
     """
     names = _Names(model)
     order = {}
@@ -200,18 +214,29 @@ def synchronize(model: GraphModule) -> int:
     layers = 0
     for gm in graphs:
         for name, nodes in _layers(gm):
-            # A layer with neither a loop nor a dispatch of its own -- a
-            # host op, or a cond whose branches hold layers of their own
-            # (walked as graphs above) -- has nothing to synchronize.
+            # A layer with no loop, dispatch or copy of its own -- a host
+            # op, or a cond whose branches hold layers of their own (walked
+            # as graphs above) -- has nothing to synchronize.
             if not any(
                 n.op == "call_function"
-                and n.target is WHILE_LOOP
+                and n.target in (WHILE_LOOP, _ASYNC_COPY)
                 or _is_dispatch(n)
                 for n in nodes
             ):
                 continue
             _Layer(gm, nodes, name, names, order).synchronize()
             layers += 1
+    bare = [
+        n.name
+        for sub in model.modules()
+        if isinstance(sub, GraphModule)
+        for n in sub.graph.nodes
+        if n.op == "call_function"
+        and n.target is _ASYNC_COPY
+        and _counter_arg(n) is None
+    ]
+    if bare:
+        raise SyncError(f"copies in no layer, with no counter: {bare}")
     counters = plan_counters(model)
     # The program size: the dispatches the program issues, each a commit
     # in the IR (the emitter enforces the chip's program region).
@@ -250,6 +275,13 @@ def _layers(gm: GraphModule):
 
 def _placeholders(gm: GraphModule) -> List[Node]:
     return [n for n in gm.graph.nodes if n.op == "placeholder"]
+
+
+def _counter_arg(copy: Node):
+    """The counter operand of an ``async_copy`` (``None``: none yet)."""
+    if len(copy.args) > 4:
+        return copy.args[4]
+    return copy.kwargs.get("counter")
 
 
 def _is_host_op(node: Node) -> bool:
@@ -297,28 +329,17 @@ def _is_matrix_op(node: Node) -> bool:
     return is_gemm_op(node) and not runs_on_vector_unit(node)
 
 
-def _is_scalar_node(node: Node) -> bool:
-    """A node a wait may sit after without separating it from the op it
-    guards: addressing and index arithmetic."""
-    if node.op != "call_function":
-        return False
-    if node.target in (_SUBVIEW, operator.getitem) or is_nop(node):
-        return True
-    return not isinstance(getattr(node, "value", None), torch.Tensor) and (
-        node.meta.get("val") is None
-        or not isinstance(node.meta.get("val"), torch.Tensor)
-    )
-
-
 class _Scalars:
     """Scalar expressions in one graph, folded when constant and shared
-    when repeated, each new node inserted before ``anchor``."""
+    when repeated, each new node inserted before ``anchor``.  ``memo`` is
+    the graph's: the pass walks a graph in program order, so a node made
+    before an earlier anchor is defined at every later one."""
 
-    def __init__(self, names: _Names, graph: Graph, anchor: Node):
+    def __init__(self, names: _Names, graph: Graph, anchor: Node, memo):
         self.names = names
         self.graph = graph
         self.anchor = anchor
-        self.memo = {}
+        self.memo = memo
 
     def _op(self, target, a, b, prefix):
         if isinstance(a, int) and isinstance(b, int):
@@ -361,9 +382,9 @@ class _Scalars:
 
 class _Layer:
     """One layer and the pass's rewrite of it (module docstring): how its
-    graphs are read (buffers, slots, dispatches and their passes, copies,
-    the builders' waits) and rewritten (values threaded into regions, unit
-    counters, carried counts, commits, waits)."""
+    graphs are read (buffers, slots, dispatches and their passes, copies and
+    their streams) and rewritten (values threaded into regions, counters,
+    carried counts, commits, waits)."""
 
     def __init__(self, gm, nodes, name, names, order):
         self.gm = gm
@@ -374,7 +395,16 @@ class _Layer:
         self.touched = set()
         self.regions: Dict[GraphModule, _Region] = {}
         self.threaded = {}
-        self.unit_counters: Dict[str, Node] = {}
+        # The counter of each unit and stream, in allocation order.
+        self.counters: Dict[object, Node] = {}
+        # Each on-chip buffer's streams.
+        self.streams: Dict[Node, List[_Stream]] = {}
+        # Per graph the CPU waits made in it, as resolved ``(counter,
+        # threshold)``: they hold for whatever runs after them there, and
+        # in the regions nested there.
+        self.cpu_waits: Dict[GraphModule, set] = {}
+        # Per graph the scalar expressions the pass made in it (``_Scalars``).
+        self.memos: Dict[Graph, dict] = {}
         # What marks a node as the layer's: its scope, and the build the
         # layer came from (``print_layer_table`` groups layers by it).
         self.tags = {
@@ -385,19 +415,17 @@ class _Layer:
         self.scope = self.tags.get("scope")
         self.sites: Dict[Node, _Dispatch] = {}
         self.copies: Dict[Node, _Copy] = {}
-        # The builders' CPU waits, each with the region it stands in.
-        self.builder_waits: List[tuple] = []
-        self.spmm_buffers = set()
         self.slots: Dict[Node, int] = {}
         self.modified: Dict[Node, set] = {}
         self.modified[None] = self._explore(nodes, None)
+        accessors = [d.passes for d in self.sites.values()]
+        accessors += [[c.access] for c in self.copies.values()]
         self.written = {
             b
-            for d in self.sites.values()
-            for p in d.passes
+            for passes in accessors
+            for p in passes
             for b in p.buffers(p.writes)
         }
-        self.guards = self._guards()
 
     # --- reading ---------------------------------------------------------
 
@@ -542,7 +570,8 @@ class _Layer:
     def _dispatch(self, node, region) -> _Dispatch:
         """``node`` as a dispatch: its stores, and its passes -- a matrix op
         is a matrix-class pass reading its own operands, every other op a
-        vector pass, the results written by the pass of the last op."""
+        vector pass, the results written by the pass of the last op, or by
+        the vector pass after an SpMM (the vector unit stores its output)."""
         d = _Dispatch(node, region, self._inserts(node))
         if node.op == "call_module":
             sub = region.gm.get_submodule(node.target) if region else None
@@ -555,7 +584,11 @@ class _Layer:
         else:
             ops = [(node, list(node.all_input_nodes))]
         matrix = next((op for op, _ in ops if _is_matrix_op(op)), None)
-        d.spmm = matrix is not None and matrix.target is _SPMM
+        # An SpMM dispatch is an spmm_csr, or a GEMM that fuses one (its CSR
+        # operands, the emitter's has_fused_spmm): both run on the SpMM unit.
+        d.spmm = matrix is not None and (
+            matrix.target is _SPMM or matrix.kwargs.get("A_data") is not None
+        )
         tail = matrix is not None and any(
             op is not matrix and self.order[op] > self.order[matrix]
             for op, _ in ops
@@ -571,7 +604,8 @@ class _Layer:
 
         for op, operands in ops:
             read(MATRIX if op is matrix else VECTOR, operands)
-        writer = MATRIX if matrix is not None and not tail else VECTOR
+        direct = matrix is not None and not tail and not d.spmm
+        writer = MATRIX if direct else VECTOR
         p = passes.setdefault(writer, _Pass(writer))
         if node.target is WITH_SCRATCH:
             # The op's regions are its own, read and written by its unit.
@@ -592,20 +626,31 @@ class _Layer:
         return d
 
     def _copy(self, node, region) -> _Copy:
-        """Classify a copy by the on-chip buffer it fills or drains."""
+        """A copy and its stream: the loads into the on-chip buffer it
+        fills, else the stores out of the one it drains.
+
+        Raises:
+            SyncError: The copy already has a counter, or moves between two
+                off-chip buffers.
+        """
+        if _counter_arg(node) is not None:
+            raise SyncError(
+                f"{self.name}: {node.name} has a counter; the builders "
+                f"issue copies bare"
+            )
         src = self._access(node.args[0], region)
         dst = self._access(node.args[1], region)
-        if dst is not None:
-            (buffer, slot), load = dst, True
-        elif src is not None:
-            (buffer, slot), load = src, False
-        else:
+        if dst is None and src is None:
             raise SyncError(
                 f"{self.name}: {node.name} copies between two off-chip "
                 f"buffers"
             )
-        counter = self._buffer(node.args[4], region)
-        return _Copy(node, region, buffer, slot, counter, load)
+        stream = _Stream(dst[0], True) if dst else _Stream(src[0], False)
+        streams = self.streams.setdefault(stream.buffer, [])
+        if stream not in streams:
+            streams.append(stream)
+        access = _Pass(stream, [src] if src else [], [dst] if dst else [])
+        return _Copy(node, region, stream, access)
 
     # --- rewriting -------------------------------------------------------
 
@@ -649,16 +694,20 @@ class _Layer:
                 result = ph
         return result
 
-    def _unit_counter(self, unit) -> Node:
-        """The layer's counter for ``unit``, allocated at the register level
-        before its first node on first use."""
-        if unit not in self.unit_counters:
+    def _counter(self, agent) -> Node:
+        """The layer's counter for ``agent``, a unit or a stream, allocated
+        at the register level before the layer's first node on first use."""
+        if agent not in self.counters:
+            if isinstance(agent, _Stream):
+                prefix = "ld" if agent.load else "st"
+            else:
+                prefix = _COUNTER_NAMES[agent]
             graph = self.gm.graph
             with graph.inserting_before(self.nodes[0]):
                 counter = graph.call_function(
-                    voyager.alloc.default,
+                    _ALLOC,
                     ([], torch.int64, _REGISTER),
-                    name=self.names(_COUNTER_NAMES[unit]),
+                    name=self.names(prefix),
                 )
                 counter.meta["space"] = "Register"
                 counter.meta.update(self.tags)
@@ -669,8 +718,8 @@ class _Layer:
                     name=self.names("zeros"),
                 )
                 reset.meta.update(self.tags)
-            self.unit_counters[unit] = counter
-        return self.unit_counters[unit]
+            self.counters[agent] = counter
+        return self.counters[agent]
 
     def _wrap(self, d: _Dispatch, waits, post) -> None:
         """Replace ``d``'s op and its stores with one ``commit`` over a
@@ -745,34 +794,61 @@ class _Layer:
             graph.erase_node(n)
         self.touched.add(owner)
 
-    def _wait(self, graph, anchor, counter, threshold) -> Node:
-        """A CPU ``async_wait(counter, threshold)`` before ``anchor``."""
+    def _origin(self, value, region):
+        """``value`` of ``region`` as the value it is bound to outside every
+        region it was threaded into."""
+        return self._resolve(value, region)[0]
+
+    def _cpu_waited(self, counter, threshold, region) -> bool:
+        """Whether the CPU has already waited ``counter >= threshold`` where
+        a node of ``region`` runs: earlier in its graph or in a graph
+        enclosing it."""
+        key = (self._origin(counter, region), self._origin(threshold, region))
+        while True:
+            gm = region.gm if region is not None else self.gm
+            if key in self.cpu_waits.get(gm, ()):
+                return True
+            if region is None:
+                return False
+            region = region.parent
+
+    def _wait(self, anchor, counter, threshold, region) -> None:
+        """A CPU ``async_wait(counter, threshold)`` before ``anchor`` of
+        ``region``, unless the CPU has waited it there already."""
+        if self._cpu_waited(counter, threshold, region):
+            return
+        graph = self._graph(region)
         with graph.inserting_before(anchor):
             wait = graph.call_function(
                 _ASYNC_WAIT, (counter, threshold), name=self.names("async_wait")
             )
         wait.meta.update(self.tags)
-        return wait
-
-    def _drain(self, graph, anchor) -> Node:
-        """A CPU ``drain()`` before ``anchor``."""
-        with graph.inserting_before(anchor):
-            drain = graph.call_function(_DRAIN, (), name=self.names("drain"))
-        drain.meta.update(self.tags)
-        return drain
+        key = (self._origin(counter, region), self._origin(threshold, region))
+        gm = region.gm if region is not None else self.gm
+        self.cpu_waits.setdefault(gm, set()).add(key)
 
     def _close(self, totals) -> None:
-        """The layer ends quiescent: every unit counter waited at its total
-        after the layer's last node."""
+        """The layer ends quiescent: every counter waited at its total after
+        the layer's last node and the counts read off its loops and conds
+        there, the streams' first."""
         anchor = self.nodes[-1]
-        for unit in UNITS:
-            total = totals.get(unit, 0)
+        members = set(self.nodes)
+        while (
+            anchor.next.op == "call_function"
+            and anchor.next.target is operator.getitem
+            and anchor.next.args[0] in members
+        ):
+            anchor = anchor.next
+        agents = [a for a in self.counters if isinstance(a, _Stream)]
+        agents += [a for a in self.counters if not isinstance(a, _Stream)]
+        for agent in agents:
+            total = totals.get(agent, 0)
             if total == 0:
                 continue
             with self.gm.graph.inserting_after(anchor):
                 anchor = self.gm.graph.call_function(
                     _ASYNC_WAIT,
-                    (self._unit_counter(unit), total),
+                    (self.counters[agent], total),
                     name=self.names("async_wait"),
                 )
             anchor.meta.update(self.tags)
@@ -797,22 +873,20 @@ class _Layer:
                     f"the {unit} unit, more than {_WAITS_PER_UNIT}"
                 )
 
-    # --- the counts each dispatch updates -------------------------------
+    # --- the counts each producer updates -------------------------------
 
-    def _keys(self, d: _Dispatch) -> set:
-        """The state keys ``d`` updates."""
-        keys = set()
-        if d.spmm:
-            return keys
-        keys.add((_POSTS, d.post_unit))
-        for p in d.passes:
+    def _keys(self, passes, post) -> set:
+        """The state keys a producer of ``passes`` posting on ``post``'s
+        counter updates."""
+        keys = {(_POSTS, post)}
+        for p in passes:
             for kind, accesses in (
                 (_TOUCH, p.reads + p.writes),
                 (_WRITE, p.writes),
             ):
                 for buffer, slot in accesses:
                     for j in self._slot_range(buffer, slot):
-                        keys.add((kind, p.unit, buffer, j, d.post_unit))
+                        keys.add((kind, p.unit, buffer, j, post))
         return keys
 
     def _slot_range(self, buffer, slot):
@@ -825,7 +899,8 @@ class _Layer:
     def _explore(self, nodes, region) -> set:
         """Find every dispatch, copy and loop under ``nodes`` of ``region``
         (``None``: the layer's graph), freshening the regions on the way;
-        return the state keys the dispatches among them update."""
+        return the state keys the dispatches and copies among them
+        update."""
         keys = set()
         owner = region.gm if region is not None else self.gm
         for node in list(nodes):
@@ -860,59 +935,19 @@ class _Layer:
                 self.modified[node] = inner
                 keys |= inner
             elif node.target is _ASYNC_COPY:
-                self.copies[node] = self._copy(node, region)
+                c = self._copy(node, region)
+                self.copies[node] = c
+                keys |= self._keys([c.access], c.stream)
             elif node.target is _ASYNC_WAIT:
-                self.builder_waits.append((node, region))
+                raise SyncError(
+                    f"{self.name}: {node.name} is a builder's wait; the "
+                    f"builders emit no synchronization"
+                )
             elif _is_dispatch(node):
                 d = self._dispatch(node, region)
                 self.sites[node] = d
-                if d.spmm:
-                    for p in d.passes:
-                        self.spmm_buffers.update(p.buffers(p.reads + p.writes))
-                keys |= self._keys(d)
+                keys |= self._keys(d.passes, d.post_unit)
         return keys
-
-    def _guards(self) -> Dict[Node, List[Node]]:
-        """The builders' stream waits each dispatch takes over, by dispatch:
-        a wait standing right before it, and a wait at the root of a loop
-        body for every later dispatch in that body (not in a loop nested in
-        it) accessing the buffer the waited counter streams.  A wait on a
-        buffer the CPU itself reads (a scalar read of it) stays the CPU's."""
-        stream = {c.counter: c.buffer for c in self.copies.values()}
-        cpu_read = set()
-        for region in [None, *self.regions.values()]:
-            graph = (region.gm if region is not None else self.gm).graph
-            for n in graph.nodes:
-                if n.op == "call_function" and n.target is _SCALAR_READ:
-                    access = self._access(n.args[0], region)
-                    if access is not None:
-                        cpu_read.add(access[0])
-        guards = {d: [] for d in self.sites}
-        for wait, region in self.builder_waits:
-            buffer = stream.get(self._buffer(wait.args[0], region))
-            if buffer is None or buffer in cpu_read:
-                continue
-            for d in self.sites.values():
-                if not any(p.touches(buffer) for p in d.passes):
-                    continue
-                if wait in self._pending_waits(d) or self._after_in_body(
-                    d, wait, region
-                ):
-                    guards[d.node].append(wait)
-        return guards
-
-    def _after_in_body(self, d: _Dispatch, wait, region) -> bool:
-        """Whether ``wait`` stands at the root of a loop body (``region``)
-        and ``d`` runs later in the same iteration: under that body, after
-        the wait, and in no loop nested in it."""
-        if region is None or region.hop.target is not WHILE_LOOP:
-            return False
-        node, inner = d.node, d.region
-        while inner is not None and inner is not region:
-            if inner.hop.target is WHILE_LOOP:
-                return False
-            node, inner = inner.hop, inner.parent
-        return inner is region and self.order[node] > self.order[wait]
 
     # --- state ---------------------------------------------------------------
 
@@ -921,16 +956,18 @@ class _Layer:
         node, home = slot
         return self._thread(node, region) if home is not region else node
 
-    def _lookup(self, s, state, kind, unit, buffer, slot, region):
-        """The saved counts ``kind`` of pass unit ``unit`` on ``buffer``'s
-        ``slot`` in ``state``, as ``[(posting unit, count)]``: one per
-        posting counter, and for a whole-buffer access one per slot too."""
+    def _lookup(self, s, state, kind, agent, buffer, slot, region):
+        """The saved counts ``kind`` of accessor ``agent`` (a pass unit or a
+        stream) on ``buffer``'s ``slot`` in ``state``, as ``[(posting
+        agent, count)]``: one per counter its producers post on (a unit's
+        dispatch on either unit's, a stream's copy on its own), and for a
+        whole-buffer access one per slot too."""
         count = self.slots.get(buffer, max(1, _slots(buffer)))
         found = []
-        for post in UNITS:
+        for post in UNITS if agent in UNITS else (agent,):
             values = [
                 self._thread(
-                    state.get((kind, unit, buffer, j, post), 0), region
+                    state.get((kind, agent, buffer, j, post), 0), region
                 )
                 for j in range(count)
             ]
@@ -948,7 +985,7 @@ class _Layer:
         return found
 
     def _record(self, s, state, kind, unit, post, buffer, slot, value, region):
-        """Set the count ``kind`` of pass unit ``unit`` on ``buffer``'s
+        """Set the count ``kind`` of accessor ``unit`` on ``buffer``'s
         ``slot``, posted on ``post``'s counter, to ``value`` in ``state``."""
         count = self.slots.get(buffer, max(1, _slots(buffer)))
         index = None
@@ -962,77 +999,84 @@ class _Layer:
                 old = self._thread(state.get(key, 0), region)
                 state[key] = s.ite(s.eq(index, j), value, old)
 
+    def _producers(self, s, state, p: _Pass, region) -> list:
+        """The ``(counter, count)`` waits the accesses of ``p`` need: on
+        every stream of each buffer but ``p``'s own, then on every unit, the
+        saved count of the last writer of what ``p`` reads and of the last
+        toucher of what it writes (RAW, WAR, WAW).  A slot ``p`` also
+        writes needs only the toucher's count: it is never below the
+        writer's."""
+        lookups = [(_WRITE, a) for a in p.reads if a not in p.writes]
+        lookups += [(_TOUCH, a) for a in p.writes]
+        lookups = [
+            (kind, access)
+            for kind, access in lookups
+            if kind == _TOUCH or access[0] in self.written
+        ]
+        found = []
+        for kind, (buffer, slot) in lookups:
+            for stream in self.streams.get(buffer, []):
+                if stream != p.unit:
+                    found += self._lookup(
+                        s, state, kind, stream, buffer, slot, region
+                    )
+        for unit in UNITS:
+            for kind, (buffer, slot) in lookups:
+                found += self._lookup(
+                    s, state, kind, unit, buffer, slot, region
+                )
+        waits = [
+            (self._thread(self._counter(post), region), value)
+            for post, value in found
+            if value != 0
+        ]
+        return self._unique(waits)
+
     def _dependencies(self, s, state, d: _Dispatch, region):
-        """``d``'s waits per unit from ``state`` (the ordinals of the other
-        unit's last toucher of what it writes and last writer of what it
-        reads, and of its own unit's last writer of either) plus whether it
-        must drain, and the builders' stream waits it takes over
-        (``_guards``), on the pass accessing the streamed buffer."""
-        stream = {c.counter: c.buffer for c in self.copies.values()}
-        guards = self.guards.get(d.node, [])
-        waits, drain = {}, False
+        """``d``'s waits per unit: each pass's ``_producers``, but those the
+        CPU has already waited where ``d`` runs."""
+        waits = {}
         for p in d.passes:
-            other = VECTOR if p.unit == MATRIX else MATRIX
-            seq = []
-            for buffer in p.buffers(p.reads + p.writes):
-                for wait in guards:
-                    home = next(r for w, r in self.builder_waits if w is wait)
-                    if stream.get(self._buffer(wait.args[0], home)) is buffer:
-                        seq.append(
-                            (
-                                self._thread(wait.args[0], region),
-                                self._thread(wait.args[1], region),
-                            )
-                        )
-            # The other unit's last writer of what the pass reads and last
-            # toucher of what it writes; this unit's last writer of either
-            # (a pipelined unit starts a pass before the previous one has
-            # finished writing).
-            # A buffer the pass also writes needs only the toucher's count:
-            # it is never below the writer's.
-            written = set(p.buffers(p.writes))
-            reads = [a for a in p.reads if a[0] not in written]
-            lookups = [(_WRITE, other, reads), (_TOUCH, other, p.writes)]
-            lookups += [(_WRITE, p.unit, p.reads + p.writes)]
-            for kind, unit, accesses in lookups:
-                for buffer, slot in accesses:
-                    if buffer in self.spmm_buffers and not d.spmm:
-                        drain = True
-                    if buffer not in self.written and kind == _WRITE:
-                        continue
-                    for post, value in self._lookup(
-                        s, state, kind, unit, buffer, slot, region
-                    ):
-                        if value == 0:
-                            continue
-                        counter = self._thread(self._unit_counter(post), region)
-                        seq.append((counter, value))
-            seq = self._unique(seq)
+            seq = [
+                (counter, value)
+                for counter, value in self._producers(s, state, p, region)
+                if not self._cpu_waited(counter, value, region)
+            ]
             if seq:
                 waits[p.unit] = seq
-        return waits, drain
+        return waits
 
-    def _pending_waits(self, d: _Dispatch) -> List[Node]:
-        """The builder's CPU waits standing right before ``d`` (only
-        addressing and index arithmetic between)."""
-        pending, node = [], d.node.prev
-        while node is not None and node.op == "call_function":
-            if node.target is _ASYNC_WAIT:
-                pending.append(node)
-            elif not _is_scalar_node(node):
-                break
-            node = node.prev
-        return pending
+    def _post(self, s, state, passes, post, region) -> None:
+        """Issue a producer of ``passes`` posting on ``post``'s counter: its
+        ordinal, the counter's count once it completes, becomes the saved
+        count of every slot it touches and writes."""
+        key = (_POSTS, post)
+        ordinal = s.add(self._thread(state.get(key, 0), region), 1)
+        state[key] = ordinal
+        for p in passes:
+            for kind, accesses in (
+                (_TOUCH, p.reads + p.writes),
+                (_WRITE, p.writes),
+            ):
+                for buffer, slot in accesses:
+                    self._record(
+                        s,
+                        state,
+                        kind,
+                        p.unit,
+                        post,
+                        buffer,
+                        slot,
+                        ordinal,
+                        region,
+                    )
 
     # --- the walk ------------------------------------------------------
 
     def synchronize(self) -> None:
         state = {}
         self._walk(self.nodes, None, state)
-        # The builders' waits now in commits leave the CPU's program.
-        for wait in {w for ws in self.guards.values() for w in ws}:
-            wait.graph.erase_node(wait)
-        self._close({u: state.get((_POSTS, u), 0) for u in UNITS})
+        self._close({a: state.get((_POSTS, a), 0) for a in self.counters})
         self._recompile()
 
     def _walk(self, nodes, region, state) -> None:
@@ -1050,128 +1094,69 @@ class _Layer:
             elif node in self.copies:
                 self._walk_copy(self.copies[node], state)
             elif node.target is _SCALAR_READ:
-                self._walk_read(node, region, state)
+                self._walk_cpu(node, region, state)
             elif _is_host_op(node):
-                self._walk_host(node, region, state)
+                self._walk_cpu(node, region, state)
 
     def _graph(self, region) -> Graph:
         return (region.gm if region is not None else self.gm).graph
 
+    def _scalars(self, region, anchor) -> _Scalars:
+        graph = self._graph(region)
+        return _Scalars(
+            self.names, graph, anchor, self.memos.setdefault(graph, {})
+        )
+
     def _walk_dispatch(self, d: _Dispatch, state) -> None:
         region = d.region
-        s = _Scalars(self.names, self._graph(region), d.node)
-        waits, drain = self._dependencies(s, state, d, region)
+        s = self._scalars(region, d.node)
+        waits = self._dependencies(s, state, d, region)
         self._check_waits(d, waits)
-        if drain:
-            self._drain(s.graph, d.node)
-        if d.spmm:
-            # SpMM fetches before it starts: its waits are the CPU's, and
-            # it posts nothing.
-            for seq in waits.values():
-                for counter, threshold in seq:
-                    self._wait(s.graph, d.node, counter, threshold)
-            self._wrap(d, {}, None)
-            return
-        post = self._thread(self._unit_counter(d.post_unit), region)
+        post = self._thread(self._counter(d.post_unit), region)
         # The ordinals the dispatch leaves behind are computed before the
         # op is wrapped: the scalars sit before the commit, as its own
         # thresholds do.
-        key = (_POSTS, d.post_unit)
-        ordinal = s.add(self._thread(state.get(key, 0), region), 1)
-        state[key] = ordinal
-        for p in d.passes:
-            for kind, accesses in (
-                (_TOUCH, p.reads + p.writes),
-                (_WRITE, p.writes),
-            ):
-                # Every count ``_keys`` declares is recorded here: a load
-                # overwriting a slot waits on its last toucher, read-only
-                # stream slots included.
-                for buffer, slot in accesses:
-                    self._record(
-                        s,
-                        state,
-                        kind,
-                        p.unit,
-                        d.post_unit,
-                        buffer,
-                        slot,
-                        ordinal,
-                        region,
-                    )
+        self._post(s, state, d.passes, d.post_unit, region)
         self._wrap(d, waits, post)
 
     def _walk_copy(self, copy: _Copy, state) -> None:
-        """A load waits for the last toucher of the slot it overwrites, a
-        store for the last writer of the tile it reads, on every unit."""
+        """A copy waits on the CPU for its producers (``_producers``), then
+        is issued on its stream's counter."""
         region = copy.region
-        if copy.load and copy.buffer not in self.written:
-            kind = _TOUCH
-        elif copy.load:
-            kind = _TOUCH
+        s = self._scalars(region, copy.node)
+        for counter, value in self._producers(s, state, copy.access, region):
+            self._wait(copy.node, counter, value, region)
+        args = list(copy.node.args) + [None] * (5 - len(copy.node.args))
+        args[4] = self._thread(self._counter(copy.stream), region)
+        copy.node.args = tuple(args)
+        copy.node.kwargs = {
+            k: v for k, v in copy.node.kwargs.items() if k != "counter"
+        }
+        self._post(s, state, [copy.access], copy.stream, region)
+        self.touched.add(copy.region.gm if copy.region else self.gm)
+
+    def _walk_cpu(self, node, region, state) -> None:
+        """A CPU op -- a scalar read, or a host op (``_is_host_op``) -- waits
+        on the CPU for the producers of the on-chip values it reads and
+        overwrites.  It posts nothing: the CPU issues what follows only once
+        it is done."""
+        if node.target is _SCALAR_READ:
+            reads, written = [node.args[0]], []
         else:
-            kind = _WRITE
-        if not copy.load and copy.buffer not in self.written:
-            return
-        s = _Scalars(self.names, self._graph(region), copy.node)
-        if copy.buffer in self.spmm_buffers:
-            self._drain(s.graph, copy.node)
-        for unit in UNITS:
-            for post, value in self._lookup(
-                s, state, kind, unit, copy.buffer, copy.slot, region
-            ):
-                if value == 0:
-                    continue
-                counter = self._thread(self._unit_counter(post), region)
-                self._wait(s.graph, copy.node, counter, value)
-
-    def _walk_host(self, node, region, state) -> None:
-        """A host op waits on the CPU for every unit's last writer of the
-        on-chip values it reads and last toucher of those it overwrites.
-        It posts nothing: the CPU issues what follows only once it is
-        done."""
-        accesses = [
-            (_WRITE, self._access(arg, region)) for arg in node.all_input_nodes
-        ]
-        written = [node] + [
-            user.args[1]
-            for user in node.users
-            if user.target is _INSERT and user.args[0] is node
-        ]
-        accesses += [(_TOUCH, self._access(w, region)) for w in written]
-        s = _Scalars(self.names, self._graph(region), node)
-        for kind, access in accesses:
-            if access is None:
-                continue
-            buffer, slot = access
-            if buffer in self.spmm_buffers:
-                self._drain(s.graph, node)
-            for unit in UNITS:
-                for post, value in self._lookup(
-                    s, state, kind, unit, buffer, slot, region
-                ):
-                    if value == 0:
-                        continue
-                    counter = self._thread(self._unit_counter(post), region)
-                    self._wait(s.graph, node, counter, value)
-
-    def _walk_read(self, node, region, state) -> None:
-        """A CPU read of an on-chip value waits for its last writer."""
-        access = self._access(node.args[0], region)
-        if access is None or access[0] not in self.written:
-            return
-        buffer, slot = access
-        s = _Scalars(self.names, self._graph(region), node)
-        if buffer in self.spmm_buffers:
-            self._drain(s.graph, node)
-        for unit in UNITS:
-            for post, value in self._lookup(
-                s, state, _WRITE, unit, buffer, slot, region
-            ):
-                if value == 0:
-                    continue
-                counter = self._thread(self._unit_counter(post), region)
-                self._wait(s.graph, node, counter, value)
+            reads = node.all_input_nodes
+            written = [node] + [
+                user.args[1]
+                for user in node.users
+                if user.target is _INSERT and user.args[0] is node
+            ]
+        p = _Pass(
+            None,
+            [a for a in (self._access(n, region) for n in reads) if a],
+            [a for a in (self._access(n, region) for n in written) if a],
+        )
+        s = self._scalars(region, node)
+        for counter, value in self._producers(s, state, p, region):
+            self._wait(node, counter, value, region)
 
     def _walk_cond(self, node, region, state) -> None:
         """Walk both branches from the state at the cond; a key either

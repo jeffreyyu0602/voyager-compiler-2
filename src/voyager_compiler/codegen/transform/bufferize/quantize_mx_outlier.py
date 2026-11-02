@@ -77,7 +77,6 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _tag_loop_extents,
     effect_cond,
-    new_counter,
     outline_dps_ops,
     stamp_csr_fill,
     voyager,
@@ -94,11 +93,6 @@ logger = logging.getLogger(__name__)
 
 _SRAM = int(MemoryLevel.SRAM)
 _QUANTIZE_MX_OUTLIER = torch.ops.quantized_ops.quantize_mx_outlier.default
-
-# Stores ``_OutlierProducer._slice`` issues per K slice (inliers, scale,
-# indptr, packed data, packed indices), each adding 1 to the store stream's
-# counter once landed.
-_SLICE_STORES = 5
 
 # Meta key naming the producer whose base table an alloc belongs to. The
 # producer and each of its consumers allocate the table independently; a pass
@@ -361,17 +355,6 @@ class _OutlierProducer(torch.nn.Module):
 
         d, i, p, s, q = self._quantize(tile, slots, offset)
 
-        # The previous steps' stores are waited for only here: their DMAs
-        # ran under this step's quantize, so the waits cost nothing, and the
-        # staging tiles are not reused before this point.  ``ordinal`` is
-        # this step's position in the sweep, so the steps before it issued
-        # ``_SLICE_STORES`` stores each; ``forward`` waits for the last
-        # step's after the sweep.
-        ordinal = 0
-        for extent, coord in zip(g.batch + (g.n_rb, g.n_k), idx):
-            ordinal = ordinal * extent + coord
-        voyager.async_wait(bufs.store_counter, _SLICE_STORES * ordinal)
-
         # A compute result reaches DRAM through a scratchpad tile: the
         # memory model has the datapath write on chip (``insert``) and the
         # DMA move it out, never straight from the op.
@@ -394,14 +377,12 @@ class _OutlierProducer(torch.nn.Module):
             bufs.inliers,
             bidx + [m, k],
             ones + (g.rows, g.tk),
-            bufs.store_counter,
         )
         voyager.async_copy(
             s,
             bufs.scale,
             bidx + [m, k],
             ones + (g.rows, g.tk // g.block_size),
-            bufs.store_counter,
         )
         # Slice k, rows [m*rows, m*rows+rows] inclusive: rows+1 entries at
         # stride rows, so consecutive blocks share a boundary element. Both
@@ -412,7 +393,7 @@ class _OutlierProducer(torch.nn.Module):
             bufs.csr_indptr,
             bidx + [k, m],
             ones + (1, g.rows + 1),
-            bufs.store_counter,
+            None,
             None,
             [1] * nb + [1, g.rows],
         )
@@ -435,7 +416,7 @@ class _OutlierProducer(torch.nn.Module):
             bufs.csr_data,
             bidx + [at],
             ones + (g.budget,),
-            bufs.store_counter,
+            None,
             None,
             [1] * (nb + 1),
             count=[1] * nb + [nnz],
@@ -445,7 +426,7 @@ class _OutlierProducer(torch.nn.Module):
             bufs.csr_indices,
             bidx + [at],
             ones + (g.budget,),
-            bufs.store_counter,
+            None,
             None,
             [1] * (nb + 1),
             count=[1] * nb + [nnz],
@@ -501,8 +482,6 @@ class _OutlierProducer(torch.nn.Module):
         bufs.base_table = voyager.alloc(
             list(g.batch) + [g.n_k, g.n_rb], torch.int32, _SRAM
         )
-        bufs.store_counter = new_counter()
-        bufs.table_counter = new_counter()
         # Per-block staging tiles for ``_slice``'s stores.
         bufs.store_data_tile = voyager.alloc(
             list(g.ones) + [g.budget], self.data_dtype, _SRAM
@@ -524,16 +503,8 @@ class _OutlierProducer(torch.nn.Module):
 
         self._bufs = bufs
         self.inner(*inputs)
-        # The last slice's stores are still in flight, and the consumer's
-        # nest reads the CSR next: every step the loop ran stored one slice.
-        voyager.async_wait(
-            bufs.store_counter, _SLICE_STORES * self.inner.steps_run
-        )
         copy_base_table(
-            bufs.base_table,
-            bufs.base_table_dram,
-            base_table_shape(g),
-            bufs.table_counter,
+            bufs.base_table, bufs.base_table_dram, base_table_shape(g)
         )
         return (
             bufs.csr_data,
@@ -553,24 +524,22 @@ def base_table_shape(geom: _Geometry) -> list:
     return [1] * geom.dropped + list(geom.batch) + [geom.n_k, geom.n_rb]
 
 
-def copy_base_table(src, dst, shape, counter) -> None:
+def copy_base_table(src, dst, shape) -> None:
     """Move a whole base table between its DRAM home and a nest's SRAM tile.
 
-    One bulk transfer per nest, waited before what needs it runs: a producer
-    fills its SRAM table an entry at a time across the loop and dumps it once
-    at the end, and each consumer loads it once before the gathers read the
-    scalars that address them. Source and destination share the table's full
-    shape, so the transfer names the whole block and the two buffers' memory
-    spaces give its direction.
+    One bulk transfer per nest: a producer fills its SRAM table an entry at
+    a time across the loop and dumps it once at the end, and each consumer
+    loads it once before the gathers read the scalars that address them.
+    Source and destination share the table's full shape, so the transfer
+    names the whole block and the two buffers' memory spaces give its
+    direction.
 
     Args:
         src: The buffer read whole.
         dst: The buffer written whole.
         shape: The table's shape, which both buffers have.
-        counter: The table's own counter, which this one copy adds 1 to.
     """
-    voyager.async_copy(src, dst, [0] * len(shape), list(shape), counter)
-    voyager.async_wait(counter, 1)
+    voyager.async_copy(src, dst, [0] * len(shape), list(shape))
 
 
 def tag_base_table(gm, producer_name: str, shape: list) -> None:

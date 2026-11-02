@@ -446,7 +446,7 @@ def build_attention(
 
     # Output tile [.., tq, d]; the kv reduction dim is dropped (index_map has no
     # ``gkv``), so the slot stays live across the sweep, written once at the
-    # last kv step — single-buffered, drained at block-exit.  The shape is the
+    # last kv step — single-buffered.  The shape is the
     # folded (KV-head-batch) output; ``_FoldInputs`` unfolds it back.
     out_spec = _OutputSpec(
         plan.out_fold_shape,
@@ -454,7 +454,6 @@ def build_attention(
         batch_map + (gq, None),
         out.dtype,
         num_slots=1,
-        first_use_at_exit=True,
     )
 
     acc = torch.float32 if accumulate_fp32 else out.dtype
