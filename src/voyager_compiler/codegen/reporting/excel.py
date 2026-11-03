@@ -25,9 +25,13 @@ from voyager_compiler.codegen.reporting.calibration import (
     sheet_rows,
     calibration_sheet,
     op_calibration_sheet,
+    pass_calibration_sheet,
     shape_text,
 )
-from voyager_compiler.codegen.reporting.model import ScheduleResult
+from voyager_compiler.codegen.reporting.model import (
+    COMPUTE_UNITS,
+    ScheduleResult,
+)
 from voyager_compiler.codegen.reporting.summary import (
     KernelRow,
     coverage,
@@ -64,10 +68,11 @@ def _shape(op, key) -> str:
 def _lane_cycles(result: ScheduleResult, lane: str) -> int:
     """Total cycles the Operations sheet's rows carry for one lane.
 
-    ``compute`` and ``dram`` reproduce ``busy_compute`` / ``busy_dram``
-    exactly, so the sheet is checkable against the Summary; ``control`` is
-    the ``async_wait`` time, which overlaps the transfers it waits on and so
-    belongs to neither.
+    ``compute`` sums every op's main passes (a fused op's riding vector pass
+    is part of its matrix-class pass) and ``dram`` every transfer, so they
+    reach ``busy_compute`` / ``busy_dram`` when nothing overlaps on their
+    lanes; ``control`` is the ``async_wait`` time, which overlaps the
+    transfers it waits on and so belongs to neither.
     """
     total = 0
     for e in _rollup(result).values():
@@ -75,9 +80,9 @@ def _lane_cycles(result: ScheduleResult, lane: str) -> int:
         if lane == "dram":
             hit = "dram" in res
         elif lane == "compute":
-            hit = "mma" in res or "vector" in res
+            hit = bool(set(COMPUTE_UNITS) & set(res))
         else:
-            hit = not ({"dram", "mma", "vector"} & set(res))
+            hit = not ({"dram", *COMPUTE_UNITS} & set(res))
         if hit:
             total += e["cycles"]
     return total
@@ -217,11 +222,15 @@ def _rollup(result: ScheduleResult) -> Dict[str, dict]:
             else:
                 e["write"] += rec.bytes * times
 
+    # A fused op's riding vector pass is part of its matrix-class pass's
+    # invocation, so it adds neither a count nor cycles.
     for rec in result.records:
-        add(rec, 1)
+        if not rec.rides:
+            add(rec, 1)
     for skip in result.skips:
         for eid in skip.template:
-            add(result.records[eid], skip.repeats)
+            if not result.records[eid].rides:
+                add(result.records[eid], skip.repeats)
     return agg
 
 
@@ -254,6 +263,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
         "Input",
         "Weight",
         "Output",
+        "Tiling",
         "Dtypes",
         "Category",
         "Macs / Ops",
@@ -289,6 +299,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                     _shape(op, "input"),
                     _shape(op, "weight"),
                     _shape(op, "output"),
+                    op.detail.get("tiling", ""),
                     op.detail.get("dtypes", ""),
                     "",
                     op.detail.get("macs", op.detail.get("ops", 0)),
@@ -327,6 +338,7 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                     None,  # Slot numbers compute ops only
                     label,
                     "/".join(e["resource"]),
+                    "",
                     "",
                     "",
                     "",
@@ -427,7 +439,7 @@ def _per_kernel(result, agg) -> Dict[str, dict]:
         op = by_key.get(key)
         if op is not None and op.op_type in ("gemm", "conv", "vector"):
             entry["ideal"] += op.ideal_cycles * e["count"]
-            entry["mma"] |= "mma" in op.units
+            entry["mma"] |= bool({"mma", "mvm", "spmm"} & set(op.units))
             entry["vec"] |= "vector" in op.units
     return out
 
@@ -519,11 +531,13 @@ def totals(table: List[OperationRow], total_latency: int) -> OperationRow:
 
 
 def _calibration(wb, rows, calibration):
-    """The Calibration sheet, then the Op calibration sheet when per-op
-    measurements priced the estimate.  Written by ``calibration.py``, which
-    owns the column layouts the loader reads back."""
+    """The Calibration sheet, then the Op calibration and the Pass
+    calibration sheets when per-op or per-pass measurements priced the
+    estimate.  Written by ``calibration.py``, which owns the column layouts
+    the loader reads back."""
     calibration_sheet(wb, rows, calibration)
     op_calibration_sheet(wb, calibration)
+    pass_calibration_sheet(wb, calibration)
 
 
 def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
@@ -640,9 +654,11 @@ def _events(wb, result: ScheduleResult, max_rows: int):
         "Iter",
         "Bytes",
         "Category",
+        "Ready",
         "Start",
         "Latency",
         "End",
+        "Done",
     ]
     folds = {}
     for s in result.skips:
@@ -662,9 +678,11 @@ def _events(wb, result: ScheduleResult, max_rows: int):
                 str(rec.iteration_path),
                 rec.bytes,
                 rec.category,
+                rec.ready,
                 rec.start,
                 rec.end - rec.start,
                 rec.end,
+                rec.done,
             )
             n += 1
             for s in folds.get(rec.eid, ()):
@@ -680,7 +698,9 @@ def _events(wb, result: ScheduleResult, max_rows: int):
                     * s.repeats,
                     "",
                     s.start,
+                    s.start,
                     s.end - s.start,
+                    s.end,
                     s.end,
                 )
                 n += 1

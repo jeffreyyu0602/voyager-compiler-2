@@ -78,6 +78,28 @@ class Placement:
 
 
 @dataclass(frozen=True)
+class PassTiming:
+    """The terms of one grid step of a matrix-class op, as its cost model
+    prices them, which reporting and attention's products read: a cold pass
+    computes ``buffer_fill`` after it may start, the array then computes for
+    ``steady``, and the pass is done ``skew + drain`` after its last row
+    went in.
+
+    Attributes:
+        buffer_fill: Cycles the first L1 tile's operands take to land.
+        steady: The array's compute span of the step.
+        skew: The systolic skew after the last row into the array.
+        drain: The parked finished tile's drain after the skew; 0 when the
+            tile rides the pass.
+    """
+
+    buffer_fill: float
+    steady: float
+    skew: float
+    drain: float
+
+
+@dataclass(frozen=True)
 class Cost:
     """What a tiling costs, in the backend's cycles.
 
@@ -85,13 +107,16 @@ class Cost:
         latency: The whole op.
         dram_bytes: Its DRAM traffic, which breaks near-ties in latency;
             ``None`` when the model does not count it.
-        compute: One step of its grid, which attention's products and
-            reporting charge; ``None`` when nothing reads it.
+        compute: One step of its grid, which attention charges a product
+            and reporting prices an op by: a :class:`PassTiming` when the
+            backend models the step's terms (a matrix GEMM on the array),
+            else the step's cycles as one float (a GEMV, Trainium);
+            ``None`` when nothing reads it.
     """
 
     latency: float
     dram_bytes: float | None = None
-    compute: float | None = None
+    compute: PassTiming | float | None = None
 
 
 @dataclass(frozen=True)

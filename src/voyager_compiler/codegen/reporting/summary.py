@@ -78,13 +78,13 @@ def _busy_cycles(recs) -> int:
 
 
 # The order a kernel's mixed calibration labels are joined in, finest first.
-_LABEL_ORDER = ("per-op", "analytic")
+_LABEL_ORDER = ("per-pass", "per-op", "analytic")
 
 
 def _calibration_label(period_ops: List[OpInfo]) -> str:
     """How a kernel's period was priced: one label when its ops agree, else
-    ``per-op+analytic`` when some ops had their own measurement and the
-    rest kept the analytic price."""
+    the labels joined (``per-op+analytic`` when some ops had their own
+    measurement and the rest kept the analytic price)."""
     present = {op.calibration or "analytic" for op in period_ops}
     labels = [label for label in _LABEL_ORDER if label in present]
     return "+".join(labels)
@@ -119,7 +119,7 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
             group_id=grp.group if grp else -1,
             num_shared_kernels=grp.num_shared_kernels if grp else 0,
             start=min(r.start for r in recs),
-            end=max(r.end for r in recs),
+            end=max(r.done for r in recs),
         )
         skips = skips_by_kernel.get(kernel, [])
         for skip in skips:
@@ -143,17 +143,21 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
         if skip is not None:
             template = [result.records[e] for e in skip.template]
             row.repeats = sum(s.repeats for s in skips)
-            row.compute_per_period = sum(
-                r.end - r.start for r in template if r.kind == "compute"
-            )
+            # A fused op's riding vector pass is part of its matrix-class
+            # pass's invocation, not one of its own.
+            compute = [
+                r for r in template if r.kind == "compute" and not r.rides
+            ]
+            row.compute_per_period = sum(r.end - r.start for r in compute)
             row.dram_per_period = sum(
                 r.end - r.start for r in template if r.resource == ("dram",)
             )
-            compute = [r for r in template if r.kind == "compute"]
             iterations = skip.period
         else:
             loop_recs = [r for r in recs if r.loop_uid != -1]
-            compute = [r for r in loop_recs if r.kind == "compute"]
+            compute = [
+                r for r in loop_recs if r.kind == "compute" and not r.rides
+            ]
             iterations = max(1, row.walked)
         counts = Counter(r.op_key for r in compute)
         row.ops_per_period = {
@@ -171,7 +175,10 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
             busy * analytic / effective / iterations if effective else 0.0
         )
         measured = [
-            ops[k] for k in counts if ops[k].measured_cycles is not None
+            ops[k]
+            for k in counts
+            if ops[k].measured_cycles is not None
+            or ops[k].measured_terms is not None
         ]
         if measured:
             # The busy time comes out of the schedule, so it is the measured

@@ -10,7 +10,14 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from voyager_compiler.codegen.transform.tiling.runtime_model import (
+    PassTiming,
+)
 from voyager_compiler.hardware_config import AcceleratorConfig
+
+# The lanes a compute pass can occupy: the systolic array, the matrix-vector
+# unit, the SpMM unit and the vector unit.
+COMPUTE_UNITS = ("mma", "mvm", "spmm", "vector")
 
 
 @dataclass
@@ -18,11 +25,15 @@ class TimingRecord:
     """One scheduled execution of one FX node (a loop body node runs many
     times, so one node yields many records, tagged by ``iteration_path``).
 
-    ``resource`` is the tuple of lanes the event occupies.  A compute pass
-    holds ``("mma",)`` (matrix unit), ``("vector",)`` (vector unit), or
-    both ``("mma", "vector")`` (a fused GEMM / conv, whose tail runs on the
-    VU); a DMA holds ``("dram",)``; an ``async_wait`` holds
-    ``("control",)`` -- a synchronization that uses no bandwidth.
+    ``resource`` is the lane the event occupies.  A compute pass holds one
+    of ``COMPUTE_UNITS``: an op with a matrix-class pass and a vector pass
+    (a fused GEMM / conv, whose tail runs on the VU) yields one record per
+    pass, the vector one marked ``rides``; a DMA holds ``("dram",)``; an
+    ``async_wait`` holds ``("control",)`` -- a synchronization that uses no
+    bandwidth.  A compute pass is stamped on its unit's timeline: ``ready``
+    when its sync waits hold, ``start`` and ``end`` its compute span, and
+    ``done`` when it is finished (a pass posts its counter at its done);
+    other events leave ``ready`` and ``done`` at ``start`` and ``end``.
     ``kernel`` names the bufferized nest the event belongs to, ``op_key``
     the ``OpInfo`` a compute event was priced by.  ``sync`` marks a DRAM
     event the program clock waits on -- the whole-tensor materialization of
@@ -33,7 +44,7 @@ class TimingRecord:
     eid: int
     node_name: str
     kind: str  # compute | load | store | async_wait | launch
-    resource: Tuple[str, ...]  # subset of {mma, vector, dram, control}
+    resource: Tuple[str, ...]  # one of COMPUTE_UNITS, dram or control
     start: int
     end: int
     iteration_path: Tuple[int, ...] = ()
@@ -44,6 +55,16 @@ class TimingRecord:
     category: str = ""
     op_key: str = ""
     sync: bool = False  # DRAM: a materialization that stalls the program clock
+    ready: int = -1
+    done: int = -1
+    # A fused op's vector pass, derived from the matrix-class pass it rides.
+    rides: bool = False
+
+    def __post_init__(self):
+        if self.ready < 0:
+            self.ready = self.start
+        if self.done < 0:
+            self.done = self.end
 
 
 @dataclass
@@ -57,6 +78,14 @@ class OpInfo:
     ``cost.py``.  A calibrated op carries the RTL-derived ``measured_cycles``
     instead, with ``calibration`` set to ``per-op``: the op's own RTL
     runtime priced it.
+
+    The op runs as the passes the sync pass gives it: a matrix-class pass on
+    ``engine`` (``mma``, ``mvm`` or ``spmm``; blank for none) and a vector
+    pass when ``vector_pass``; ``posts_on`` names the one that posts
+    (``matrix`` or ``vector``), and ``spmm`` marks a GEMM whose matrix-class
+    pass runs on the SpMM unit beside the array.  ``timing`` is the tiler's
+    ``PassTiming`` of a tiled matrix op, and ``measured_terms`` the pass
+    terms RTL stamps measured (``calibration`` ``per-pass``).
 
     ``slot`` is the op's 0-based ordinal within its kernel, in the order
     the scheduler first walks the kernel's ops.  Kernels built from one
@@ -75,6 +104,31 @@ class OpInfo:
     slot: int = -1
     measured_cycles: Optional[int] = None
     calibration: str = ""
+    engine: str = ""
+    vector_pass: bool = True
+    posts_on: str = "vector"
+    spmm: bool = False
+    timing: Optional[PassTiming] = None
+    measured_terms: Optional[Tuple[int, int, int]] = None
+
+    @property
+    def pass_terms(self) -> Tuple[int, int, int]:
+        """``(fill, span, tail)`` of the op's main pass (its matrix-class
+        pass, else its vector pass): a cold pass computes ``fill`` after it
+        is ready, computes for ``span`` and is done ``tail`` after that.
+        The measured terms when calibrated per pass, else the tiler's
+        ``PassTiming``; an op priced per op or without one computes for its
+        ``effective_cycles``, with no fill and no tail."""
+        if self.measured_terms is not None:
+            return self.measured_terms
+        if self.timing is None or self.measured_cycles is not None:
+            return 0, self.effective_cycles, 0
+        t = self.timing
+        return (
+            math.ceil(t.buffer_fill),
+            math.ceil(t.steady),
+            math.ceil(t.skew + t.drain),
+        )
 
     @property
     def analytic_cycles(self) -> int:

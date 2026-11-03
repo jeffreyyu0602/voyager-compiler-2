@@ -20,10 +20,20 @@ scheduler's overlap stay.  The ``Op calibration`` sheet gives one op's own
 steady-state cycles per invocation, keyed by build key and the op's
 ``slot`` in its kernel, and ``Calibration.apply`` prices the op at exactly
 that; the scheduler then works out how the kernel's ops overlap.  The build
-key does not cover tiling, so a row also carries the shapes it was measured
-at; an op tiled otherwise, or with no row, keeps its analytic price.  The
-``Calibration`` sheet's per-group cycles per iteration are reported beside
-the estimate, and its launch term is charged once per kernel.
+key does not cover tiling, so a row also carries the shapes and the tiling
+(scratch slots and nest) it was measured at; an op shaped or tiled
+otherwise, or with no row, keeps its analytic price.  A kernel's launch
+term, charged once per kernel, comes from its op rows when it has any (the
+cold first invocation over a steady one), else from the ``Calibration``
+sheet, whose per-group cycles per iteration are reported beside the
+estimate.
+
+The ``Pass calibration`` sheet gives one op's pass terms, measured from the
+RTL's per-pass stamps of its unit (``measure_pass_terms``): its compute
+span, its cold fill and its tail, keyed and guarded as an ``Op
+calibration`` row.  The scheduler places the op's passes with them in
+place of the tiler's ``steady``, ``buffer_fill`` and ``skew + drain``; a
+pass row takes precedence over an op row for the same op.
 
 The same sheet carries the group's measured **power**, which corrects
 nothing: the compiler has no power model, and the number exists only so the
@@ -32,6 +42,7 @@ reporting workbook can turn a latency into an energy.
 
 import logging
 import re
+import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -133,9 +144,89 @@ class OpMeasurement:
     unit: str = ""
     passes: int = 0
     samples: int = 0
-    method: str = ""  # start-to-start | start-to-done | sum-of-passes
+    method: str = ""  # how fill-ops priced it, e.g. service-time
     source: str = ""  # the regression_results folder it was read from
     shapes: str = ""  # op_shapes of the op measured; blank matches any
+    tiling: str = ""  # cost.tiling_text of the op measured
+    # The kernel's cold first invocation over a steady one, on the row of
+    # the op that invocation is; 0 on the others.
+    launch_cycles: int = 0
+
+
+@dataclass
+class PassMeasurement:
+    """One op's pass terms measured in RTL (``measure_pass_terms``), for the
+    op at ``slot`` of every kernel built with ``key``, measured at
+    ``shapes`` and ``tiling``: ``fill``, ``span`` and ``tail`` stand in for
+    the tiler's ``buffer_fill``, ``steady`` and ``skew + drain``.  The other
+    fields say where the terms came from and are carried, not used."""
+
+    key: str
+    slot: int
+    fill: int
+    span: int
+    tail: int
+    kernel: str = ""
+    op: str = ""
+    passes: int = 0
+    source: str = ""
+    shapes: str = ""
+    tiling: str = ""
+
+
+def measure_pass_terms(stamps) -> Dict[object, Tuple[int, int, int]]:
+    """Each op's ``(fill, span, tail)`` from the RTL stamps of the passes
+    of one unit.
+
+    A pass is warm when it was ready before its predecessor's compute end,
+    so it computes right after it; the others, the first included, are
+    cold.  An op's span is the median of ``E(n) - E(n-1)`` over its warm
+    passes (the handoff between passes included), its fill the median of
+    ``E(n) - R(n) - span`` over its cold ones, and its tail the median of
+    ``D(n) - E(n)`` over its passes whose done is exposed: the unit's last
+    pass and every one a cold pass follows (the output latency after the
+    skew and drain included).  An op with no warm or no cold pass takes the
+    span or the fill of all the unit's passes, and one with no exposed pass
+    the median tail of its own passes.
+
+    Args:
+        stamps: ``(op, R, E, D)`` per pass, in issue order on the unit:
+            the op the pass runs (any hashable label, e.g. its slot), its
+            start handshake, its last row into the array and its done.
+
+    Returns:
+        Each op's ``(fill, span, tail)``.
+
+    Raises:
+        ValueError: when no pass of the unit is warm, so no span is
+            measurable.
+    """
+    stamps = list(stamps)
+    warm, cold, exposed = {}, {}, {}
+    for n, (op, r, e, d) in enumerate(stamps):
+        prev_e = stamps[n - 1][2] if n else None
+        if prev_e is not None and r < prev_e:
+            warm.setdefault(op, []).append(e - prev_e)
+        else:
+            cold.setdefault(op, []).append((r, e))
+        follower = stamps[n + 1] if n + 1 < len(stamps) else None
+        if follower is None or follower[1] >= e:
+            exposed.setdefault(op, []).append(d - e)
+    if not warm:
+        raise ValueError("no warm pass: the compute span is not measurable")
+    unit_span = statistics.median_low([x for xs in warm.values() for x in xs])
+    unit_fill = statistics.median_low(
+        [e - r - unit_span for xs in cold.values() for r, e in xs]
+    )
+    terms = {}
+    for op in dict.fromkeys(op for op, *_ in stamps):
+        span = statistics.median_low(warm.get(op, [unit_span]))
+        fills = [e - r - span for r, e in cold.get(op, [])]
+        fill = statistics.median_low(fills) if fills else unit_fill
+        tails = exposed.get(op) or [d - e for o, _, e, d in stamps if o == op]
+        tail = statistics.median_low(tails)
+        terms[op] = (max(0, fill), span, max(0, tail))
+    return terms
 
 
 def shape_text(dims) -> str:
@@ -164,49 +255,80 @@ class Calibration:
         self,
         measurements: Dict[str, Measurement],
         op_measurements: Optional[Dict[Tuple[str, int], OpMeasurement]] = None,
+        pass_measurements: Optional[
+            Dict[Tuple[str, int], PassMeasurement]
+        ] = None,
     ):
         self.measurements = measurements
         self.op_measurements = op_measurements or {}
+        self.pass_measurements = pass_measurements or {}
         self.applied: Dict[str, int] = {}
-        # (key, slot) -> (the row's shapes, the op's): rows not applied
-        # because this compile tiles the op otherwise.
-        self.shape_mismatches: Dict[Tuple[str, int], Tuple[str, str]] = {}
+        # (key, slot) -> (the row's shapes and tiling, the op's): rows not
+        # applied because this compile shapes or tiles the op otherwise.
+        self.mismatches: Dict[Tuple[str, int], Tuple[str, str]] = {}
 
     def apply(self, op: OpInfo, group: Optional[str]) -> None:
-        """Price ``op`` by its own measurement when the ``Op calibration``
-        sheet has a row for ``(group, op.slot)`` measured at the op's
-        shapes; otherwise the analytic price stands."""
-        per_op = self.op_measurements.get((group, op.slot)) if group else None
-        if per_op is not None and per_op.shapes:
-            shapes = op_shapes(op)
-            if shapes != per_op.shapes:
-                self._shape_mismatch(per_op, shapes)
-                per_op = None
-        if per_op is None:
+        """Place ``op``'s passes by its measured pass terms when the ``Pass
+        calibration`` sheet has a row for ``(group, op.slot)`` measured at
+        the op's shapes and tiling, else price it by its own measurement
+        when the ``Op calibration`` sheet has one; otherwise the analytic
+        price stands."""
+        if not group:
+            return
+        per_pass = self.pass_measurements.get((group, op.slot))
+        if per_pass is not None and self._matches(per_pass, op):
+            op.measured_terms = (per_pass.fill, per_pass.span, per_pass.tail)
+            op.calibration = "per-pass"
+            self.applied[group] = self.applied.get(group, 0) + 1
+            return
+        per_op = self.op_measurements.get((group, op.slot))
+        if per_op is None or not self._matches(per_op, op):
             return
         op.measured_cycles = max(1, round(per_op.cycles))
         op.calibration = "per-op"
         self.applied[group] = self.applied.get(group, 0) + 1
 
-    def _shape_mismatch(self, row: "OpMeasurement", shapes: str) -> None:
-        """Note, once per row, an op whose shapes differ from its row's."""
+    def _matches(self, row, op: OpInfo) -> bool:
+        """Whether ``row`` was measured at ``op``'s shapes (a blank row
+        shape matches any) and tiling; a mismatch is noted."""
+        shapes = op_shapes(op)
+        tiling = op.detail.get("tiling", "")
+        shapes_differ = bool(row.shapes) and shapes != row.shapes
+        if shapes_differ or tiling != row.tiling:
+            self._mismatch(row, f"{shapes} [{tiling}]")
+            return False
+        return True
+
+    def _mismatch(self, row, found: str) -> None:
+        """Note, once per row, an op whose shapes or tiling differ from its
+        row's."""
         where = (row.key, row.slot)
-        if where in self.shape_mismatches:
+        if where in self.mismatches:
             return
-        self.shape_mismatches[where] = (row.shapes, shapes)
+        measured = f"{row.shapes} [{row.tiling}]"
+        self.mismatches[where] = (measured, found)
         logger.warning(
-            "Op calibration %s slot %d (%s) was measured at %s; this compile "
-            "has %s, so the op keeps its analytic price",
+            "Calibration row %s slot %d (%s) was measured at %s; this "
+            "compile has %s, so the row does not price the op",
             row.key,
             row.slot,
             row.op,
-            row.shapes,
-            shapes,
+            measured,
+            found,
         )
 
     def launch_cycles(self, group: Optional[str]) -> int:
-        """The measured fixed cost of entering a kernel (0 when unmeasured)."""
-        m = self.measurements.get(group) if group else None
+        """The measured fixed cost of entering a kernel (0 when unmeasured):
+        the sum over the group's op rows when it has any, else the
+        ``Calibration`` sheet's launch term."""
+        if not group:
+            return 0
+        rows = [
+            m for (key, _), m in self.op_measurements.items() if key == group
+        ]
+        if rows:
+            return sum(m.launch_cycles for m in rows)
+        m = self.measurements.get(group)
         return m.launch_cycles if m is not None else 0
 
     def power(self, group: Optional[str]) -> float:
@@ -360,11 +482,9 @@ OP_HEADERS = [
     "Method",
     "Source",
     "Shapes",
+    "Tiling",
+    "Launch cycles",
 ]
-# Fewer steady-state samples than this is no measurement: the op keeps its
-# analytic price.  A row with Samples left blank was written by hand and
-# counts.
-_MIN_OP_SAMPLES = 2
 
 
 def op_calibration_sheet(wb, calibration, formats=None) -> int:
@@ -382,7 +502,14 @@ def op_calibration_sheet(wb, calibration, formats=None) -> int:
     bold = fmt.get("bold") or wb.add_format({"bold": True})
     for c, h in enumerate(OP_HEADERS):
         ws.write(0, c, h, bold)
-    widths = {"Key": 14, "Kernel": 46, "Op": 32, "Source": 40, "Shapes": 40}
+    widths = {
+        "Key": 14,
+        "Kernel": 46,
+        "Op": 32,
+        "Source": 40,
+        "Shapes": 40,
+        "Tiling": 40,
+    }
     for name, width in widths.items():
         column = OP_HEADERS.index(name)
         ws.set_column(column, column, width)
@@ -401,6 +528,8 @@ def op_calibration_sheet(wb, calibration, formats=None) -> int:
             m.method,
             m.source,
             m.shapes,
+            m.tiling,
+            m.launch_cycles,
         ]
         for c, v in enumerate(values):
             if isinstance(v, (int, float)):
@@ -408,6 +537,64 @@ def op_calibration_sheet(wb, calibration, formats=None) -> int:
             else:
                 ws.write(r, c, v)
     return len(calibration.op_measurements)
+
+
+PASS_SHEET = "Pass calibration"
+PASS_HEADERS = [
+    "Key",
+    "Kernel",
+    "Slot",
+    "Op",
+    "Compute span",
+    "Cold fill",
+    "Tail",
+    "Passes",
+    "Source",
+    "Shapes",
+    "Tiling",
+]
+
+
+def pass_calibration_sheet(wb, calibration, formats=None) -> int:
+    """Write the ``Pass calibration`` rows ``calibration`` carries into an
+    open ``xlsxwriter`` workbook, so a per-pass calibrated compile's
+    workbook loads back as the same calibration.
+
+    Writes nothing (no sheet) when there are no pass rows.  Returns the
+    number of rows written.
+    """
+    if calibration is None or not calibration.pass_measurements:
+        return 0
+    ws = wb.add_worksheet(PASS_SHEET)
+    fmt = formats or {}
+    bold = fmt.get("bold") or wb.add_format({"bold": True})
+    for c, h in enumerate(PASS_HEADERS):
+        ws.write(0, c, h, bold)
+    widths = {"Kernel": 46, "Op": 32, "Source": 40, "Shapes": 40, "Tiling": 40}
+    for name, width in widths.items():
+        column = PASS_HEADERS.index(name)
+        ws.set_column(column, column, width)
+    ws.freeze_panes(1, 0)
+    for r, m in enumerate(calibration.pass_measurements.values(), start=1):
+        values = [
+            m.key,
+            m.kernel,
+            m.slot,
+            m.op,
+            m.span,
+            m.fill,
+            m.tail,
+            m.passes,
+            m.source,
+            m.shapes,
+            m.tiling,
+        ]
+        for c, v in enumerate(values):
+            if isinstance(v, (int, float)):
+                ws.write_number(r, c, v)
+            else:
+                ws.write(r, c, v)
+    return len(calibration.pass_measurements)
 
 
 def power_column() -> str:
@@ -440,19 +627,22 @@ def load_calibration(path: str) -> Calibration:
     measurement nor a power are ignored.  The sheet carries one row per key,
     so a repeated key means the file was edited by hand; the last row wins.
 
-    An ``Op calibration`` sheet, when present, is read too (see
-    ``load_op_measurements``); either sheet may be absent, not both.
+    An ``Op calibration`` and a ``Pass calibration`` sheet, when present,
+    are read too (see ``load_op_measurements`` and
+    ``load_pass_measurements``); any of the three may be absent, not all.
     """
     import openpyxl
 
     wb = openpyxl.load_workbook(path, data_only=True)
     op_measurements = load_op_measurements(wb)
+    pass_measurements = load_pass_measurements(wb)
     if FORM_SHEET not in wb.sheetnames:
-        if OP_SHEET not in wb.sheetnames:
+        if not {OP_SHEET, PASS_SHEET} & set(wb.sheetnames):
             raise ValueError(
-                f"{path} has neither a {FORM_SHEET!r} nor an {OP_SHEET!r} sheet"
+                f"{path} has no {FORM_SHEET!r}, {OP_SHEET!r} or "
+                f"{PASS_SHEET!r} sheet"
             )
-        return Calibration({}, op_measurements)
+        return Calibration({}, op_measurements, pass_measurements)
     ws = wb[FORM_SHEET]
     header = [c.value for c in ws[1]]
     col = {name: i for i, name in enumerate(header) if name in FORM_HEADERS}
@@ -491,17 +681,19 @@ def load_calibration(path: str) -> Calibration:
             n2=float(n2 or 0),
             t2=float(t2 or 0),
         )
-    return Calibration(measurements, op_measurements)
+    return Calibration(measurements, op_measurements, pass_measurements)
 
 
 def load_op_measurements(wb) -> Dict[Tuple[str, int], OpMeasurement]:
     """The ``Op calibration`` rows of an open ``openpyxl`` workbook, keyed by
     ``(Key, Slot)``; empty when the sheet is absent.
 
-    A row needs a key, a slot and a positive ``Measured cycles``; one with
-    fewer than two ``Samples`` is dropped, so its op keeps its analytic
-    price, and so is one whose numbers do not read as numbers.  A repeated
-    ``(Key, Slot)`` means a hand edit; the last row wins.
+    A row needs a key, a slot and a positive ``Measured cycles`` (one steady
+    sample suffices: the RTL repeats a tile to the cycle); one whose numbers
+    do not read as numbers is dropped.  A row from before the ``Tiling``
+    column loads with a blank tiling, so it prices only an op no search
+    tiled; a tiled op keeps its analytic price.  A repeated ``(Key, Slot)``
+    means a hand edit; the last row wins.
     """
     if OP_SHEET not in wb.sheetnames:
         return {}
@@ -518,16 +710,15 @@ def load_op_measurements(wb) -> Dict[Tuple[str, int], OpMeasurement]:
         key = cell(cells, "Key")
         if not key:
             continue
-        samples_cell = cell(cells, "Samples")
         try:
             slot = int(cell(cells, "Slot"))
             cycles = float(cell(cells, "Measured cycles"))
-            samples = int(samples_cell) if samples_cell is not None else 0
+            samples = int(cell(cells, "Samples") or 0)
             passes = int(cell(cells, "Passes") or 0)
+            launch = round(float(cell(cells, "Launch cycles") or 0))
         except (TypeError, ValueError):
             continue
-        too_few = samples_cell is not None and samples < _MIN_OP_SAMPLES
-        if cycles <= 0 or too_few:
+        if cycles <= 0:
             continue
         m = OpMeasurement(
             key=str(key),
@@ -541,6 +732,59 @@ def load_op_measurements(wb) -> Dict[Tuple[str, int], OpMeasurement]:
             method=str(cell(cells, "Method") or ""),
             source=str(cell(cells, "Source") or ""),
             shapes=str(cell(cells, "Shapes") or ""),
+            tiling=str(cell(cells, "Tiling") or ""),
+            launch_cycles=max(0, launch),
+        )
+        out[(m.key, m.slot)] = m
+    return out
+
+
+def load_pass_measurements(wb) -> Dict[Tuple[str, int], PassMeasurement]:
+    """The ``Pass calibration`` rows of an open ``openpyxl`` workbook, keyed
+    by ``(Key, Slot)``; empty when the sheet is absent.
+
+    A row needs a key, a slot and a positive ``Compute span``; a blank fill
+    or tail reads as 0, and a row whose numbers do not read as numbers is
+    dropped.  A repeated ``(Key, Slot)`` means a hand edit; the last row
+    wins.
+    """
+    if PASS_SHEET not in wb.sheetnames:
+        return {}
+    ws = wb[PASS_SHEET]
+    header = [c.value for c in ws[1]]
+    col = {name: i for i, name in enumerate(header) if name in PASS_HEADERS}
+
+    def cell(cells, name):
+        i = col.get(name)
+        return cells[i] if i is not None and i < len(cells) else None
+
+    out: Dict[Tuple[str, int], PassMeasurement] = {}
+    for cells in ws.iter_rows(min_row=2, values_only=True):
+        key = cell(cells, "Key")
+        if not key:
+            continue
+        try:
+            slot = int(cell(cells, "Slot"))
+            span = round(float(cell(cells, "Compute span")))
+            fill = round(float(cell(cells, "Cold fill") or 0))
+            tail = round(float(cell(cells, "Tail") or 0))
+            passes = int(cell(cells, "Passes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if span <= 0:
+            continue
+        m = PassMeasurement(
+            key=str(key),
+            slot=slot,
+            fill=max(0, fill),
+            span=span,
+            tail=max(0, tail),
+            kernel=str(cell(cells, "Kernel") or ""),
+            op=str(cell(cells, "Op") or ""),
+            passes=passes,
+            source=str(cell(cells, "Source") or ""),
+            shapes=str(cell(cells, "Shapes") or ""),
+            tiling=str(cell(cells, "Tiling") or ""),
         )
         out[(m.key, m.slot)] = m
     return out

@@ -33,6 +33,7 @@ from voyager_compiler.codegen.transform.tiling.runtime_model import (
     Fused,
     MatrixSpace,
     OpModel,
+    PassTiming,
     Placement,
     Role,
 )
@@ -85,7 +86,7 @@ class RuntimeCalculator:
     accumulate steps and the tail pass that finishes each output tile, and
     with one scratch region the next tile's first round starts only at that
     pass's done and then waits for its own first operands
-    (``matrix_timing``'s completion and refill).  A
+    (``matrix_cycles``'s skew, drain and buffer fill).  A
     DRAM transfer costs its bytes at ``dram_bandwidth`` plus one access
     latency, block scales being a transfer of their own, and the batch loop
     outside the mapping shares a weight tile among the elements of one
@@ -109,12 +110,11 @@ class RuntimeCalculator:
     switch when the weight tile spans several banks.  A tail pass of its own
     costs the vector unit's lane rate or its bank words, whichever is
     slower.  The ramps of a sweep, the first buffer fill, the systolic skew
-    and the last drain, are spread over the ops the sweep dispatches.
+    and the last drain, are charged once, whatever bounds its steps.
 
     Not modeled are the per-op costs (parameter load, deserialisation, the
     start/done handshake, the drain between uncommitted ops, the host's
-    dispatch time), so an op that runs alone pays its ramps in full where
-    the spreading charges a share; the cycle-exact datapath, the systolic
+    dispatch time); the cycle-exact datapath, the systolic
     skew being a constant of the array dims; a stream-breaking
     ``quantize_mx`` tail, charged as a staged region rather than a drained
     pass; a conv input tile's halo; more than one port width, every operand
@@ -662,26 +662,26 @@ class RuntimeCalculator:
             stall = max(stall, fraction * excess)
         return stall
 
-    def matrix_timing(self, mapping, banks):
-        """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
-        each costing the busier of the matrix unit -- its systolic passes,
-        plus the back-pressure a single-buffered accumulator takes while the
-        tail drains each finished tile -- and the scratchpad bank with the
-        most to move for it -- the every-round operands of its L1 sub-tiles,
-        the accumulator read back and rewritten while the reduction is
-        split, the finished tile and the tail's operands when it is not,
-        the round trips a stream idles for when it changes bank, each
-        summed with whatever shares its bank -- plus the stall the tail's
-        burst inflicts where it shares a bank with one of the array's
-        every-round buffers (``_tail_stall``) -- and, for an outlier GEMM,
-        the SpMM unit, which must deliver the block's sparse correction
-        before the vector pipeline releases any of its rows: per 64-column
-        pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
-        turnaround plus that row's outliers, each gather a bank switch when
-        the weight tile spans several banks -- plus the once-per-sweep
-        overhead (buffer fill, systolic skew, the last parked tile's drain)
-        spread over the ops a double-buffered L2 overlaps it with.  Also
-        the reporting model's per-tile utilization denominator.
+    def matrix_cycles(self, mapping, banks):
+        """The terms of one L3 grid step.  Its steady span is the L2 sweep of
+        weight-reuse tiles, each costing the busier of the matrix unit -- its
+        systolic passes, plus the back-pressure a single-buffered accumulator
+        takes while the tail drains each finished tile -- and the scratchpad
+        bank with the most to move for it -- the every-round operands of its L1
+        sub-tiles, the accumulator read back and rewritten while the reduction
+        is split, the finished tile and the tail's operands when it is not, the
+        round trips a stream idles for when it changes bank, each summed with
+        whatever shares its bank -- plus the stall the tail's burst inflicts
+        where it shares a bank with one of the array's every-round buffers
+        (``_tail_stall``) -- and, for an outlier GEMM, the SpMM unit, which must
+        deliver the block's sparse correction before the vector pipeline
+        releases any of its rows: per 64-column pass it walks every row of the
+        block, paying ``SPMM_ROW_CYCLES`` of turnaround plus that row's
+        outliers, each gather a bank switch when the weight tile spans several
+        banks.  Its ramps -- the first buffer fill, the systolic skew, the last
+        parked tile's drain -- come beside it, for ``cost`` to charge once per
+        sweep.  The steady span is also the reporting model's per-step
+        utilization denominator.
 
         The step's done trails the array's last reduction row by its
         completion: the systolic skew, then the parked tile's drain.  A round
@@ -694,7 +694,8 @@ class RuntimeCalculator:
                 shares (``_banks``), or ``None`` when nothing shares a bank.
 
         Returns:
-            ``(cycles, completion, refill)``.
+            The step's ``PassTiming``: the buffer fill or refill, the steady
+            span, the skew and the drain.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -894,21 +895,7 @@ class RuntimeCalculator:
         buffer_fill = self._bank_cycles(loads, banks)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
         drain = output_size * vector_beats if parked else 0
-        overhead = buffer_fill + skew + drain
-        steady = l2_blocks * block_time
-        completion = skew + drain
-
-        if not self.double_buffered_l2:
-            return steady + overhead, completion, buffer_fill
-
-        # Every op the sweep dispatches -- the L3 steps and the batch elements
-        # looped outside the mapping -- overlaps the ramps of its neighbours,
-        # a split reduction's included: its next tile's first round runs
-        # behind this tile's drain unless one scratch region holds it, which
-        # ``cost`` charges per tile.
-        steps = self._l3_blocks(mapping)
-        cycles = steady + overhead / (steps * self.batch)
-        return cycles, completion, buffer_fill
+        return PassTiming(buffer_fill, l2_blocks * block_time, skew, drain)
 
     def vector_cycles(self, mapping, banks):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
@@ -951,7 +938,10 @@ class RuntimeCalculator:
 
     def cost(self, mapping, placement):
         """The op's latency under ``mapping`` laid out as ``placement``, the
-        DRAM bytes its sweep moves, and one grid step's ``matrix_cycles``.
+        DRAM bytes its sweep moves, and one grid step's ``PassTiming``.  Each
+        step is priced at its steady span, and the sweep's ramps (the first
+        buffer fill, the systolic skew, the last drain) are added once: they
+        are exposed whatever bounds the steps.
 
         Args:
             mapping: The interstellar mapping to price, its loop orders
@@ -1037,7 +1027,11 @@ class RuntimeCalculator:
         ]
 
         banks, scratch_slots = self._banks(placement), placement.scratch_slots
-        matrix_cycles, completion, refill = self.matrix_timing(mapping, banks)
+        timing = self.matrix_cycles(mapping, banks)
+        steady = timing.steady
+        completion = timing.skew + timing.drain
+        refill = timing.buffer_fill
+        ramps = timing.buffer_fill + timing.skew + timing.drain
         vector_cycles = (
             self.vector_cycles(mapping, banks) if self.has_tail else 0
         )
@@ -1069,10 +1063,11 @@ class RuntimeCalculator:
         ]
 
         if not self.double_buffered_l2:
-            total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
+            total_time = l3_blocks * steady + ramps
+            total_time += sum(t * c for c, t in dmas)
             if num_k > 1 or self.single_k_tail_extra_pass:
                 total_time += output_tiles * vector_cycles
-            return Cost(total_time, dram_bytes, matrix_cycles)
+            return Cost(total_time, dram_bytes, timing)
 
         if num_k == 1:
             # Every step finishes a tile: one schedule covers the sweep.  A
@@ -1080,11 +1075,11 @@ class RuntimeCalculator:
             # overlaps the next tile's (its bank words are in the block);
             # a staged one is a pass of its own, serial on the single
             # scratch region.
-            step = matrix_cycles
+            step = steady
             if self.single_k_tail_extra_pass and not self.tail_keeps_shape:
                 step += vector_cycles
-            total_time = sweep_cycles(dmas, l3_blocks, step)
-            return Cost(total_time, dram_bytes, matrix_cycles)
+            total_time = sweep_cycles(dmas, l3_blocks, step) + ramps
+            return Cost(total_time, dram_bytes, timing)
 
         load = input_load + weight_load
         # The sweep's last step has no tile after it to prefetch, so it costs
@@ -1105,7 +1100,7 @@ class RuntimeCalculator:
         if self.has_tail and scratch_slots == 1:
             exposed = completion + refill
 
-        total_time = load + first_tail + accum_steps * max(load, matrix_cycles)
+        total_time = load + first_tail + accum_steps * max(load, steady)
         # One window per remaining tile, spanning two grid steps: the matrix
         # unit finishes this tile and starts the next, while DRAM fits that
         # tile's tail read, its store and the next prefetch into the same span.
@@ -1118,14 +1113,14 @@ class RuntimeCalculator:
                 # matrix and the vector pass, so the window's loads are
                 # issued only then and nothing hides them.
                 total_time += count * (
-                    matrix_cycles + vector_cycles + prefetch + matrix_cycles
+                    steady + vector_cycles + prefetch + steady
                 )
                 continue
-            compute = max(matrix_cycles, prefetch) + matrix_cycles + exposed
-            dma = max(matrix_cycles + vector_cycles, prefetch) + store + load
+            compute = max(steady, prefetch) + steady + exposed
+            dma = max(steady + vector_cycles, prefetch) + store + load
             total_time += count * max(compute, dma)
-        total_time += matrix_cycles + vector_cycles + store
-        return Cost(total_time, dram_bytes, matrix_cycles)
+        total_time += steady + vector_cycles + store + ramps
+        return Cost(total_time, dram_bytes, timing)
 
 
 @dataclass(frozen=True)

@@ -30,10 +30,21 @@ from voyager_compiler.codegen.node_info import (
     is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
+    is_nop,
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
+from voyager_compiler.codegen.transform.bufferize.sync import _is_matrix_op
+from voyager_compiler.codegen.transform.tiling.runtime_model import (
+    PassTiming,
+)
 from voyager_compiler.hardware_config import AcceleratorConfig
+
+# interstellar's loop ids, named as the IR's ``LoopIndex`` names them.
+_LOOP_NAMES = ("FX", "FY", "OX", "OY", "OC", "IC", "ON")
+# The mapping levels a nest is told apart by: L1 and L2, the levels the IR's
+# ``Tiling`` records (level 0 is the PE).
+_NEST_LEVELS = (1, 2)
 
 
 def _val(node):
@@ -114,8 +125,10 @@ def op_utilization(
 
     A matrix op interstellar mapped carries the search's result
     (``meta["tile_result"]``, stamped on it by the builder), whose
-    ``cost.compute`` prices one tiled execution of its mapping, so its
-    utilization is the ideal-to-actual ratio.
+    ``cost.compute`` is one grid step's ``PassTiming``, whose ``steady`` is
+    the array's span of the step, so its utilization is the ideal-to-actual
+    ratio: the padding alone, the ramps being the schedule's.  A backend
+    with no ``PassTiming`` gives the step's cycles as one float instead.
 
     Everything else runs on the vector unit, charged by
     ``vector_op_utilization`` (shared with the vector L2-tiling cost model)
@@ -134,7 +147,10 @@ def op_utilization(
         and isinstance(result.tiling, interstellar.MappingPoint)
         and ideal_cycles > 0
     ):
-        return min(1.0, ideal_cycles / result.cost.compute)
+        step = result.cost.compute
+        if isinstance(step, PassTiming):
+            step = step.steady
+        return min(1.0, ideal_cycles / step)
     anchor = get_anchor_node(node) or node
     tile = None
     if is_fully_connected(anchor):
@@ -142,6 +158,98 @@ def op_utilization(
     elif is_pooling(anchor):
         tile = _shape(anchor.args[0])
     return vector_op_utilization(node, cost, ideal_cycles, tile)
+
+
+# --------------------------------------------------------------------------
+# Tiling
+# --------------------------------------------------------------------------
+
+
+def tiling_text(node: Node) -> str:
+    """The tiling the search chose for ``node``, as the Operations sheet's
+    and the Op calibration sheet's ``Tiling`` cell: the reduction scratch's
+    slot count, then a matrix op's L1 and L2 loops with a blocking above 1
+    in loop order (``slots 1; L1 OX128 IC8; L2 OC8 OX2``), or a grid's tile
+    sizes and counts.  Blank for an op no search tiled."""
+    result = node.meta.get("tile_result")
+    if result is None:
+        return ""
+    parts = [f"slots {result.placement.scratch_slots}"]
+    mapping = result.tiling
+    if isinstance(mapping, interstellar.MappingPoint):
+        for level in _NEST_LEVELS:
+            ranked = sorted(
+                range(len(_LOOP_NAMES)),
+                key=lambda loop: mapping.loop_orders[loop][level],
+            )
+            loops = [
+                f"{_LOOP_NAMES[loop]}{mapping.loop_blockings[loop][level]}"
+                for loop in ranked
+                if mapping.loop_blockings[loop][level] > 1
+            ]
+            parts.append(" ".join([f"L{level}", *loops]))
+    else:
+        tile = "x".join(str(t) for t in mapping.tile_sizes)
+        grid = "x".join(str(g) for g in mapping.grid)
+        parts.append(f"tile {tile} grid {grid}")
+    return "; ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Passes
+# --------------------------------------------------------------------------
+
+
+def _module_ops(gm: GraphModule) -> list:
+    """The ops of a fused module in program order, nested modules flattened
+    and views left out, as the sync pass lists a dispatch's ops."""
+    ops = []
+    for n in gm.graph.nodes:
+        if n.op == "call_module":
+            ops += _module_ops(gm.get_submodule(n.target))
+        elif n.op == "call_function" and not is_nop(n):
+            ops.append(n)
+    return ops
+
+
+def op_passes(node: Node) -> dict:
+    """The passes the sync pass gives compute ``node``, as ``OpInfo``
+    fields: a matrix-class pass when one of its ops is a matrix op
+    (``_is_matrix_op``), on the SpMM unit for a bare SpMM, on the
+    matrix-vector unit for a fully-connected GEMM, else on the systolic
+    array (``engine``); a vector pass when it has any other op or its
+    matrix op is an SpMM (``vector_pass``); and the pass that posts, the
+    matrix-class one only when no op follows the matrix op and it is no
+    SpMM (``posts_on``).  A tiled op on the array also carries its search's
+    ``PassTiming`` (``timing``)."""
+    sub = node.meta.get("submodule")
+    ops = _module_ops(sub) if isinstance(sub, GraphModule) else [node]
+    matrix = next((op for op in ops if _is_matrix_op(op)), None)
+    if matrix is None:
+        return {"engine": "", "vector_pass": True, "posts_on": "vector"}
+    spmm = not is_gemm_op(matrix) or matrix.kwargs.get("A_data") is not None
+    if not is_gemm_op(matrix):
+        engine = "spmm"
+    elif is_fully_connected(matrix):
+        engine = "mvm"
+    else:
+        engine = "mma"
+    tail = ops.index(matrix) < len(ops) - 1
+    result = node.meta.get("tile_result")
+    return {
+        "engine": engine,
+        "vector_pass": len(ops) > 1 or spmm,
+        "posts_on": "vector" if tail or spmm else "matrix",
+        "spmm": spmm,
+        "timing": (
+            result.cost.compute
+            if engine == "mma"
+            and result is not None
+            and result.cost is not None
+            and isinstance(result.cost.compute, PassTiming)
+            else None
+        ),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -165,10 +273,20 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     vec_lanes = max(1, cost.vector_lanes)
     out = _shape(anchor)
 
-    # A fused submodule drives the vector unit too (its tail runs on the VU,
-    # even a bare reshape); a bare matrix op occupies only the matrix unit.
+    # A fused submodule is priced as driving the vector unit too (its tail
+    # runs on the VU, even a bare reshape); a bare matrix op as occupying
+    # only the matrix unit.
     fused = isinstance(node.meta.get("submodule"), GraphModule)
     matrix_units = ("mma", "vector") if fused else ("mma",)
+    # The lanes its passes occupy: the matrix-class unit, the SpMM unit
+    # beside the array, the vector unit.
+    passes = op_passes(node)
+    lanes = [passes["engine"]] if passes["engine"] else []
+    if passes.get("spmm") and passes["engine"] == "mma":
+        lanes.append("spmm")
+    if passes["vector_pass"]:
+        lanes.append("vector")
+    lanes = tuple(lanes)
 
     if is_conv2d(anchor):
         w = _shape(anchor.args[1])
@@ -189,9 +307,11 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "weight": w,
                 "output": out,
                 "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
+                "tiling": tiling_text(node),
             },
-            units=matrix_units,
+            units=lanes,
             utilization=op_utilization(node, matrix_units, ideal, cost),
+            **passes,
         )
 
     if is_gemm_op(anchor):
@@ -215,9 +335,11 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "weight": _shape(anchor.args[1]),
                 "output": out,
                 "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
+                "tiling": tiling_text(node),
             },
-            units=units,
+            units=lanes,
             utilization=op_utilization(node, units, ideal, cost),
+            **passes,
         )
 
     # Vector op: work is the larger of input / output element count -- a
@@ -240,7 +362,9 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             "input": in_shape,
             "output": out,
             "dtypes": _dtypes(anchor, *in_nodes[:1]),
+            "tiling": tiling_text(node),
         },
-        units=("vector",),
+        units=lanes,
         utilization=op_utilization(node, ("vector",), ideal, cost),
+        **passes,
     )

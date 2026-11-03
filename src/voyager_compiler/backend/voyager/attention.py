@@ -19,6 +19,7 @@ from voyager_compiler.codegen.transform.tiling.lowering import (
 from voyager_compiler.codegen.transform.tiling.runtime_model import (
     Cost,
     OpModel,
+    PassTiming,
     Placement,
     pad_head,
 )
@@ -326,13 +327,20 @@ class VoyagerAttention(OpModel):
         return Placement()
 
     def cost(self, tiling, placement):
-        """``attention_tile_latency`` of ``tiling``, each product charged its
-        result's one-step ``compute`` (``tiling.products``); ``placement`` is
-        the contract's."""
-        matrix = {
-            name: result.cost.compute
-            for name, result in tiling.products.items()
-        }
+        """``attention_tile_latency`` of ``tiling``, each product charged one
+        step of its result's ``compute`` (``tiling.products``): the whole
+        pass a mapped product's ``PassTiming`` gives -- its fill, steady
+        span, skew and drain, the product being one grid step -- else a
+        GEMV's one-tile cycles; ``placement`` is the contract's."""
+        matrix = {}
+        for name, result in tiling.products.items():
+            timing = result.cost.compute
+            if not isinstance(timing, PassTiming):
+                matrix[name] = timing
+                continue
+            # The product is one grid step: its whole pass, ramps included.
+            ramps = timing.buffer_fill + timing.skew + timing.drain
+            matrix[name] = timing.steady + ramps
         latency, traffic = attention_tile_latency(
             self.node,
             attention_operand_shapes(self.node, tiling),

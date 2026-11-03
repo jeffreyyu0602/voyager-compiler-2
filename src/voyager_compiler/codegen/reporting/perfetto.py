@@ -1,13 +1,16 @@
 """Chrome / Perfetto trace export (``chrome://tracing`` JSON).
 
-Emits every walked event: compute split onto a Matrix (systolic array) and
-a Vector (vector unit) track, the DRAM interface on another, control
-(waits) on a third.  A fused pass that runs vector ops alongside its
-matrix anchor (a GEMM + elementwise epilogue) draws on BOTH compute
-tracks.  A folded steady state -- iterations the walk skipped as repeats
-of the period before them -- appears as one bar on the Control track
-spanning the skipped time, so the trace stays readable at any trip count.
-Time is in cycles (the trace ``ts``/``dur`` unit is arbitrary).
+Emits every walked event: each compute pass on its unit's track -- Matrix
+(systolic array), MVM (matrix-vector unit), SpMM, Vector -- the DRAM
+interface on another, control (waits) on another.  A compute pass's bar is
+its compute span; its ``args`` carry its stamps (``ready``, ``start``,
+``end``, ``done``).  A fused op (a GEMM + elementwise epilogue) draws a
+matrix-class pass and the vector pass that rides it, which spans the
+matrix pass's start to its done.  A folded steady state -- iterations the
+walk skipped as repeats of the period before them -- appears as one bar on
+the Control track spanning the skipped time, so the trace stays readable
+at any trip count.  Time is in cycles (the trace ``ts``/``dur`` unit is
+arbitrary).
 """
 
 import json
@@ -15,8 +18,15 @@ from typing import Dict
 
 from voyager_compiler.codegen.reporting.model import ScheduleResult
 
-_TID = {"mma": 0, "vector": 1, "dram": 2, "control": 3}
-_TRACK = {0: "Matrix", 1: "Vector", 2: "DRAM", 3: "Control"}
+_TID = {"mma": 0, "vector": 1, "dram": 2, "control": 3, "mvm": 4, "spmm": 5}
+_TRACK = {
+    0: "Matrix",
+    1: "Vector",
+    2: "DRAM",
+    3: "Control",
+    4: "MVM",
+    5: "SpMM",
+}
 
 
 def perfetto_dict(result: ScheduleResult) -> Dict:
@@ -49,6 +59,11 @@ def perfetto_dict(result: ScheduleResult) -> Dict:
                         "bytes": r.bytes,
                         "is_read": r.is_read,
                         "iteration": list(r.iteration_path),
+                        "ready": r.ready,
+                        "start": r.start,
+                        "end": r.end,
+                        "done": r.done,
+                        "rides": r.rides,
                     },
                 }
             )

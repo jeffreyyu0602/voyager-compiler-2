@@ -17,9 +17,11 @@ from voyager_compiler.codegen.reporting.calibration import (
     KernelGroup,
     Measurement,
     OpMeasurement,
+    PassMeasurement,
     kernel_groups,
     load_calibration,
     calibration_sheet,
+    measure_pass_terms,
 )
 from voyager_compiler.codegen.reporting.excel import write_excel_report
 from voyager_compiler.codegen.reporting.interpret import estimate_schedule
@@ -46,6 +48,7 @@ __all__ = [
     "Measurement",
     "OpInfo",
     "OpMeasurement",
+    "PassMeasurement",
     "ScheduleResult",
     "TimingRecord",
     "coverage",
@@ -53,6 +56,7 @@ __all__ = [
     "kernel_rows",
     "kernel_groups",
     "load_calibration",
+    "measure_pass_terms",
     "report",
     "calibration_sheet",
     "write_excel_report",

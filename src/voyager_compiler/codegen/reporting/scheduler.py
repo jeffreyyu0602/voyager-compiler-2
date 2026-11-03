@@ -1,17 +1,28 @@
 """The resource/timing state machine.
 
-A compute occupies the unit(s) named by its ``OpInfo.units`` — ``mma``
-(systolic matrix array), ``vector`` (vector unit), or both (a fused GEMM /
-conv, whose tail runs on the VU).  Whether it advances the **program clock**
-depends on how it is dispatched:
+Each unit -- the systolic array (``mma``), the matrix-vector unit (``mvm``),
+the SpMM unit (``spmm``), the vector unit and DRAM -- has its own timeline.
+A compute runs as the passes the sync pass gave it (``OpInfo.engine``,
+``vector_pass``): a matrix-class pass on its engine, a vector pass, or both
+(a fused GEMM / conv, whose tail runs on the VU).  Each pass is stamped on
+its unit's timeline: ready ``R`` when its waits hold (the waits its commit
+lists under its pass's unit), compute start ``S = max(R + fill, the unit's
+previous compute end)``, compute end ``E = S + span`` and done ``D = E +
+tail``, with ``OpInfo.pass_terms``.  A warm pass thus follows its
+predecessor at the span, and a cold one starts ``fill`` after it is ready.
+A fused op's vector pass rides its matrix-class pass: it starts with it
+once the vector unit is ready and free, and is done with it.  The op posts
+at the done of the pass ``OpInfo.posts_on`` names.  Whether a compute
+advances the **program clock** depends on how it is dispatched:
 
 * **synchronous**: advances the program clock, so it serializes and forms the
   clock the waits reconcile against.
 * **asynchronous** (dispatched inside a ``voyager.commit``): occupies its
   unit(s) but does **not** advance the program clock, so it runs while the clock
   moves on other units; the commit adds its completion to its counter,
-  exactly as ``async_copy`` does.  Two ops on the same unit still serialize
-  (shared ``*_free`` counter); overlap appears only across different units.
+  exactly as ``async_copy`` does.  Two passes on the same unit still
+  serialize their compute (``*_free``, the unit's last compute end), while
+  one pass's tail overlaps the next pass's compute.
 
 ``async_copy`` *is* asynchronous: it occupies DRAM for its transfer without
 advancing the program clock, so a prefetch overlaps compute.  A counter is
@@ -19,8 +30,7 @@ the list of completion cycles of what has been added to it, in order; a wait
 for ``counter >= threshold`` resolves at the ``threshold``-th of them,
 whether that post came from a DMA or an async compute.  ``async_wait``
 blocks the program clock until its wait resolves; a commit's passes wait
-per unit before they start.  A pass is done, and frees its unit(s), at the
-end of its charged cycles, and its post carries that end.
+per unit before they start.  A post carries its pass's done.
 
 Every timestamp the machine holds -- the clocks, the unit-free cycles, the
 posted completions and the parked commits' floors -- is exposed by
@@ -44,6 +54,7 @@ from voyager_compiler.codegen.reporting.model import (
     OpInfo,
     TimingRecord,
 )
+from voyager_compiler.codegen.transform.bufferize.ops import UNITS
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 # Trace entry tags.
@@ -54,9 +65,9 @@ T_COMMIT = 5
 T_WAIT = 6
 T_LOOP = 7
 T_SKIP = 8
-
-# The unit an ``OpInfo`` names -> the unit its commit waits are listed under.
-_WAIT_UNIT = {"mma": "matrix", "vector": "vector"}
+# The units a commit lists its waits under: a matrix-class pass waits on the
+# first, a vector pass on the second.
+_MATRIX, _VECTOR = UNITS
 
 
 @dataclass
@@ -92,7 +103,10 @@ class ResourceState:
         self.cost = cost
         self.calibration = calibration
         self.now = 0
+        # Each compute unit's last compute end.
         self.mma_free = 0
+        self.mvm_free = 0
+        self.spmm_free = 0
         self.vector_free = 0
         self.dram_free = 0
         self.cur_loop = -1  # id() of the while_loop currently being walked
@@ -134,15 +148,6 @@ class ResourceState:
     def _eid(self) -> int:
         return len(self.records)
 
-    def _unit_free(self, unit: str) -> int:
-        return self.mma_free if unit == "mma" else self.vector_free
-
-    def _occupy(self, unit: str, end: int) -> None:
-        if unit == "mma":
-            self.mma_free = end
-        else:
-            self.vector_free = end
-
     def clock(self) -> int:
         """The clock a loop iteration is measured against: the program clock,
         or the commit clock while a committed body is being walked."""
@@ -175,49 +180,88 @@ class ResourceState:
 
     # -- event kinds --------------------------------------------------------
 
-    def compute(self, node, path) -> TimingRecord:
-        op = self.get_op(node)
-        units_free = [self._unit_free(u) for u in op.units]
+    def _ready(self, queue: str) -> int:
+        """The cycle a pass whose waits are listed under ``queue`` is ready:
+        its issue and those waits (committed), or the program clock."""
         if self.in_commit:
-            # A committed op runs in program order on the datapath but off
-            # the program clock: its start floors on the issue cycle
-            # (commit_now, advanced by each body op), on the cycle its
-            # unit(s)' waits resolved at, and on its unit(s), never on
-            # self.now.
-            floors = [self.commit_floors[_WAIT_UNIT[u]] for u in op.units]
-            start = max(self.commit_now, *units_free, *floors)
-        else:
-            start = max(self.now, *units_free)
-        end = start + op.effective_cycles
-        rec = TimingRecord(
-            eid=self._eid(),
-            node_name=node.name,
-            kind="compute",
-            resource=op.units,
-            start=start,
-            end=end,
-            iteration_path=tuple(path),
-            loop_uid=self.cur_loop,
-            kernel=self.cur_kernel,
-            op_key=op.key,
-        )
-        self.records.append(rec)
-        for u in op.units:
-            self._occupy(u, end)
+            return max(self.commit_now, self.commit_floors[queue])
+        return self.now
+
+    def compute(self, node, path) -> TimingRecord:
+        """Stamp ``node``'s passes on their units' timelines (module
+        docstring) and return its main pass's record: the matrix-class
+        pass, else the vector pass.  A committed op leaves the program clock
+        and hands its post to the commit; a synchronous one advances the
+        clock to its post."""
+        op = self.get_op(node)
+        fill, span, tail = op.pass_terms
+        passes = []  # (unit, ready, start, end, done, rides)
+        if op.engine:
+            ready = self._ready(_MATRIX)
+            # An outlier GEMM runs its correction on the SpMM unit beside
+            # the array, so it takes both.
+            beside = op.spmm and op.engine == "mma"
+            free = getattr(self, f"{op.engine}_free")
+            if beside:
+                free = max(free, self.spmm_free)
+            start = max(ready + fill, free)
+            end = start + span
+            setattr(self, f"{op.engine}_free", end)
+            if beside:
+                self.spmm_free = end
+            passes.append((op.engine, ready, start, end, end + tail, False))
+        if op.vector_pass:
+            ready = self._ready(_VECTOR)
+            free = max(ready, self.vector_free)
+            if passes:
+                _, _, m_start, _, m_done, _ = passes[0]
+                start = max(free, m_start)
+                done = max(free, m_done)
+                passes.append(("vector", ready, start, done, done, True))
+            else:
+                start = max(ready + fill, self.vector_free)
+                done = start + span + tail
+                end = start + span
+                passes.append(("vector", ready, start, end, done, False))
+            self.vector_free = done
+        post = passes[0][4] if op.posts_on == _MATRIX else passes[-1][4]
+        records = []
+        for lane, ready, start, end, done, rides in passes:
+            rec = TimingRecord(
+                eid=self._eid(),
+                node_name=node.name,
+                kind="compute",
+                resource=(lane,),
+                start=start,
+                end=end,
+                iteration_path=tuple(path),
+                loop_uid=self.cur_loop,
+                kernel=self.cur_kernel,
+                op_key=op.key,
+                ready=ready,
+                done=done,
+                rides=rides,
+            )
+            self.records.append(rec)
+            records.append(rec)
         if self.in_commit:
             # A committed op occupies its unit(s) but leaves the program clock;
-            # its post carries its end.  A sync one advances the clock to it.
-            self.commit_now = end
+            # its post carries its done.  A sync one advances the clock to it.
+            self.commit_now = post
             self.last_commit_node = node
-            self.pending_post[id(node)] = end
+            self.pending_post[id(node)] = post
         else:
-            self.now = end
+            self.now = post
         if self.trace is not None:
             base = self.trace_base
             self.trace.append(
-                (T_COMPUTE, id(node), self.in_commit, start - base, end - base)
+                (T_COMPUTE, id(node), self.in_commit)
+                + tuple(
+                    (lane, r - base, s - base, e - base, d - base)
+                    for lane, r, s, e, d, _ in passes
+                )
             )
-        return rec
+        return records[0]
 
     def post_counter(self, key, src_node) -> None:
         """Add the async compute ``src_node``'s completion to counter
@@ -293,7 +337,7 @@ class ResourceState:
         no earlier than the clock it is issued at.
         """
         issued = self.clock()
-        floors = {unit: issued for unit in _WAIT_UNIT.values()}
+        floors = {unit: issued for unit in UNITS}
         self.pending_commits.append(
             _PendingCommit(node, list(waits), floors, run)
         )
@@ -470,6 +514,8 @@ class ResourceState:
                 self.now,
                 self.commit_now,
                 self.mma_free,
+                self.mvm_free,
+                self.spmm_free,
                 self.vector_free,
                 self.dram_free,
             ),
@@ -482,7 +528,7 @@ class ResourceState:
                 (
                     id(pc.node),
                     tuple(pc.waits),
-                    tuple(pc.floors[u] for u in _WAIT_UNIT.values()),
+                    tuple(pc.floors[u] for u in UNITS),
                 )
                 for pc in self.pending_commits
             ),
@@ -496,6 +542,8 @@ class ResourceState:
             self.now,
             self.commit_now,
             self.mma_free,
+            self.mvm_free,
+            self.spmm_free,
             self.vector_free,
             self.dram_free,
         ) = clocks
@@ -504,7 +552,7 @@ class ResourceState:
         for k, value in posts:
             self.pending_post[k] = value
         for pc, (_, _, floors) in zip(self.pending_commits, commits):
-            pc.floors = dict(zip(_WAIT_UNIT.values(), floors))
+            pc.floors = dict(zip(UNITS, floors))
 
     def checkpoint(self) -> Checkpoint:
         return Checkpoint(
@@ -512,6 +560,8 @@ class ResourceState:
                 self.now,
                 self.commit_now,
                 self.mma_free,
+                self.mvm_free,
+                self.spmm_free,
                 self.vector_free,
                 self.dram_free,
             ),
@@ -539,6 +589,8 @@ class ResourceState:
             self.now,
             self.commit_now,
             self.mma_free,
+            self.mvm_free,
+            self.spmm_free,
             self.vector_free,
             self.dram_free,
         ) = cp.clocks
