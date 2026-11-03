@@ -2085,11 +2085,14 @@ class _PromptStore:
         self.buffers = {}
         self.offsets = {}
 
-    def constant(self, prefix: str, value: torch.Tensor, dtype=None) -> Node:
-        """``value`` as a new buffer of the prefill, named after ``prefix``."""
+    def constant(
+        self, prefix: str, value: torch.Tensor, dtype=None, producer=None
+    ) -> Node:
+        """``value`` as a new buffer of the prefill, named after ``prefix``;
+        ``producer``, a graph computing it, is kept on the node."""
         with self.model.graph.inserting_before(self.before):
             node = create_getattr_from_value(
-                self.model, self.model.graph, prefix, value
+                self.model, self.model.graph, prefix, value, producer
             )
         node.meta["dtype"] = dtype
         set_node_value(node, fake_like(fetch_attr(self.model, node.target)))
@@ -2185,9 +2188,20 @@ class _PromptStore:
             set_node_value(self.buffers[name], fake_like(tensor))
         span = source.value.shape[axis]
         if (start, span) not in self.offsets:
+            device = source.value.device
+            # The positions' arange, which a pass reads instead of the values.
+            arange = Graph()
+            arange.output(
+                arange.call_function(
+                    torch.ops.aten.arange.start,
+                    (start, start + span),
+                    {"device": device},
+                )
+            )
             self.offsets[start, span] = self.constant(
                 "prompt_positions",
-                torch.arange(start, start + span, device=source.value.device),
+                torch.arange(start, start + span, device=device),
+                producer=GraphModule(torch.nn.Module(), arange),
             )
         return self.call(
             _INDEX_COPY,

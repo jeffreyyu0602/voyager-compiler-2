@@ -12,6 +12,17 @@ From the CI run of 2026-11-03 (`test/run_ci.py`, baseline e5c49a0; run
 folder `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/weight-layout/ci/2026-11-03_03-27-38`).
 The commits from fd6feef to 8d0ffa7 are not logged yet.
 
+### fix: store the KIVI cache in place (2026-11-03)
+
+- Not in the CI run above; traced on the `llama_cache_kivi` pair only.
+- **model.txt, llama_cache_kivi:** a KIVI chunk's cache store writes into a
+  pitched window of the cache, so the prefill and the decode's fold no
+  longer `index_copy_` the quantized cache and its scales and zero points;
+  the decode's per-token residual write stays a host copy. The layer list
+  is unchanged.
+- Numerics: the 8 cache, scale and zero-point buffers, both residuals and
+  the logits are bit-identical.
+
 ### feat: store each weight once, in the model's layout (2026-11-03)
 
 - **model.txt, 19 of 34 configs** (the 10 llama_prefill and llama_cache

@@ -36,6 +36,13 @@ result into a buffer that outlives it -- a gradient, a parameter, an
 optimizer moment.  That is a one-source join whose window is the whole
 destination: the producing nest's output alloc is redirected into it, so
 the nest stores straight into the destination and the copy goes.
+
+``aten.index_copy_`` (write side): a KV-cache store writes one contiguous
+run of positions -- ``arange(start, start + n)``, a constant or with a
+runtime ``start``, or a one-element ``full`` -- so it is a ``copy_`` into
+the cache's window there, and folds like one, in every graph of the model
+(a decode fold stores inside a ``cond`` branch).  A source with no alloc to
+redirect is host-copied into the window.
 """
 
 import operator
@@ -45,12 +52,19 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import get_arg_value, is_nop
 from voyager_compiler.codegen.transform.bufferize.ops import MemoryLevel
-from voyager_compiler.shape_prop import set_node_value
+from voyager_compiler.shape_prop import fetch_attr, set_node_value
 
 _ALLOC = torch.ops.voyager.alloc.default
+_ARANGE = (
+    torch.ops.aten.arange.default,
+    torch.ops.aten.arange.start,
+    torch.ops.aten.arange.start_step,
+)
 _CAT = torch.ops.aten.cat.default
 _CLONE = torch.ops.aten.clone.default
 _COPY = torch.ops.aten.copy_.default
+_FULL = torch.ops.aten.full.default
+_INDEX_COPY = torch.ops.aten.index_copy_.default
 _INSERT = torch.ops.voyager.insert.default
 _RESHAPE = torch.ops.aten.reshape.default
 _SELECT = torch.ops.aten.select.int
@@ -67,7 +81,8 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 
 def lower_views(model: GraphModule) -> GraphModule:
     """Rewrite foldable ``select`` / ``slice`` / ``unbind`` / ``split`` /
-    ``cat`` / ``stack`` / ``copy_`` nodes into subview windows.  A window
+    ``cat`` / ``stack`` / ``copy_`` nodes, and every graph's foldable
+    ``index_copy_``, into subview windows.  A window
     carries the logical (quantized) dtype of the buffer it views, so its
     bytes are sized like the buffer's."""
     for node in list(model.graph.nodes):
@@ -85,7 +100,13 @@ def lower_views(model: GraphModule) -> GraphModule:
             _fold_join(model, node)
         elif node.target is _COPY:
             _fold_copy(model, node)
-    model.graph.lint()
+    for gm in model.modules():
+        if not isinstance(gm, GraphModule):
+            continue
+        for node in list(gm.graph.nodes):
+            if node.op == "call_function" and node.target is _INDEX_COPY:
+                _fold_index_copy(gm, node)
+        gm.graph.lint()
     return model
 
 
@@ -436,6 +457,192 @@ def _fold_copy(model: GraphModule, node: Node) -> None:
     graph.erase_node(node)
     # The views that named the result for the copy are unread now.
     while src is not storage and is_nop(src) and not src.users:
+        source = src.args[0]
+        graph.erase_node(src)
+        src = source
+
+
+def _run_start(model: GraphModule, index: Node, length: int):
+    """The first position of ``index`` when it names ``length`` consecutive
+    ascending positions -- an int, or the scalar node a runtime start is --
+    else ``None``.  A folded constant is judged by the one call its
+    producer graph computes it with, never by its contents; one with no
+    producer names no run."""
+    if not isinstance(index, Node):
+        return None
+    if index.op == "get_attr":
+        producer = index.meta.get("producer")
+        if not isinstance(producer, GraphModule):
+            return None
+        (output,) = producer.graph.find_nodes(op="output")
+        call = output.args[0]
+        if not isinstance(call, Node) or call.op != "call_function":
+            return None
+        numel = fetch_attr(model, index.target).numel()
+        return _call_run_start(call, length, numel)
+    if index.op != "call_function":
+        return None
+    return _call_run_start(index, length, index.value.numel())
+
+
+def _call_run_start(call: Node, length: int, numel: int):
+    """The first position ``call`` names when it is an ``arange`` of step 1
+    over ``numel`` == ``length`` positions, or a ``full`` naming one, else
+    ``None``."""
+    if call.target is _FULL and length == 1:
+        return call.args[1]
+    if call.target not in _ARANGE:
+        return None
+    bounds = list(call.args)
+    if call.target is torch.ops.aten.arange.default:
+        bounds = [0, *bounds]
+    step = bounds[2] if len(bounds) > 2 else 1
+    if step != 1 or numel != length:
+        return None
+    return bounds[0]
+
+
+def _in_layer(node) -> bool:
+    """Whether scalar ``node`` can be computed inside a layer: a literal, a
+    scalar operand of the graph (a ``cond`` branch's), or arithmetic on
+    those.  A scalar read out of a tensor is not: the core reads only
+    scratchpad cells, and a layer run alone has no other layer's scalars."""
+    if not isinstance(node, Node):
+        return True
+    if isinstance(getattr(node, "value", None), torch.Tensor):
+        return False
+    if node.op == "placeholder":
+        return True
+    return node.op == "call_function" and all(
+        _in_layer(arg) for arg in node.all_input_nodes
+    )
+
+
+def _scalar_copy(node, before: Node, scope, copies: dict):
+    """``node`` recomputed just before ``before``, in its layer (``scope``):
+    scalar arithmetic is copied there with the arithmetic it reads, so a run
+    of that layer alone computes it.  A scalar read out of a tensor (an
+    ``_local_scalar_dense``), a tensor, a ``get_attr``, a placeholder or a
+    literal is read where it is: the core reads only scratchpad cells, so
+    such a read stays in the prelude the emitter evaluates."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return node
+    if any(
+        isinstance(getattr(arg, "value", None), torch.Tensor)
+        for arg in [node, *node.all_input_nodes]
+    ):
+        return node
+    if node not in copies:
+        args = [_scalar_copy(a, before, scope, copies) for a in node.args]
+        with before.graph.inserting_before(before):
+            copy = before.graph.call_function(node.target, tuple(args))
+        copy.meta = dict(node.meta)
+        if hasattr(node, "value"):
+            set_node_value(copy, node.value)
+        if scope is not None:
+            copy.meta["scope"] = scope
+            # Kept apart from the same scalar computed elsewhere.
+            copy.meta["layer_local"] = True
+        copies[node] = copy
+    return copies[node]
+
+
+def _names_of_buffer(gm: GraphModule, root: Node) -> list:
+    """Every name ``root``'s buffer has in ``gm``: each ``get_attr`` of the
+    same target, when it is one, and their views."""
+    roots = [root]
+    if root.op == "get_attr":
+        roots = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "get_attr" and n.target == root.target
+        ]
+    return [name for r in roots for name in _names_of(r)]
+
+
+def _fold_index_copy(gm: GraphModule, node: Node) -> None:
+    """Make ``index_copy_(dst, dim, index, src)`` store into ``dst``'s window
+    at ``index``'s positions, when they are one ascending run.
+
+    The window is a ``subview`` of ``dst``, strided where ``dst`` has
+    non-unit dims ahead of ``dim``.  ``src``'s producer stores into it, as
+    for ``copy_``, when its output alloc has the window's shape and dtype,
+    lives where ``dst`` does, and nothing reads ``dst``'s buffer under any
+    name between that producer's first store and the copy; otherwise
+    ``src`` is host-copied into the window.  A runtime start is a scalar the
+    graph computes, recomputed in the storing layer from the tensors it is
+    read from, so that layer run alone has it.
+    """
+    dst, dim, index, src = node.args
+    value = getattr(src, "value", None)
+    dst_value = getattr(dst, "value", None)
+    if not isinstance(value, torch.Tensor) or not isinstance(
+        dst_value, torch.Tensor
+    ):
+        return
+    rank = dst_value.dim()
+    dim = dim + rank if dim < 0 else dim
+    if value.dim() != rank or any(
+        value.shape[d] != dst_value.shape[d] for d in range(rank) if d != dim
+    ):
+        return
+    start = _run_start(gm, index, value.shape[dim])
+    # A runtime start the storing layer cannot compute stays a host copy.
+    if start is None or not _in_layer(start):
+        return
+
+    graph = gm.graph
+    order = {n: i for i, n in enumerate(graph.nodes)}
+    root = dst
+    while root.target is _SUBVIEW or is_nop(root):
+        root = root.args[0]
+    storage = _storage_of(src)
+    redirect = (
+        storage is not None
+        and _space(storage) == _space(root)
+        and tuple(storage.value.shape) == tuple(value.shape)
+        and value.dtype == dst_value.dtype
+    )
+    if redirect:
+        first_store = min(storage.users, key=order.__getitem__)
+        redirect = not any(
+            order[first_store] < order[user] < order[node]
+            for name in _names_of_buffer(gm, root)
+            for user in name.users
+        )
+    # The window stands in the layer that stores into it, just before its
+    # first store, and a runtime start is recomputed there.
+    anchor = first_store if redirect else node
+    scope = anchor.meta.get("scope")
+    start = _scalar_copy(start, anchor, scope, {})
+    # A ``get_attr`` belongs to no layer: one standing later moves to the top.
+    if dst.op == "get_attr" and order[dst] > order[anchor]:
+        head = next(n for n in graph.nodes if n.op != "placeholder")
+        if head is not dst:
+            head.prepend(dst)
+
+    offsets = [0] * rank
+    offsets[dim] = start
+    with graph.inserting_before(anchor):
+        window = graph.call_function(
+            _SUBVIEW, (dst, offsets, list(value.shape), [1] * rank)
+        )
+    set_node_value(window, value)
+    window.meta["dtype"] = dst.meta.get("dtype")
+    if scope is not None:
+        window.meta["scope"] = scope
+    if redirect:
+        _redirect(graph, storage, window, before=first_store)
+    else:
+        with graph.inserting_before(node):
+            clone = graph.call_function(_CLONE, (src,))
+            graph.call_function(_INSERT, (clone, window))
+        set_node_value(clone, value)
+        clone.meta["dtype"] = src.meta.get("dtype")
+    node.replace_all_uses_with(dst)
+    graph.erase_node(node)
+    # The views that named the result for the copy are unread now.
+    while redirect and src is not storage and is_nop(src) and not src.users:
         source = src.args[0]
         graph.erase_node(src)
         src = source

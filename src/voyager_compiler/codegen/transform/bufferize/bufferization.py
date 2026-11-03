@@ -499,9 +499,7 @@ def propagate_logical_dtypes(
             )
         elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            _thread_hop(
-                gm, node, operands, (node.args[1], node.args[2]), rules
-            )
+            _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
         elif t is _COMMIT:
             _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
         elif t is _WITH_SCRATCH:
@@ -640,8 +638,7 @@ def _nest_output_values(sub_gm) -> list:
     if not isinstance(outs, (tuple, list)):
         outs = [outs]
     return [
-        getattr(n, "value", None) if isinstance(n, Node) else None
-        for n in outs
+        getattr(n, "value", None) if isinstance(n, Node) else None for n in outs
     ]
 
 
@@ -1184,6 +1181,10 @@ def _dedup_regions(gm: GraphModule) -> None:
         if node.op != "call_function" or node.target in _DEDUP_SKIP:
             continue
         key = (node.target, tuple(node.args), frozenset(node.kwargs.items()))
+        # A scalar recomputed inside a layer, so that layer run alone has it
+        # (``view_lowering._scalar_copy``), merges only within that layer.
+        if node.meta.get("layer_local"):
+            key += (node.meta.get("scope"),)
         orig = seen.get(key)
         if orig is None:
             seen[key] = node
