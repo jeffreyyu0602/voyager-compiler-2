@@ -117,8 +117,8 @@ SCHEME_ARGS = {
         "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
         "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --tensor_layout nhwc "
-        "--gemm_layout xc,ck->xk --scratchpad_size 2097152 --num_banks 16 "
-        "--conv2d_im2col"
+        "--gemm_layout xc,ck->xk --scratchpad_size 2097152 "
+        "--scratchpad_banks 16 --conv2d_im2col"
     ),
     "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk",
     # Training schemes: the gradients (--error) are quantized too.  FP8 is
@@ -140,12 +140,16 @@ SCHEME_ARGS = {
 # The matrix search sizes its blocking against a scratchpad and a bank
 # count, and has no answer when they are unset.  Only MXNF4 names its own, so
 # every other scheme is given these -- the same pair MXNF4 asks for.
-DEFAULT_TILER_ARGS = {"--scratchpad_size": "2097152", "--num_banks": "16"}
+DEFAULT_TILER_ARGS = {
+    "--scratchpad_size": "2097152",
+    "--scratchpad_banks": "16",
+}
 
-# One activation element, bytes, per scheme.  Each command's --bank_width is
-# one input beat -- the PE array's column count times this -- which is the
-# word the store bus writes whole, so the memory planner both aligns to it
-# and reserves the tail slack a sub-word store beat overshoots by.
+# One activation element, bytes, per scheme.  Each command's
+# --scratchpad_word_bytes is one input beat -- the PE array's column count
+# times this -- which is the word the store bus writes whole, so the memory
+# planner both aligns to it and reserves the tail slack a sub-word store beat
+# overshoots by.
 SCHEME_INPUT_BYTES = {
     "E4M3": 1,
     "P8_1": 1,
@@ -388,10 +392,10 @@ def _build(command, run_dir):
     for flag, value in DEFAULT_TILER_ARGS.items():
         if flag not in argv:
             argv += [flag, value]
-    if "--bank_width" not in argv:
+    if "--scratchpad_word_bytes" not in argv:
         cols = int(command.unrolling.split(",")[1])
         width = int(cols * SCHEME_INPUT_BYTES[command.scheme])
-        argv += ["--bank_width", str(width)]
+        argv += ["--scratchpad_word_bytes", str(width)]
     argv += ["--model_output_dir", str(dest)]
     return label, dest, argv
 

@@ -164,7 +164,7 @@ def is_counter(node) -> bool:
 
 def _payload_bytes(node: Node, numel: int, config) -> int:
     """The allocated bytes of ``numel`` elements of ``node`` at its logical
-    (quantized) dtype, aligned to ``config.bank_width``.
+    (quantized) dtype, aligned to ``config.scratchpad_word_bytes``.
 
     A Scratchpad tensor also reserves the tail of its last vector beat, since
     the datapath stores in whole beats; the DMA writes DRAM byte-exact.
@@ -174,7 +174,7 @@ def _payload_bytes(node: Node, numel: int, config) -> int:
         lanes = config.vector_lanes
     else:
         lanes = None
-    return tensor_alloc_bytes(numel, dtype, config.bank_width, lanes)
+    return tensor_alloc_bytes(numel, dtype, config.scratchpad_word_bytes, lanes)
 
 
 def _slot_stride(node: Node, config) -> int:
@@ -685,7 +685,7 @@ def _plan_scratchpad(bufs: Dict[Node, _Buf], config) -> Tuple[int, int, int]:
         ``(bytes used including the reserved offset, blocks placed, bank
         groups)``.
     """
-    bank = config.bank_size
+    bank = config.scratchpad_bank_bytes
     groups: Dict[tuple, List[Node]] = {}
     if bank:
         for root, buf in bufs.items():

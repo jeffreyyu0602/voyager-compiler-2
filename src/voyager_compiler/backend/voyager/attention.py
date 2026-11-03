@@ -109,7 +109,7 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
 
     # The vector unit's passes, at the softmax's width (the output's): a lane
     # group per ``per_group`` cycles, by default the beats its bytes take.
-    lanes, bpc = config.vector_lanes, config.bytes_per_cycle
+    lanes, bpc = config.vector_lanes, config.dram_bytes_per_cycle
     read = math.ceil(lanes * node_dtype_bits(node) / 8 / bpc)
 
     def passes(count, elems, per_group=read):
@@ -149,7 +149,7 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
         # Every step starts a query block, so the sweep runs boundaries only.
         interior = boundary_step
 
-    lat = config.access_latency_cycles
+    lat = config.dram_latency_cycles
     # ``sweep_cycles`` reads the store off the front.
     out_bytes = operand_bytes(tiles[node], node)
     dmas = [(transfer_cost(tiles[node], out_bytes, lat, bpc), boundaries)]
@@ -289,7 +289,7 @@ class VoyagerAttention(OpModel):
             return tensor_alloc_bytes(
                 math.prod(shape),
                 acc_dtype,
-                config.bank_width,
+                config.scratchpad_word_bytes,
                 config.vector_lanes,
             )
 
@@ -311,7 +311,7 @@ class VoyagerAttention(OpModel):
             total += 2 * tensor_alloc_bytes(
                 tq * tkv,
                 torch.bool if self.bool_mask else acc_dtype,
-                config.bank_width,
+                config.scratchpad_word_bytes,
                 config.vector_lanes,
             )
         if residual is not None:

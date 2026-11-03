@@ -71,7 +71,7 @@ command compiles ResNet-18 with FP8 (E4M3) for a 16×16 PE array:
 python scripts/compile_model.py resnet18 \
     --activation fp8_e4m3 --weight fp8_e4m3 --bf16 \
     --tensor_layout nhwc --gemm_layout 'xc,ck->xk' --pe_array_size 16,16 \
-    --scratchpad_size 2097152 --num_banks 16 --bank_width 16 \
+    --scratchpad_size 2097152 --scratchpad_banks 16 --scratchpad_word_bytes 16 \
     --model_output_dir out/resnet18 --debug
 ```
 
@@ -126,7 +126,7 @@ every change:
 | MXNF4 | `--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --residual fp8_e4m3 --quantize_fc --conv2d_im2col --bf16` |
 
 All of them add `--tensor_layout nhwc --gemm_layout 'xc,ck->xk'
---scratchpad_size 2097152 --num_banks 16`. They also set `--bank_width` to the
+--scratchpad_size 2097152 --scratchpad_banks 16`. They also set `--scratchpad_word_bytes` to the
 PE array's column count times the activation width in bytes: one byte for the
 8-bit schemes, half a byte for MXNF4. To see every command in full, run
 `python test/run_ci.py --list`. For example, one Llama-3.1-8B decoder layer
@@ -137,7 +137,7 @@ python scripts/compile_model.py llama_prefill \
     --activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 \
     --weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 \
     --bf16 --tensor_layout nhwc --gemm_layout 'xc,ck->xk' --pe_array_size 64,64 \
-    --scratchpad_size 2097152 --num_banks 16 --bank_width 32 \
+    --scratchpad_size 2097152 --scratchpad_banks 16 --scratchpad_word_bytes 32 \
     --context_length 1024 --num_hidden_layers 1 \
     --quantize_attention_mask --remove_fp32_casts \
     --model_output_dir out/llama_prefill
@@ -213,7 +213,7 @@ config = vc.AcceleratorConfig(
     pe_array_size=(16, 16),
     scratchpad_size=2 * 1024 * 1024,
     num_banks=16,
-    bank_width=16,
+    scratchpad_word_bytes=16,
 )
 vc.transform(
     gm,
@@ -245,8 +245,8 @@ in place.
 `AcceleratorConfig` describes the target: a weight-stationary systolic array
 plus a vector unit, input, weight and accumulation buffers, a banked
 scratchpad, and DRAM. On the command line the same fields are flags:
-`--pe_array_size`, `--vector_unit_width`, `--scratchpad_size`, `--num_banks`,
-`--bank_width`, `--dram_bandwidth`, `--frequency`, and so on (see
+`--pe_array_size`, `--vector_unit_width`, `--scratchpad_size`, `--scratchpad_banks`,
+`--scratchpad_word_bytes`, `--dram_bandwidth`, `--frequency`, and so on (see
 `python scripts/compile_model.py --help`). The tile search needs
 `scratchpad_size` and `num_banks`. Double buffering is on by default; turn it
 off with `--no-double_buffered_l2`.

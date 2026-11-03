@@ -356,16 +356,17 @@ def add_compile_args(parser=None):
         "it. Must be a multiple of the bank size.",
     )
     parser.add_argument(
-        "--num_banks",
+        "--scratchpad_banks",
         type=int,
         default=None,
-        help="Number of banks in the accelerator.",
+        help="Number of scratchpad banks.",
     )
     parser.add_argument(
-        "--bank_width",
+        "--scratchpad_word_bytes",
         type=int,
         default=None,
-        help="Memory bank width (bytes) for memory planning.",
+        help="Bytes in one scratchpad bank word, which a bank moves per "
+        "cycle; allocations are aligned to it.",
     )
     parser.add_argument(
         "--double_buffered_l2",

@@ -20,7 +20,13 @@ class Backend:
         synchronizes: Whether ``compile()`` runs the sync pass, which wraps
             every dispatch in a ``commit`` and derives the unit-counter
             waits; off for a target whose own toolchain orders the work.
+        store_lag: Steps a pipelined GEMM / conv nest's stores trail its
+            compute (``PipelinedKernel``'s ``lag``).  At 1 a tile's store
+            overlaps the next tile's compute, and a split reduction with a
+            tail may rotate its partial sum over two scratch slots; at 0
+            each step stores its own tile from one scratch slot.
     """
 
     builders: tuple[BuilderRule, ...]
     synchronizes: bool = True
+    store_lag: int = 1

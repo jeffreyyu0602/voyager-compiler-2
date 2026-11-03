@@ -24,7 +24,6 @@ DEFAULT_WEIGHT_BUFFER_SIZE = 1024
 DEFAULT_ACCUM_BUFFER_SIZE = 1024
 DEFAULT_SCRATCHPAD_OFFSET = 0
 DEFAULT_DOUBLE_BUFFERED_L2 = True
-DEFAULT_ASYNC_PIPELINE = True
 DEFAULT_DRAM_SIZE_GB = 16.0
 DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
 DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
@@ -54,9 +53,9 @@ class AcceleratorConfig:
 
     # Compute
     pe_array_size: Tuple[int, int] = DEFAULT_PE_ARRAY_SIZE
-    vector_unit_width: Optional[int] = None  # None -> pe_array_size[1]
-    matrix_vector_unit_width: Optional[int] = None  # None -> pe_array_size[1]
-    accumulator_width: Optional[int] = None  # None -> vector_lanes
+    vector_lanes: Optional[int] = None  # None -> pe_array_size[1]
+    matrix_vector_lanes: Optional[int] = None  # None -> pe_array_size[1]
+    accumulator_lanes: Optional[int] = None
     frequency: float = DEFAULT_FREQUENCY_GHZ  # accelerator clock
     # L1 systolic buffers (# elements)
     input_buffer_size: Optional[int] = DEFAULT_INPUT_BUFFER_SIZE
@@ -66,10 +65,9 @@ class AcceleratorConfig:
     # L2 scratchpad
     scratchpad_size: Optional[int] = None
     scratchpad_offset: int = DEFAULT_SCRATCHPAD_OFFSET  # bytes at the base
-    num_banks: Optional[int] = None
-    bank_width: Optional[int] = None
+    scratchpad_banks: Optional[int] = None
+    scratchpad_word_bytes: Optional[int] = None
     double_buffered_l2: bool = DEFAULT_DOUBLE_BUFFERED_L2
-    async_pipeline: bool = DEFAULT_ASYNC_PIPELINE
     # L3 DRAM
     dram_size: Optional[float] = DEFAULT_DRAM_SIZE_GB
     dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
@@ -77,11 +75,23 @@ class AcceleratorConfig:
     dram_energy_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT  # pJ/bit
 
     def __post_init__(self):
-        """Reject a reservation the rest of the compiler could not honour.
+        """Fill the unit widths left unset, then reject a reservation the
+        rest of the compiler could not honour.
 
-        Inert at the default of 0, so a config that names no scratchpad at
-        all still constructs.
+        An unset vector or matrix-vector width is the PE array's columns
+        (left unset without a PE array), an unset accumulator width the
+        vector unit's.  The reservation check is inert at the default offset
+        of 0, so a config that names no scratchpad at all still constructs.
         """
+        # The config is frozen: the defaults are set once, here.
+        if self.pe_array_size is not None:
+            cols = self.pe_array_size[1]
+            if self.vector_lanes is None:
+                object.__setattr__(self, "vector_lanes", cols)
+            if self.matrix_vector_lanes is None:
+                object.__setattr__(self, "matrix_vector_lanes", cols)
+        if self.accumulator_lanes is None:
+            object.__setattr__(self, "accumulator_lanes", self.vector_lanes)
         if self.scratchpad_offset < 0:
             raise ValueError(
                 f"scratchpad_offset {self.scratchpad_offset} is negative"
@@ -99,7 +109,7 @@ class AcceleratorConfig:
             )
         # A reservation that split a bank would put the planner's bank-aligned
         # groups and the tile search's bank budget on different geometries.
-        bank = self.bank_size
+        bank = self.scratchpad_bank_bytes
         if bank is not None and self.scratchpad_offset % bank:
             raise ValueError(
                 f"scratchpad_offset {self.scratchpad_offset} is not a multiple "
@@ -107,39 +117,16 @@ class AcceleratorConfig:
             )
 
     @property
-    def vector_lanes(self) -> int:
-        """Vector-unit lane count: its own width, else the PE array columns."""
-        if self.vector_unit_width is not None:
-            return self.vector_unit_width
-        return self.pe_array_size[1]
-
-    @property
-    def matrix_vector_lanes(self) -> int:
-        """Matrix-vector unit width in elements: its own, else the PE array
-        columns."""
-        if self.matrix_vector_unit_width is not None:
-            return self.matrix_vector_unit_width
-        return self.pe_array_size[1]
-
-    @property
-    def accumulator_lanes(self) -> int:
-        """Channels one vector-unit fetch of a pool covers (the accelerator's
-        ACCUMULATOR_WIDTH): its own width, else the vector unit's lanes."""
-        if self.accumulator_width is not None:
-            return self.accumulator_width
-        return self.vector_lanes
-
-    @property
     def dram_energy_per_byte(self) -> float:
         """DRAM access energy in joules per byte, from the pJ/bit figure."""
         return self.dram_energy_per_bit * 8 * 1e-12
 
     @property
-    def bytes_per_cycle(self) -> float:
+    def dram_bytes_per_cycle(self) -> float:
         return self.dram_bandwidth / self.frequency
 
     @property
-    def access_latency_cycles(self) -> float:
+    def dram_latency_cycles(self) -> float:
         return self.dram_access_latency * self.frequency
 
     @property
@@ -148,10 +135,10 @@ class AcceleratorConfig:
         return 2 if self.double_buffered_l2 else 1
 
     @property
-    def bank_size(self) -> Optional[int]:
-        if self.num_banks is None:
+    def scratchpad_bank_bytes(self) -> Optional[int]:
+        if self.scratchpad_banks is None:
             return None
-        return self.scratchpad_size // self.num_banks
+        return self.scratchpad_size // self.scratchpad_banks
 
     @property
     def usable_scratchpad_size(self) -> Optional[int]:
@@ -161,16 +148,19 @@ class AcceleratorConfig:
         return self.scratchpad_size - self.scratchpad_offset
 
     @property
-    def usable_banks(self) -> Optional[int]:
+    def usable_scratchpad_banks(self) -> Optional[int]:
         """Banks above the reservation.
 
-        Counted off ``num_banks`` rather than divided out of the usable
-        bytes, so it is exactly ``num_banks`` at an offset of 0 even when the
-        banks do not divide the SRAM evenly.
+        Counted off ``scratchpad_banks`` rather than divided out of the
+        usable bytes, so it is exactly ``scratchpad_banks`` at an offset of 0
+        even when the banks do not divide the SRAM evenly.
         """
-        if self.num_banks is None or self.bank_size is None:
+        if self.scratchpad_banks is None or self.scratchpad_bank_bytes is None:
             return None
-        return self.num_banks - self.scratchpad_offset // self.bank_size
+        return (
+            self.scratchpad_banks
+            - self.scratchpad_offset // self.scratchpad_bank_bytes
+        )
 
     def runtime_model(self, accumulate_fp32):
         """The runtime model the tile search fits and prices this
@@ -202,9 +192,9 @@ class AcceleratorConfig:
         """Build the config from parsed CLI args (``add_compile_args``)."""
         return cls(
             pe_array_size=args.pe_array_size,
-            vector_unit_width=args.vector_unit_width,
-            matrix_vector_unit_width=args.matrix_vector_unit_width,
-            accumulator_width=args.accumulator_width,
+            vector_lanes=args.vector_unit_width,
+            matrix_vector_lanes=args.matrix_vector_unit_width,
+            accumulator_lanes=args.accumulator_width,
             frequency=args.frequency,
             input_buffer_size=args.input_buffer_size,
             weight_buffer_size=args.weight_buffer_size,
@@ -212,8 +202,8 @@ class AcceleratorConfig:
             double_buffered_accum_buffer=args.double_buffered_accum_buffer,
             scratchpad_size=args.scratchpad_size,
             scratchpad_offset=args.scratchpad_offset,
-            num_banks=args.num_banks,
-            bank_width=args.bank_width,
+            scratchpad_banks=args.scratchpad_banks,
+            scratchpad_word_bytes=args.scratchpad_word_bytes,
             double_buffered_l2=args.double_buffered_l2,
             dram_size=args.dram_size,
             dram_bandwidth=args.dram_bandwidth,

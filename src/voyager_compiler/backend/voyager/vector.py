@@ -258,7 +258,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
     puts it.  A switch costs the ``BANK_SWITCH_CYCLES`` round trip less the
     fetch's beats after its first, which the drain overlaps: 7 on Sphinx, as
     measured.  0 without banking."""
-    if not config.bank_size:
+    if not config.scratchpad_bank_bytes:
         return 0
     nhwc = anchor.target in NHWC_OP_VARIANTS.values()
     dims = NCHW_TO_NHWC if nhwc else None
@@ -277,9 +277,9 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
         (kernel, stride, dilation),
         chunk,
         bits,
-        config.bank_size,
+        config.scratchpad_bank_bytes,
     )
-    beat = max(1, round(config.bytes_per_cycle))
+    beat = max(1, round(config.dram_bytes_per_cycle))
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
     per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
     return per_switch * switches
@@ -386,7 +386,7 @@ def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
     rows over several banks, every chunk column crosses them again.  The
     tile buffer starts on a bank, where the planner puts it.  0 without
     banking."""
-    if not config.bank_size:
+    if not config.scratchpad_bank_bytes:
         return 0
     block = config.pe_array_size[0]
     row_bytes = reduction * weight_bits / 8
@@ -397,7 +397,7 @@ def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
             for r in range(k, min(k + block, rows)):
                 lo = r * row_bytes + c * chunk_bytes
                 ranges.append((lo, lo + chunk_bytes))
-    switches, _, _ = bank_walk(ranges, config.bank_size)
+    switches, _, _ = bank_walk(ranges, config.scratchpad_bank_bytes)
     return BANK_SWITCH_CYCLES * switches
 
 
@@ -409,7 +409,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     ``quantize_mx`` along another axis than the last, ``mx_scale_pass``; one
     for everything else) costs a lane group the greater of its read cycles,
     the bus beats its widest streamed operand is fetched in, and its write
-    cycles, at ``config.bytes_per_cycle``
+    cycles, at ``config.dram_bytes_per_cycle``
     per beat: a reduction pass writes one value per row, so it runs at the
     read rate, and a record that ends mid-beat is split by the bus, so a
     sub-byte output can take more write cycles than read cycles.  A
@@ -431,7 +431,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
-    bytes_per_cycle = config.bytes_per_cycle
+    bytes_per_cycle = config.dram_bytes_per_cycle
     beat = max(1, round(bytes_per_cycle))
     switch_cycles = 0
     cycles_per_group = 0.0
@@ -548,12 +548,12 @@ def vector_tile_latency(node, tiled_shapes, tiling, config):
     else:
         tile_ops = max(_tile_elems(out_shape), in_elems)
     lanes = config.vector_lanes
-    bpc = config.bytes_per_cycle
+    bpc = config.dram_bytes_per_cycle
     ideal = math.ceil(tile_ops / lanes)
     util = vector_op_utilization(node, config, ideal, tile)
     compute = math.ceil(ideal / util)
 
-    lat = config.access_latency_cycles
+    lat = config.dram_latency_cycles
     dmas, traffic = [], 0
     for n, shape, transfers in vector_transfers(node, tiled_shapes, tiling):
         n_bytes = operand_bytes(shape, n)
@@ -615,8 +615,8 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
         what an attention product charges for a step.
     """
     grid, moves = gemv_transfers(node, tiled_shapes, tiling)
-    lat = config.access_latency_cycles
-    bpc = config.bytes_per_cycle
+    lat = config.dram_latency_cycles
+    bpc = config.dram_bytes_per_cycle
     dmas, traffic = [], 0
     for n, shape, transfers in moves:
         # Bytes come off the loaded buffer (its packed dtype).
@@ -666,14 +666,16 @@ def tensor_bytes(node, shape, config):
     if isinstance(val, torch.Tensor):
         dtype = node.meta.get("dtype") or val.dtype
         return tensor_alloc_bytes(
-            math.prod(shape), dtype, config.bank_width, lanes
+            math.prod(shape), dtype, config.scratchpad_word_bytes, lanes
         )
 
     if isinstance(val, (tuple, list)):
         numel = [math.prod(s) for s in shape]
         dtypes = node.meta.get("dtype") or [None for _ in val]
         sizes = [
-            tensor_alloc_bytes(n, dt or t.dtype, config.bank_width, lanes)
+            tensor_alloc_bytes(
+                n, dt or t.dtype, config.scratchpad_word_bytes, lanes
+            )
             for t, n, dt in zip(val, numel, dtypes)
         ]
         return sum(sizes)
@@ -741,7 +743,7 @@ class VoyagerVector(OpModel):
             self._running_bytes = tensor_alloc_bytes(
                 1,
                 self.anchor.value.dtype,
-                self.config.bank_width,
+                self.config.scratchpad_word_bytes,
                 self.config.vector_lanes,
             )
 
@@ -774,17 +776,18 @@ class VoyagerVector(OpModel):
         scratch = self.scratch(shapes[self.node])
         sized = self._bank_groups(shapes, scratch)
         budget = config.usable_scratchpad_size // config.num_slots
-        if not config.bank_size:
+        if not config.scratchpad_bank_bytes:
             needed = sum(size for size, _ in sized)
             return Placement(scratch=scratch) if needed <= budget else None
-        target = config.usable_banks // config.num_slots
+        target = config.usable_scratchpad_banks // config.num_slots
         for tier in range(len(GEMV_BANK_GROUPS)):
             while len(sized) > max(1, target - tier):
                 sized.sort(key=lambda group: group[0])
                 (size0, members0), (size1, members1) = sized[0], sized[1]
                 sized = [(size0 + size1, members0 + members1)] + sized[2:]
             needed = sum(
-                math.ceil(size / config.bank_size) * config.bank_size
+                math.ceil(size / config.scratchpad_bank_bytes)
+                * config.scratchpad_bank_bytes
                 for size, _ in sized
             )
             if needed <= budget:
@@ -846,7 +849,10 @@ class VoyagerVector(OpModel):
         config = self.config
         reserved = sum(
             tensor_alloc_bytes(
-                math.prod(shape), dtype, config.bank_width, config.vector_lanes
+                math.prod(shape),
+                dtype,
+                config.scratchpad_word_bytes,
+                config.vector_lanes,
             )
             for _, shape, dtype, *_ in scratch
         )
@@ -959,7 +965,7 @@ class VoyagerGemv(VoyagerVector):
         return reserved + tensor_alloc_bytes(
             math.prod(out_tile),
             acc_dtype,
-            self.config.bank_width,
+            self.config.scratchpad_word_bytes,
             self.config.vector_lanes,
         )
 

@@ -46,8 +46,8 @@ FLAGS = (
     "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
     "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
     "--residual fp8_e4m3 --tensor_layout nhwc --gemm_layout xc,ck->xk "
-    "--scratchpad_size 2097152 --num_banks 16 --pe_array_size 64,64 "
-    "--remove_fp32_casts --bank_width 32"
+    "--scratchpad_size 2097152 --scratchpad_banks 16 --pe_array_size 64,64 "
+    "--remove_fp32_casts --scratchpad_word_bytes 32"
 )
 RESIDUAL = 128
 # (stage, prompt length, --residual_length): a KIVI cache with a 64-token

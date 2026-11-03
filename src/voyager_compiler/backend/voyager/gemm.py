@@ -1198,7 +1198,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
         # ``fit`` offers it beside one.  A sync nest keeps one region.
         consumes_csr = anchor.kwargs.get("A_data") is not None
         scratch_regions = 1
-        if config.async_pipeline and has_tail:
+        if config.backend().store_lag and has_tail:
             scratch_regions = 2
         outlier_pct, outlier_rate = outlier_stats(node)
         if isinstance(out_dtype, (list, tuple)):
@@ -1209,15 +1209,16 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             output_scale_width = 0
         input_width = node_dtype_bits(anchor.args[0])
         anchor_width = get_dtype_width(anchor.value.dtype)
-        # A scratchpad bank moves one store word per cycle, ``bank_width``
-        # bytes: a port the hardware fixes, not one that widens with the
-        # element.  So a row of elements wider than the port's lanes (int6
-        # attention operands on the 4-bit NF4 port) takes more than one beat.
-        # Without a bank width the port is one input row per cycle: the
+        # A scratchpad bank moves one store word per cycle,
+        # ``scratchpad_word_bytes`` bytes: a port the hardware fixes, not one
+        # that widens with the element.  So a row of elements wider than the
+        # port's lanes (int6 attention operands on the 4-bit NF4 port) takes
+        # more than one beat.  Without a word size the port is one input row
+        # per cycle: the
         # ``min(unroll)`` elements the array's narrow side consumes.
         sram_bandwidth = (
-            config.bank_width * 8
-            if config.bank_width
+            config.scratchpad_word_bytes * 8
+            if config.scratchpad_word_bytes
             else min(config.pe_array_size) * input_width
         )
         layer = matrix_layer(anchor)
@@ -1265,8 +1266,8 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             accum_dtype_width=32 if model.accumulate_fp32 else anchor_width,
             double_buffered_accum_buffer=config.double_buffered_accum_buffer,
             sram_bandwidth=sram_bandwidth,
-            dram_bandwidth=config.bytes_per_cycle,
-            dram_access_latency_cycles=config.access_latency_cycles,
+            dram_bandwidth=config.dram_bytes_per_cycle,
+            dram_access_latency_cycles=config.dram_latency_cycles,
             double_buffered_l2=config.double_buffered_l2,
             outlier_rate=outlier_rate,
             batch=gemm_batch(anchor),
@@ -1288,7 +1289,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
                 get_arg_value(anchor, 2, "bias", None), 0
             ),
             stride=(layer.hstd, layer.wstd),
-            bank_size=config.bank_size,
+            bank_size=config.scratchpad_bank_bytes,
             weight_transposed=weight_transforms(anchor.args[1])[1],
             space=model.matrix_space,
             key=key,
@@ -1300,7 +1301,7 @@ class VoyagerGemm(RuntimeCalculator, OpModel):
             scratch_regions=scratch_regions,
             accumulate_fp32=model.accumulate_fp32,
             num_slots=config.num_slots,
-            bank_width=config.bank_width,
+            bank_width=config.scratchpad_word_bytes,
             vector_lanes=config.vector_lanes,
             usable_scratchpad_size=config.usable_scratchpad_size,
             member_order=member_order,

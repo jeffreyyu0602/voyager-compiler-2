@@ -285,8 +285,8 @@ class SweepConfig:
         return AcceleratorConfig(
             pe_array_size=self.pe,
             scratchpad_size=self.scratchpad_size,
-            num_banks=self.num_banks,
-            bank_width=(
+            scratchpad_banks=self.num_banks,
+            scratchpad_word_bytes=(
                 self.bank_width
                 if self.bank_width is not None
                 else self.pe[1] * self.act_bits // 8

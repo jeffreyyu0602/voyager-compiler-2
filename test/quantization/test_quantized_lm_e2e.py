@@ -85,8 +85,8 @@ CONTEXT = 1024
 LANES = 64
 COMPILE_FLAGS = (
     "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk --scratchpad_size "
-    "2097152 --num_banks 16 --pe_array_size 64,64 --remove_fp32_casts "
-    "--bank_width 32"
+    "2097152 --scratchpad_banks 16 --pe_array_size 64,64 --remove_fp32_casts "
+    "--scratchpad_word_bytes 32"
 )
 # Prompts, in order, as (length, decode steps after it; 0 for up to the
 # cache's last slot): the usual 1024; a shorter prompt after it, then 192

@@ -38,9 +38,9 @@ def _matrix_space(config):
     conv is mapped onto, and its schedule hints.
 
     ``config.pe_array_size`` is ``(ic_dim, oc_dim)``.  The DRAM transfer
-    accounting is in absolute bytes (bandwidth as ``config.bytes_per_cycle``
-    is read when a tiling is priced), so it is not normalized by any element
-    width.
+    accounting is in absolute bytes (bandwidth as
+    ``config.dram_bytes_per_cycle`` is read when a tiling is priced), so it
+    is not normalized by any element width.
 
     The L0/L1 capacities are slot arrays: one fixed-width slot per element
     (the max dtype in a mixed-precision design; narrower dtypes are padded
@@ -83,7 +83,7 @@ def _matrix_space(config):
         mac_capacity=0,
         partition_mode=[0, 0, 0, 0],
         invalid_underutilized=False,
-        bank_size_list=[None, None, config.bank_size, None],
+        bank_size_list=[None, None, config.scratchpad_bank_bytes, None],
     )
 
     # L1 IC is outermost; the inner order is pinned to FY > FX > OY > OX.

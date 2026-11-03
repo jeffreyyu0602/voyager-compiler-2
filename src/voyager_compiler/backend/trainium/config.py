@@ -171,7 +171,9 @@ class TrainiumConfig(AcceleratorConfig):
         builders, and no sync pass (NKI orders the work by its
         dependences)."""
         return Backend(
-            (GEMM_RULE, ATTENTION_RULE, *SHARED_BUILDERS), synchronizes=False
+            (GEMM_RULE, ATTENTION_RULE, *SHARED_BUILDERS),
+            synchronizes=False,
+            store_lag=0,
         )
 
 
@@ -182,12 +184,11 @@ def _core(target, sbuf_bytes, dram_bandwidth):
     return TrainiumConfig(
         target=target,
         pe_array_size=(PARTITIONS, 128),
-        vector_unit_width=1,
+        vector_lanes=1,
         frequency=2.4,
         scratchpad_size=sbuf_bytes,
         scratchpad_offset=PARTITIONS * (STEP_PINNED_SBUF + HOISTED_SBUF),
         double_buffered_l2=True,
-        async_pipeline=False,
         dram_size=12.0,
         dram_bandwidth=dram_bandwidth,
         dram_access_latency=1300.0,

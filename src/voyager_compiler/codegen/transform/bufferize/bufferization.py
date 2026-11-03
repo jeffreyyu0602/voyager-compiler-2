@@ -71,7 +71,6 @@ from voyager_compiler.codegen.transform.tiling.csr_slice_planning import (
 from voyager_compiler.codegen.transform.tiling.matrix_search import (
     prefetch_tilings,
 )
-from voyager_compiler.hardware_config import DEFAULT_ASYNC_PIPELINE
 from voyager_compiler.shape_prop import set_node_value
 
 logger = logging.getLogger(__name__)
@@ -884,10 +883,10 @@ def bufferize_graph(
     model: GraphModule,
     pipelined: bool = False,
     tiler=None,
-    async_pipeline: bool = DEFAULT_ASYNC_PIPELINE,
     single_buffer_tail: bool = False,
     flash_attention_v3: bool = True,
     *,
+    store_lag: int,
     bool_mask: bool,
     builders: tuple[BuilderRule, ...] = SHARED_BUILDERS,
 ) -> GraphModule:
@@ -902,16 +901,15 @@ def bufferize_graph(
         pipelined: Emit software-pipelined (double-buffered) loop nests,
           reusing the tiler's decision that two L2 tiles fit.
         tiler: The ``Tiler`` supplying per-node tile factors.
-        async_pipeline: A pipelined GEMM (dense and sparse) / conv nest
-          stores each tile one step behind its compute (``lag`` 1,
-          prefetching ``num_slots - 2`` ahead), so two dispatches overlap;
-          off => ``lag`` 0, prefetching ``num_slots - 1`` ahead.  Ignored
-          unless ``pipelined``.
         single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
           post-op operands (SRAM saved vs. prefetch); off => double-buffered.
         flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
+        store_lag: Steps a pipelined GEMM (dense and sparse) / conv nest
+          stores each tile behind its compute (the backend's ``store_lag``):
+          1 overlaps two dispatches, prefetching ``num_slots - 2`` ahead; 0
+          prefetches ``num_slots - 1`` ahead.  Ignored unless ``pipelined``.
         bool_mask: Store an ``is_causal`` attention's mask table as int1 codes
           plus a scale, the way the eager path quantizes its mask; off => the
           additive fill at the accumulation dtype.
@@ -922,7 +920,7 @@ def bufferize_graph(
     ctx = BuildContext(
         tiler=tiler,
         num_slots=2 if pipelined else 1,
-        lag=1 if pipelined and async_pipeline else 0,
+        lag=store_lag if pipelined else 0,
         accumulate_fp32=tiler is not None and tiler.model.accumulate_fp32,
         single_buffer_tail=single_buffer_tail,
         flash_attention_v3=flash_attention_v3,

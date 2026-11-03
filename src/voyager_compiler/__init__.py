@@ -558,7 +558,7 @@ def compile(
         model,
         pipelined=config.double_buffered_l2,
         tiler=tiler,
-        async_pipeline=config.async_pipeline,
+        store_lag=backend.store_lag,
         bool_mask=bool_mask,
         builders=backend.builders,
     )
