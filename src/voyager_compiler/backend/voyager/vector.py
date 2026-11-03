@@ -279,7 +279,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
         bits,
         config.scratchpad_bank_bytes,
     )
-    beat = max(1, round(config.dram_bytes_per_cycle))
+    beat = max(1, round(config.scratchpad_bytes_per_cycle))
     fetch_beats = math.ceil(chunk * bits / 8 / beat)
     per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
     return per_switch * switches
@@ -409,7 +409,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     ``quantize_mx`` along another axis than the last, ``mx_scale_pass``; one
     for everything else) costs a lane group the greater of its read cycles,
     the bus beats its widest streamed operand is fetched in, and its write
-    cycles, at ``config.dram_bytes_per_cycle``
+    cycles, at ``config.scratchpad_bytes_per_cycle`` (one scratchpad bank port)
     per beat: a reduction pass writes one value per row, so it runs at the
     read rate, and a record that ends mid-beat is split by the bus, so a
     sub-byte output can take more write cycles than read cycles.  A
@@ -431,7 +431,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
-    bytes_per_cycle = config.dram_bytes_per_cycle
+    bytes_per_cycle = config.scratchpad_bytes_per_cycle
     beat = max(1, round(bytes_per_cycle))
     switch_cycles = 0
     cycles_per_group = 0.0

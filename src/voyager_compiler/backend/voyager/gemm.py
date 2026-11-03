@@ -916,11 +916,11 @@ class RuntimeCalculator:
 
         The busier of the unit's own rate -- one lane group per cycle, sized
         by the widest element the tail touches (the partial sum it reads, not
-        the narrower value a ``quantize_mx`` writes) at ``dram_bandwidth``,
-        which is what ``vector_op_utilization`` charges for the same tail in
-        the reporting model -- and the busiest bank: the accumulator read
-        back, the finished tile and its scales written, each tail operand
-        read, summed per bank as the placement lays them out.
+        the narrower value a ``quantize_mx`` writes) at ``sram_bandwidth``,
+        one bank port, which is what ``vector_op_utilization`` charges for the
+        same tail in the reporting model -- and the busiest bank: the
+        accumulator read back, the finished tile and its scales written, each
+        tail operand read, summed per bank as the placement lays them out.
         """
         blockings = mapping.loop_blockings
         output_size = 1
@@ -930,7 +930,7 @@ class RuntimeCalculator:
         widths = [self.output_dtype_width, self.accum_dtype_width]
         widths += [bits for _, bits in self.tail_specs]
         lane_bytes = max(widths) / 8 * oc_dim
-        lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
+        lanes = output_size * math.ceil(lane_bytes * 8 / self.sram_bandwidth)
         words = self._tail_words(mapping, 2)
         for role, cycles in self._tail_bank_switch_cycles(
             mapping, tiled=False

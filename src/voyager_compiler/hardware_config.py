@@ -130,6 +130,15 @@ class AcceleratorConfig:
         return self.dram_access_latency * self.frequency
 
     @property
+    def scratchpad_bytes_per_cycle(self) -> float:
+        """Bytes one scratchpad bank port moves per cycle: one
+        ``scratchpad_word_bytes`` word, or the DRAM rate for a config without
+        a word size."""
+        if self.scratchpad_word_bytes:
+            return self.scratchpad_word_bytes
+        return self.dram_bytes_per_cycle
+
+    @property
     def num_slots(self) -> int:
         """Banks one buffer occupies: two when it is ping-ponged, else one."""
         return 2 if self.double_buffered_l2 else 1

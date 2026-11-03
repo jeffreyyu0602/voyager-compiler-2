@@ -109,7 +109,7 @@ def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
 
     # The vector unit's passes, at the softmax's width (the output's): a lane
     # group per ``per_group`` cycles, by default the beats its bytes take.
-    lanes, bpc = config.vector_lanes, config.dram_bytes_per_cycle
+    lanes, bpc = config.vector_lanes, config.scratchpad_bytes_per_cycle
     read = math.ceil(lanes * node_dtype_bits(node) / 8 / bpc)
 
     def passes(count, elems, per_group=read):

@@ -119,7 +119,7 @@ def op_utilization(
 
     Everything else runs on the vector unit, charged by
     ``vector_op_utilization`` (shared with the vector L2-tiling cost model)
-    at ``cost.dram_bytes_per_cycle`` SRAM bandwidth -- including the
+    at ``cost.scratchpad_bytes_per_cycle`` SRAM bandwidth -- including the
     fully-connected case, which it sizes by the streamed weight and its bank
     switches over the anchor's shape, the tile once bufferized, and a pool,
     whose fetch it walks for bank switches over the anchor's input tile.
