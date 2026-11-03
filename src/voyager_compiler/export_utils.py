@@ -279,8 +279,9 @@ def create_getattr_from_value(
             stand-in, which a real run replaces by running ``producer``.
         producer: A graph over the module's own buffers that computes the
             real value; kept on the node as ``meta['producer']``.
-        copy: Register a copy of a tensor ``value``. False registers ``value``
-            itself (detached), sharing its storage.
+        copy: Register a copy of a tensor ``value``. False registers
+            ``value`` itself, the very object, or a detached view of it when
+            it requires grad, sharing its storage either way.
 
     Returns:
         The ``get_attr`` node referencing the new buffer.
@@ -291,11 +292,14 @@ def create_getattr_from_value(
         i += 1
         attr_name = f"{prefix}_{i}"
 
-    new_value = (
-        (value.clone() if copy else value).detach()
-        if isinstance(value, torch.Tensor)
-        else torch.tensor(value)
-    )
+    if not isinstance(value, torch.Tensor):
+        new_value = torch.tensor(value)
+    elif copy:
+        new_value = value.clone().detach()
+    elif value.requires_grad:
+        new_value = value.detach()
+    else:
+        new_value = value
     module.register_buffer(attr_name, new_value)
     node = graph.create_node("get_attr", attr_name)
     if producer is not None:

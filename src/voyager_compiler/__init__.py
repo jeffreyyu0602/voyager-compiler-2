@@ -87,6 +87,7 @@ from voyager_compiler.modeling import (
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
+    DEFAULT_WEIGHT_LAYOUT,
     GEMM_LAYOUTS,
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
@@ -302,6 +303,7 @@ def transform(
     keep_fp32=True,
     cache_formats=None,
     host_scalars=True,
+    weight_layout=None,
 ):
     """Lower ``model`` in place through the graph-level passes.
 
@@ -345,16 +347,30 @@ def transform(
             the Voyager program runs it.  False keeps it in device tensors,
             so a GPU step reads nothing back to the host and can replay as
             a CUDA graph.
+        weight_layout: How the linear weights are stored: ``"kc"`` [out, in]
+            or ``"ck"`` [in, out] (``normalize_gemm_weight_layout``).  None
+            takes the model's, ``meta["weight_layout"]`` as a
+            ``QuantizedModel`` sets it on each of its graphs, else
+            ``DEFAULT_WEIGHT_LAYOUT``.
 
     Returns:
         ``model``.
 
     Raises:
         ValueError: ``model`` writes a split cache's residual but no
-            ``cache_formats`` say how its chunks are stored.
+            ``cache_formats`` say how its chunks are stored, or
+            ``weight_layout`` contradicts the model's.
     """
     if example_kwargs is None:
         example_kwargs = {}
+
+    stored = model.meta.get("weight_layout")
+    if weight_layout is None:
+        weight_layout = stored or DEFAULT_WEIGHT_LAYOUT
+    elif stored is not None and stored != weight_layout:
+        raise ValueError(
+            f"the model stores its weights {stored!r}, not {weight_layout!r}"
+        )
 
     # A null config (no hardware) skips padding and tiling.
     if config is None:
@@ -403,7 +419,7 @@ def transform(
     assert gemv_layout in GEMV_LAYOUTS, gemv_layout
     gemm = GemmLayout.parse(gemm_layout)
     gemv_weight = GemmLayout.parse(gemv_layout).weight
-    normalize_gemm_weight_layout(model, gemm.weight, gemv_weight)
+    normalize_gemm_weight_layout(model, gemm.weight, gemv_weight, weight_layout)
     if gemm.activation == "cx":
         normalize_activation_layout(model)
 
@@ -457,7 +473,13 @@ def lower(lm: QuantizedLM, replay: bool = True) -> None:
                 lm.context_length, end, device=device
             ),
         }
-        transform(decode, (), step, host_scalars=False)
+        transform(
+            decode,
+            (),
+            step,
+            host_scalars=False,
+            weight_layout=lm.weight_layout,
+        )
         install_constants(decode)
         formats = decode.meta.get("cache_formats") or None
         lm.fold_step = move_folds_out(decode)
@@ -474,7 +496,13 @@ def lower(lm: QuantizedLM, replay: bool = True) -> None:
                     ),
                     "cache_position": torch.arange(length, device=device),
                 }
-                transform(graph, (), prompt, cache_formats=formats)
+                transform(
+                    graph,
+                    (),
+                    prompt,
+                    cache_formats=formats,
+                    weight_layout=lm.weight_layout,
+                )
                 install_constants(graph)
                 lowered[length] = graph
             return lowered[length]

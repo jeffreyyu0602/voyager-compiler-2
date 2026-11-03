@@ -12,6 +12,7 @@ from torchao.quantization.pt2e import FakeQuantizeBase
 from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 
 from voyager_compiler import gradient_program, split_kv_cache
+from voyager_compiler.ops.layout import DEFAULT_WEIGHT_LAYOUT
 from voyager_compiler.quantization.model import SEQ_BLOCK, _CACHE_BUFFER
 from voyager_compiler.quantization.fake_quantize import (
     _DerivedObserverOrFakeQuantize,
@@ -25,6 +26,7 @@ from voyager_compiler.quantization import (
 
 ACT = "fp8_e4m3,qs=per_tensor_symmetric"
 INT8 = "int8,qs=per_tensor_symmetric"
+MXINT8 = "int8,qs=microscaling,bs=32,pot=1,ax=-1"
 ERROR = "fp8_e5m2,qs=per_tensor_symmetric"
 VOCAB = 256
 CONTEXT_LENGTH = 128
@@ -544,3 +546,29 @@ def test_convert_bakes_the_inference_graphs():
     assert quantized.infer(x).shape == (4, 8)
     with pytest.raises(RuntimeError):
         quantized(x)
+
+
+def test_convert_shares_block_quantized_weights():
+    """Prefill and decode read one set of block-quantized weight buffers,
+    the very tensors, so a paired compile places each weight once."""
+    lm = QuantizedLM(
+        tiny_llama(),
+        quantizer(weight=MXINT8),
+        context_length=CONTEXT_LENGTH,
+        cache_len=CACHE_LEN,
+        phases=("prefill", "decode"),
+    )
+    lm.generate(torch.randint(0, VOCAB, (1, 70)), NEW_TOKENS)
+    lm.convert()
+    weights = {
+        phase: {
+            name: id(buffer)
+            for name, buffer in lm.graphs[phase].named_buffers()
+            if "_weight_" in name
+        }
+        for phase in ("prefill", "decode")
+    }
+    assert weights["prefill"]
+    assert set(weights["prefill"].values()) == set(weights["decode"].values())
+    for phase in ("prefill", "decode"):
+        assert lm.graphs[phase].meta["weight_layout"] == DEFAULT_WEIGHT_LAYOUT

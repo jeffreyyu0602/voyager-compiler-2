@@ -36,6 +36,10 @@ from transformers.integrations.executorch import (
 )
 
 from voyager_compiler.export_utils import export_model
+from voyager_compiler.ops.layout import (
+    DEFAULT_WEIGHT_LAYOUT,
+    GEMM_WEIGHT_LAYOUTS,
+)
 from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     freeze_cache_reads,
@@ -162,10 +166,15 @@ class QuantizedModel(nn.Module):
             it is prepared, for rewrites that must precede quantization;
             None for none.
         backward_override: As ``prepare_training`` takes.
+        weight_layout: How every program of the model stores the linear
+            weights: ``"kc"`` [out, in] or ``"ck"`` [in, out]; set on each
+            inference graph as ``meta["weight_layout"]``, which
+            ``transform`` reads.
 
     Raises:
         ValueError: ``phases`` names an unknown phase, or none, or one
-            whose example is missing.
+            whose example is missing, or ``weight_layout`` is neither
+            layout.
     """
 
     # Module path of the model within each inference graph.
@@ -184,6 +193,7 @@ class QuantizedModel(nn.Module):
         phases: Sequence[str] = PHASES,
         rewrite: Optional[Rewrite] = None,
         backward_override: str = DEFAULT_BACKWARD_OVERRIDE,
+        weight_layout: str = DEFAULT_WEIGHT_LAYOUT,
     ) -> None:
         super().__init__()
         _check_phases(phases, self.PHASES, training)
@@ -201,7 +211,13 @@ class QuantizedModel(nn.Module):
                 graph, "inference", quantizer, rewrite
             )
         self._capture(
-            model, graphs, quantizer, phases, training, backward_override
+            model,
+            graphs,
+            quantizer,
+            phases,
+            training,
+            backward_override,
+            weight_layout,
         )
 
     def _capture(
@@ -212,11 +228,21 @@ class QuantizedModel(nn.Module):
         phases: Sequence[str],
         training: Optional[Example],
         backward_override: str,
+        weight_layout: str,
     ) -> None:
         """Capture the training graphs of ``model`` if ``phases`` asks for
         them, share the fake-quants of the prepared inference ``graphs``
-        and the training graphs, and end in eval mode with every observer
-        still on."""
+        and the training graphs, mark each inference graph with the
+        ``weight_layout`` its weights are stored in, and end in eval mode
+        with every observer still on."""
+        if weight_layout not in GEMM_WEIGHT_LAYOUTS:
+            raise ValueError(
+                f"weight_layout {weight_layout!r} is not one of "
+                f"{GEMM_WEIGHT_LAYOUTS}"
+            )
+        self.weight_layout = weight_layout
+        for graph in graphs.values():
+            graph.meta["weight_layout"] = weight_layout
         self.converted = False
         self.model = model
         self.phases = tuple(phases)
@@ -534,10 +560,13 @@ class QuantizedLM(QuantizedModel):
             draft tokens of a speculative-decoding verification step, which
             ``generate`` and ``step`` do not drive.
         backward_override: As ``prepare_training`` takes.
+        weight_layout: As ``QuantizedModel`` takes; the prefill and decode
+            graphs store their weights alike.
 
     Raises:
         ValueError: ``phases`` names an unknown phase, or none, or the
-            training phase without its example.
+            training phase without its example, or ``weight_layout`` is
+            neither layout.
     """
 
     PREFIX = "model"
@@ -557,6 +586,7 @@ class QuantizedLM(QuantizedModel):
         rewrite: Optional[Rewrite] = None,
         decode_tokens: int = 1,
         backward_override: str = DEFAULT_BACKWARD_OVERRIDE,
+        weight_layout: str = DEFAULT_WEIGHT_LAYOUT,
     ) -> None:
         nn.Module.__init__(self)
         _check_phases(phases, self.PHASES, training)
@@ -664,7 +694,13 @@ class QuantizedLM(QuantizedModel):
         self.tokens = 0
         self.decode_seconds = 0.0
         self._capture(
-            model, graphs, quantizer, phases, training, backward_override
+            model,
+            graphs,
+            quantizer,
+            phases,
+            training,
+            backward_override,
+            weight_layout,
         )
 
     @property

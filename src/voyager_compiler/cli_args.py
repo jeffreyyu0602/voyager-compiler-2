@@ -21,7 +21,9 @@ from voyager_compiler.quantization import (
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_LAYOUT,
     DEFAULT_TENSOR_LAYOUT,
+    DEFAULT_WEIGHT_LAYOUT,
     GEMM_LAYOUTS,
+    GEMM_WEIGHT_LAYOUTS,
     GEMV_LAYOUTS,
     TENSOR_LAYOUTS,
 )
@@ -323,7 +325,7 @@ def add_layout_args(parser):
         default=DEFAULT_GEMM_LAYOUT,
         help="Matrix-matrix GEMM layout in einsum form, in C (contraction), "
         "K (output features) and X (tokens): xc,kc->xk is PyTorch's, "
-        "xc,ck->xk stores the weight [contraction, out], cx,ck->xk also "
+        "xc,ck->xk reads the weight [contraction, out], cx,ck->xk also "
         "stores the activations between GEMMs [features, tokens]. Quote "
         "it in a shell, e.g. --gemm_layout 'xc,ck->xk'.",
     )
@@ -333,6 +335,14 @@ def add_layout_args(parser):
         default=DEFAULT_GEMM_LAYOUT,
         help="Matrix-vector GEMM layout (a single activation row): "
         "xc,kc->xk or xc,ck->xk, quoted in a shell.",
+    )
+    parser.add_argument(
+        "--weight_layout",
+        choices=GEMM_WEIGHT_LAYOUTS,
+        default=DEFAULT_WEIGHT_LAYOUT,
+        help="How every program of the model stores the linear weights: kc "
+        "[out, in] or ck [in, out]. A GEMM whose layout reads the other one "
+        "loads the weight through a transpose.",
     )
 
 

@@ -6,6 +6,25 @@ latency, the numerics, and measured speed. Newest commit first. Only commits
 that changed something are listed. How entries are made: README.md,
 "Development workflow".
 
+## 8d0ffa7 → (2026-11-03)
+
+From the CI run of 2026-11-03 (`test/run_ci.py`, baseline e5c49a0; run
+folder `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/weight-layout/ci/2026-11-03_03-27-38`).
+The commits from fd6feef to 8d0ffa7 are not logged yet.
+
+### feat: store each weight once, in the model's layout (2026-11-03)
+
+- **model.txt, 19 of 34 configs** (the 10 llama_prefill and llama_cache
+  configs, bert, resnet18, resnet18_db, resnet50, vit and the 5
+  mobilebert_encoder configs): a GEMM weight is stored in the model's
+  layout (`[out, in]` by default) instead of a private transposed `_t` copy,
+  with its scales likewise, and the GEMM kernels reading it load each tile
+  transposed. Their allocs change shape and addresses move.
+- Predicted latency, DRAM traffic and peak DRAM and scratchpad: unchanged in
+  all 19. Numerics: all 34 configs keep their verdicts.
+- The new `llama_cache_kivi` command (the Voyager `llama_prefill_mp` +
+  `llama_decode_kivi` pair) is not in this run's comparison.
+
 ## 0a94c31 → fd6feef (2026-11-01, 6 commits)
 
 From the CI run of 2026-11-01 (`test/run_ci.py`, baseline 0a94c31; run

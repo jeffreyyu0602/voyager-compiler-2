@@ -392,6 +392,7 @@ def quantize_model(model, tokenizer, quantizer, args):
         rewrite=rewrite,
         decode_tokens=tokens,
         backward_override=args.backward_override,
+        weight_layout=args.weight_layout,
     )
 
 

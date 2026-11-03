@@ -23,6 +23,7 @@ def get_transform_args(args, fusion_patterns):
         "tensor_layout": args.tensor_layout,
         "gemm_layout": args.gemm_layout,
         "gemv_layout": args.gemv_layout,
+        "weight_layout": args.weight_layout,
         "fuse_reshape": not args.disable_reshape_fusion,
         "keep_fp32": not args.remove_fp32_casts,
     }

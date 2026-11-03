@@ -645,6 +645,58 @@ _GEMMS = (
 )
 
 
+def _weight_buffers(
+    model: GraphModule,
+    input_node: Node,
+    module: FakeQuantizeBase,
+    quantize: Callable[[], Tuple[torch.Tensor, ...]],
+) -> Tuple[Tuple[torch.Tensor, ...], bool]:
+    """The tensors a block-quantized weight is stored as, ``quantize()``.
+
+    A weight ``_plan_weights`` shared (``"bake"`` / ``"baked"``) is stored
+    once for every graph converted with it: the first graph to convert it
+    keeps its tensors in ``meta["weight_buffers"]``, keyed by the
+    parameter's memory and ``module``'s spec, and every later one reads
+    those very tensors.  Any other weight gets this graph's own.
+
+    Args:
+        model: The graph being converted.
+        input_node: The weight's ``get_attr``.
+        module: The fake-quant reading it.
+        quantize: Computes the stored tensors from the weight.
+
+    Returns:
+        ``(tensors, shared)``: the tensors, and whether other graphs hold
+        them too, so they must be registered as they are, not copied.
+
+    Raises:
+        RuntimeError: This graph's fake-quant now gives the weight another
+            value than it gave the graph that stored it.
+    """
+    action = model.meta.get("weight_plan", {}).get(input_node.target, "bake")
+    stored = model.meta.get("weight_buffers")
+    if stored is None or action not in ("bake", "baked"):
+        return quantize(), False
+    param = fetch_attr(model, input_node.target)
+    key = (
+        param.data_ptr(),
+        tuple(param.shape),
+        type(module).__qualname__,
+        str(module.dtype),
+        module.extra_repr(),
+    )
+    value = _weight_values(param, [module])[0]
+    if key not in stored:
+        stored[key] = (quantize(), value)
+    tensors, first = stored[key]
+    if not torch.equal(value, first):
+        raise RuntimeError(
+            f"{input_node.target} dequantizes differently here than in the "
+            "graph that stored it: a shared fake-quant changed in between"
+        )
+    return tensors, True
+
+
 def _replace_observer_with_quantize_mx_node_decomposed(
     model: torch.fx.GraphModule,
     node: Node,
@@ -754,33 +806,45 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         # quantize model parameter and remove the fq module
         param = fetch_attr(model, input_node.target)
 
-        global_scale = (
-            calculate_global_scale(
-                param.data,
-                activation_post_process.quant_max,
-                activation_post_process.scale_max,
+        def quantize():
+            global_scale = (
+                calculate_global_scale(
+                    param.data,
+                    activation_post_process.quant_max,
+                    activation_post_process.scale_max,
+                )
+                if uses_global_scale
+                else None
             )
-            if uses_global_scale
-            else None
-        )
+            scale, weight = torch.ops.quantized_ops.quantize_mx(
+                param.data,
+                qmap,
+                activation_post_process.ch_axis,
+                activation_post_process.block_size,
+                activation_post_process.quant_max,
+                activation_post_process.power_2_scale,
+                activation_post_process.scale_qmap,
+                global_scale=global_scale,
+            )
+            return weight, scale, global_scale
 
-        scale, weight = torch.ops.quantized_ops.quantize_mx(
-            param.data,
-            qmap,
-            activation_post_process.ch_axis,
-            activation_post_process.block_size,
-            activation_post_process.quant_max,
-            activation_post_process.power_2_scale,
-            activation_post_process.scale_qmap,
-            global_scale=global_scale,
+        (weight, scale, global_scale), shared = _weight_buffers(
+            model, input_node, activation_post_process, quantize
         )
-
         with graph.inserting_before(node):
             quantized_node = create_getattr_from_value(
-                model, graph, input_node.name + "_" + input_dtype, weight
+                model,
+                graph,
+                input_node.name + "_" + input_dtype,
+                weight,
+                copy=not shared,
             )
             scale_node = create_getattr_from_value(
-                model, graph, input_node.name + "_scale", scale
+                model,
+                graph,
+                input_node.name + "_scale",
+                scale,
+                copy=not shared,
             )
             if global_scale is not None:
                 global_scale_node = create_getattr_from_value(
@@ -788,6 +852,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     graph,
                     input_node.name + "_global_scale",
                     global_scale,
+                    copy=not shared,
                 )
     else:
         with graph.inserting_before(node):
@@ -1122,38 +1187,52 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
 
     if _is_weight(model, input_node):
         param = fetch_attr(model, input_node.target)
-        _, scale, zero_point = ops.group_wise_affine_fake_quant(
-            param.data,
-            list(activation_post_process.ch_axis),
-            activation_post_process.block_size,
-            activation_post_process.quant_min,
-            activation_post_process.quant_max,
-            activation_post_process.scale_qmap,
-        )
-        scale = scale.to(param.data.dtype)
-        zero_point = zero_point.to(param.data.dtype)
 
-        weight = torch.ops.quantized_ops.quantize(
-            param.data,
-            scale,
-            zero_point,
-            activation_post_process.ch_axis,
-            activation_post_process.block_size,
-            activation_post_process.qmap,
-        )
+        def quantize():
+            _, scale, zero_point = ops.group_wise_affine_fake_quant(
+                param.data,
+                list(activation_post_process.ch_axis),
+                activation_post_process.block_size,
+                activation_post_process.quant_min,
+                activation_post_process.quant_max,
+                activation_post_process.scale_qmap,
+            )
+            scale = scale.to(param.data.dtype)
+            zero_point = zero_point.to(param.data.dtype)
+            weight = torch.ops.quantized_ops.quantize(
+                param.data,
+                scale,
+                zero_point,
+                activation_post_process.ch_axis,
+                activation_post_process.block_size,
+                activation_post_process.qmap,
+            )
+            return weight, scale, zero_point
 
+        (weight, scale, zero_point), shared = _weight_buffers(
+            model, input_node, activation_post_process, quantize
+        )
         with graph.inserting_before(node):
             quantized_node = create_getattr_from_value(
                 model,
                 graph,
                 input_node.name + "_" + activation_post_process.dtype,
                 weight,
+                copy=not shared,
             )
             scale_node = create_getattr_from_value(
-                model, graph, input_node.name + "_scale", scale
+                model,
+                graph,
+                input_node.name + "_scale",
+                scale,
+                copy=not shared,
             )
             zero_point_node = create_getattr_from_value(
-                model, graph, input_node.name + "_zero_point", zero_point
+                model,
+                graph,
+                input_node.name + "_zero_point",
+                zero_point,
+                copy=not shared,
             )
     else:
         # An activation's blocks change every step, so the qparams are
@@ -1669,8 +1748,9 @@ def _plan_weights(
     gets ``mismatched_weights``: its graph's own quantized buffer
     (``"copy"``) or a quantize node run every forward (``"dynamic"``).  A
     ``get_attr`` absent from the plan is baked.  A block-quantized weight
-    (microscaling, group-wise affine) has no in-place form and gets its
-    graph's own buffers whatever the plan says.
+    (microscaling, group-wise affine) has no in-place form: a shared one is
+    stored once, in buffers every graph reads (``_weight_buffers``), a
+    ``"copy"`` one in each graph's own.
 
     Args:
         models: Prepared graph modules, which may share parameters.
@@ -1707,8 +1787,9 @@ def convert_pt2e(
     it.
 
     Several graphs exported from one model share its parameters, so they
-    are converted together: a parameter is quantized in place only when
-    every fake-quant reading it agrees and nothing else reads it (see
+    are converted together: a parameter is quantized once for all of them
+    -- in place, or into buffers every graph reads -- only when every
+    fake-quant reading it agrees and nothing else reads it (see
     ``_plan_weights``); otherwise ``mismatched_weights`` says whether each
     graph gets its own quantized copy or quantizes the weight at run time.
 
@@ -1741,9 +1822,14 @@ def convert_pt2e(
         fold_conv_bn_qat(graph_module)
         swap_matmul_inputs(graph_module)
     _plan_weights(models, mismatched_weights)
+    # The block-quantized weights the graphs share (``_weight_buffers``).
+    weight_buffers = {}
+    for graph_module in models:
+        graph_module.meta["weight_buffers"] = weight_buffers
     for graph_module in models:
         _convert_graph(graph_module, output_dtype, eliminate_no_effect)
         del graph_module.meta["weight_plan"]
+        del graph_module.meta["weight_buffers"]
     return model
 
 

@@ -2,6 +2,7 @@ import itertools
 import logging
 import math
 import operator
+import weakref
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
@@ -433,32 +434,50 @@ def find_upstream_transpose_or_param(
     return None
 
 
+def _transpose_op(arg: Node, model: GraphModule) -> Node:
+    """``arg`` read through a ``transpose(-2, -1)`` inserted after it, which
+    a GEMM reading it fuses into its load."""
+    with model.graph.inserting_after(arg):
+        transposed = model.graph.call_function(
+            torch.ops.aten.transpose.int, (arg, -2, -1)
+        )
+    transposed.meta["dtype"] = arg.meta.get("dtype")
+    propagate_shape(transposed, model)
+    return transposed
+
+
+def _read_transposed(arg: Node, model: GraphModule) -> Node:
+    """``arg`` transposed without a copy: a transpose of the last two dims is
+    undone, anything else goes through a transpose op."""
+    if swaps_last_two_dims(arg):
+        return arg.args[0]
+    return _transpose_op(arg, model)
+
+
 def _insert_transposed_input(arg: Node, model: GraphModule):
     """``arg`` transposed: a transpose of the last two dims is undone, a
     constant is transposed once, into a buffer of its own, and a computed
     tensor, or a buffer the graph writes (a KV cache, whose transposed copy
-    would go stale), goes through a transpose op."""
-    if swaps_last_two_dims(arg):
-        return arg.args[0]
+    would go stale), goes through a transpose op.  A linear's weight never
+    comes here (``_process_linear_node``)."""
+    if (
+        swaps_last_two_dims(arg)
+        or arg.op != "get_attr"
+        or arg.target in written_buffers(model.graph)
+    ):
+        return _read_transposed(arg, model)
+    value = fetch_attr(model, arg.target)
     with model.graph.inserting_after(arg):
-        if arg.op == "get_attr" and arg.target not in written_buffers(
-            model.graph
-        ):
-            value = fetch_attr(model, arg.target)
-            # A view of the weight, unless it shares a larger storage, which
-            # saving the view would write out whole.
-            transposed = create_getattr_from_value(
-                model,
-                model.graph,
-                arg.name + "_T",
-                value.mT,
-                derived_producer(arg, torch.ops.aten.transpose.int, -2, -1),
-                copy=value.untyped_storage().nbytes() != value.nbytes,
-            )
-        else:
-            transposed = model.graph.call_function(
-                torch.ops.aten.transpose.int, (arg, -2, -1)
-            )
+        # A view of the constant, unless it shares a larger storage, which
+        # saving the view would write out whole.
+        transposed = create_getattr_from_value(
+            model,
+            model.graph,
+            arg.name + "_T",
+            value.mT,
+            derived_producer(arg, torch.ops.aten.transpose.int, -2, -1),
+            copy=value.untyped_storage().nbytes() != value.nbytes,
+        )
     transposed.meta["dtype"] = arg.meta.get("dtype")
     propagate_shape(transposed, model)
     return transposed
@@ -663,18 +682,18 @@ def _set_gemm_layout(node: Node, **parts: str) -> None:
 
 
 def _process_linear_node(model: GraphModule, node: Node) -> None:
-    """Point a linear at a CK-stored copy of its KC-native weight and state
-    that in its ``layout``.  The caller decides which nodes to flip."""
+    """Point a linear at its weight transposed, read through a transpose that
+    fuses into the weight's load, and state the CK read in its ``layout``.
+    The weight's scales turn with it.  The caller decides which nodes to
+    flip."""
     logger.info(f"Transposing weight for linear node {node.name}")
 
     weight_node = node.args[1]
-    transposed = _insert_transposed_input(weight_node, model)
+    transposed = _read_transposed(weight_node, model)
     node.replace_input_with(weight_node, transposed)
 
     if (scale_node := node.kwargs.get("weight_scale")) is not None:
-        node.replace_input_with(
-            scale_node, _insert_transposed_input(scale_node, model)
-        )
+        node.replace_input_with(scale_node, _read_transposed(scale_node, model))
 
     # Mark mx / spmm_csr users as consuming a CK-stored weight.
     for user in list(transposed.users):
@@ -686,6 +705,42 @@ def _process_linear_node(model: GraphModule, node: Node) -> None:
     if node.target == torch.ops.aten.linear.default:
         node.target = torch.ops.quantized_ops.linear.default
         _set_gemm_layout(node, weight="ck")
+
+
+# The ``[in, out]`` copy ``_store_ck`` made of each ``[out, in]`` weight
+# tensor, by the source's ``id`` with a reference to it that tells a reused
+# ``id`` apart, so every program of a model storing one tensor stores one
+# copy.
+_CK_COPIES: Dict[int, Tuple[weakref.ref, torch.Tensor]] = {}
+
+
+def _store_ck(model: GraphModule, node: Node) -> None:
+    """Store constant ``node`` -- a linear's ``[out, in]`` weight or its block
+    scales -- ``[in, out]``, and read it back through a transpose, so every
+    user still sees ``[out, in]``.  The transposed tensor is made once per
+    source tensor (``_CK_COPIES``) and registered as it is, so the programs
+    of one model hold one object."""
+    value = fetch_attr(model, node.target)
+    source, transposed = _CK_COPIES.get(id(value), (None, None))
+    if source is None or source() is not value:
+        transposed = value.detach().mT.contiguous()
+        # The entry goes with its source.
+        forget = lambda _, key=id(value): _CK_COPIES.pop(key, None)
+        _CK_COPIES[id(value)] = (weakref.ref(value, forget), transposed)
+    with model.graph.inserting_after(node):
+        stored = create_getattr_from_value(
+            model,
+            model.graph,
+            node.target + "_ck",
+            transposed,
+            derived_producer(node, torch.ops.aten.transpose.int, -2, -1),
+            copy=False,
+        )
+    stored.meta["dtype"] = node.meta.get("dtype")
+    propagate_shape(stored, model)
+    read = _transpose_op(stored, model)
+    node.replace_all_uses_with(read)
+    model.graph.erase_node(node)
 
 
 def _process_matmul_node(
@@ -710,21 +765,45 @@ def normalize_gemm_weight_layout(
     model: GraphModule,
     gemm_weight: str,
     gemv_weight: str,
+    weight_layout: str,
 ) -> GraphModule:
-    """Normalize every GEMM right-operand (weight) to one layout per
-    operation class: matrix-matrix nodes to ``gemm_weight``, matrix-vector
-    (fully-connected / batch-1) nodes to ``gemv_weight``; each is ``"kc"``
-    ([out, contraction]) or ``"ck"`` ([contraction, out]).
+    """Store every linear weight as ``weight_layout`` says and read every
+    GEMM right operand (weight) in one layout per operation class:
+    matrix-matrix nodes ``gemm_weight``, matrix-vector (fully-connected /
+    batch-1) nodes ``gemv_weight``; each is ``"kc"`` ([out, contraction])
+    or ``"ck"`` ([contraction, out]).
 
-    ``aten.linear`` is KC-native and ``aten.matmul`` CK-native, so
-    exactly the nodes whose class targets the other layout have their
-    weight storage flipped, and say so in their ``layout`` argument: an
-    aten op is retargeted to the ``quantized_ops`` GEMM of its name, which
-    takes one.  Eager execution stays correct in every configuration with
-    no global patching.
+    A linear's constant weight and its scales are stored once, as
+    ``weight_layout`` (``_store_ck``); a linear reading the other layout
+    reads it through a transpose that fuses into its load, never a copy of
+    its own.  ``aten.linear`` is KC-native and ``aten.matmul`` CK-native, so
+    exactly the nodes whose class reads the other layout are flipped, and
+    say so in their ``layout`` argument: an aten op is retargeted to the
+    ``quantized_ops`` GEMM of its name, which takes one.  A matmul's
+    constant operand is not a model weight and still gets a transposed
+    copy.  Eager execution stays correct in every configuration with no
+    global patching.
     """
     assert gemm_weight in GEMM_WEIGHT_LAYOUTS, gemm_weight
     assert gemv_weight in GEMM_WEIGHT_LAYOUTS, gemv_weight
+    assert weight_layout in GEMM_WEIGHT_LAYOUTS, weight_layout
+
+    if weight_layout == "ck":
+        written = written_buffers(model.graph)
+        # In graph order, so the stored copies are named the same each run.
+        stored = {}
+        for node in model.graph.nodes:
+            if not is_linear(node):
+                continue
+            for operand in (node.args[1], node.kwargs.get("weight_scale")):
+                if (
+                    isinstance(operand, Node)
+                    and operand.op == "get_attr"
+                    and operand.target not in written
+                ):
+                    stored[operand] = None
+        for node in stored:
+            _store_ck(model, node)
 
     transposed_nodes = {}
 

@@ -52,6 +52,11 @@ GEMV_LAYOUTS = ("xc,kc->xk", "xc,ck->xk")
 DEFAULT_GEMM_LAYOUT = "xc,kc->xk"
 GEMM_ACTIVATION_LAYOUTS = ("xc", "cx")
 GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
+# How a model stores its linear weights in memory, one layout for every
+# program of the model: ``"kc"`` [out, in], as PyTorch holds them, or
+# ``"ck"`` [in, out].  A GEMM whose ``layout`` reads the other one loads the
+# weight through a transpose.
+DEFAULT_WEIGHT_LAYOUT = "kc"
 DEFAULT_GEMM_OUTPUT = "xk"
 GEMM_OUTPUT_LAYOUTS = (DEFAULT_GEMM_OUTPUT, "kx")
 # The layouts ``aten.linear`` and ``aten.matmul`` compute in: the default of

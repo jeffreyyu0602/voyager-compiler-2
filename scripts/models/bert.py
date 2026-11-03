@@ -68,6 +68,7 @@ def quantize_model(model, quantizer, calibration_data, args):
         Example((), batch),
         phases=("training",) if args.training else ("inference",),
         backward_override=args.backward_override,
+        weight_layout=args.weight_layout,
     )
 
 

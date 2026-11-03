@@ -266,12 +266,22 @@ COMMANDS = [
         "llama_cache_sdpa",
         _LLM_TAIL + _RESIDUAL + " --attn_implementation sdpa" + _BOOL_MASK,
     ),
+    # The Voyager test set's llama_prefill + llama_decode pair.
     Command(
         "llama_cache",
         "MXNF4",
         "64,64",
         "llama_cache_blocks",
         _LLM + _BOOL_MASK,
+    ),
+    # The Voyager test set's llama_prefill_mp + llama_decode_kivi pair: one
+    # qconfig, the decode's cache KIVI.
+    Command(
+        "llama_cache_kivi",
+        "MXNF4",
+        "64,64",
+        "llama_pair_mp",
+        _LLM_MP + _RESIDUAL + _BOOL_MASK,
     ),
     # -- BF16 (an unquantized KV cache stays whole) --
     Command("llama_decode", "BF16", "64,64", "llama_decode", _LLM),

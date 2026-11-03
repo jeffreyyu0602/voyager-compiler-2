@@ -24,6 +24,7 @@ from voyager_compiler.codegen.node_info import (
     is_gemm_op,
     is_nop,
     is_reshape_op,
+    swaps_last_two_dims,
 )
 from voyager_compiler.export_utils import create_getattr_from_value
 from voyager_compiler.shape_prop import (
@@ -195,12 +196,15 @@ def get_unique_node_name(node: Node):
     if (pos := OP_PARAM_ARG_INDEX.get(node.target)) is not None:
         # A norm without an affine has no weight to name it by.
         weight_node = get_arg_value(node, pos, "weight")
-        # There are cases where weights are sliced. Trace up to find the
-        # get_attr node and use the parameter name
-        while (
-            isinstance(weight_node, Node)
-            and weight_node.target == torch.ops.aten.slice.Tensor
-        ):
+        # There are cases where weights are sliced, or read through the
+        # transpose a weight's load fuses. Trace up to find the get_attr node
+        # and use the parameter name
+        while isinstance(weight_node, Node):
+            if not (
+                weight_node.target == torch.ops.aten.slice.Tensor
+                or swaps_last_two_dims(weight_node)
+            ):
+                break
             weight_node = weight_node.args[0]
 
         if isinstance(weight_node, Node) and weight_node.op == "get_attr":
