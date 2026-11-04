@@ -41,6 +41,7 @@ reporting workbook can turn a latency into an energy.
 """
 
 import logging
+import math
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -360,10 +361,20 @@ FORM_HEADERS = [
     "Launch cycles",
     "Power (W)",
 ]
-# Suggested run lengths, in periods: both past the fill, far enough apart
-# that the difference is a clean multiple of the period.
-_N1_PERIODS = 8
-_N2_PERIODS = 16
+# Suggested run lengths: N1 is past the first iteration's pipeline fill, and
+# N2 - N1 is the fewest whole periods spanning at least _MIN_SPAN iterations.
+_N1 = 1
+_MIN_SPAN = 8
+
+
+def suggested_runs(trip: int, period: int) -> Tuple[int, Optional[int]]:
+    """The iteration counts to simulate a kernel at, ``(N1, N2)``.
+
+    N2 stays below ``trip`` so the final drain is left out; a kernel with no
+    room above N1 runs whole, ``(trip, None)``, and is priced by T1 / trip.
+    """
+    n2 = min(_N1 + period * math.ceil(_MIN_SPAN / period), trip - 1)
+    return (trip, None) if n2 <= _N1 else (_N1, n2)
 
 
 def sheet_rows(rows) -> List:
@@ -435,19 +446,23 @@ def calibration_sheet(wb, rows, calibration=None, formats=None) -> int:
             r, _col("Analytic cyc/iter"), row.analytic_per_iteration
         )
         m = measured.get(row.group)
-        if m is not None and m.n1:
+        has_t1 = m is not None and bool(m.n1)
+        has_t2 = has_t1 and bool(m.n2)
+        n1, n2 = suggested_runs(row.trip_count, period)
+        if has_t1:
             ws.write_number(r, _col("N1"), m.n1, edit)
             ws.write_number(r, _col("T1"), m.t1, edit)
-            if m.n2:
-                ws.write_number(r, _col("N2"), m.n2, edit)
-                ws.write_number(r, _col("T2"), m.t2, edit)
-            else:
-                ws.write_number(r, _col("N2"), _N2_PERIODS * period)
-                ws.write_blank(r, _col("T2"), None, edit)
         else:
-            ws.write_number(r, _col("N1"), _N1_PERIODS * period)
+            ws.write_number(r, _col("N1"), n1)
             ws.write_blank(r, _col("T1"), None, edit)
-            ws.write_number(r, _col("N2"), _N2_PERIODS * period)
+        if has_t2:
+            ws.write_number(r, _col("N2"), m.n2, edit)
+            ws.write_number(r, _col("T2"), m.t2, edit)
+        elif n2 is not None:
+            ws.write_number(r, _col("N2"), n2)
+            ws.write_blank(r, _col("T2"), None, edit)
+        else:
+            ws.write_blank(r, _col("N2"), None, edit)
             ws.write_blank(r, _col("T2"), None, edit)
         if m is not None and m.power:
             ws.write_number(r, _col("Power (W)"), m.power, edit)
