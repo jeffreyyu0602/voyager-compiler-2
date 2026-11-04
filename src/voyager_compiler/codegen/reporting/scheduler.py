@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from voyager_compiler.codegen.reporting.cost import dram_cycles, op_info
+from voyager_compiler.codegen.reporting.dram import DmaPrice, DramPricer
 from voyager_compiler.codegen.reporting.model import (
     LoopSkip,
     LoopStats,
@@ -109,6 +110,14 @@ class ResourceState:
         self.spmm_free = 0
         self.vector_free = 0
         self.dram_free = 0
+        # --dram_sim: DRAMSim3 prices the DMAs, and their totals add up here.
+        self.dram = (
+            DramPricer(cost.dram_sim, cost.frequency) if cost.dram_sim else None
+        )
+        self.dram_energy_pj = 0.0
+        self.dram_standby_pj = 0.0
+        self.dram_requests = 0
+        self.dram_row_hits = 0
         self.cur_loop = -1  # id() of the while_loop currently being walked
         self.cur_kernel = ""  # the bufferized nest being walked
         self.kernel_groups: Dict[str, str] = {}
@@ -270,10 +279,21 @@ class ResourceState:
         self.counter_posts.setdefault(key, []).append(end)
 
     def _dram_event(
-        self, node, n_bytes: int, is_read: bool, category, path, sync: bool
+        self,
+        node,
+        n_bytes: int,
+        is_read: bool,
+        category,
+        path,
+        sync: bool,
+        price: Optional[DmaPrice],
     ) -> TimingRecord:
+        """One DMA on the DRAM lane, timed by ``price`` (DRAMSim3's, under
+        ``--dram_sim``) or else by ``dram_cycles``."""
         start = max(self.now, self.dram_free)
-        end = start + dram_cycles(n_bytes, self.cost)
+        if price is None:
+            price = DmaPrice(dram_cycles(n_bytes, self.cost), 0.0, 0.0, 0, 0)
+        end = start + price.cycles
         rec = TimingRecord(
             eid=self._eid(),
             node_name=node.name,
@@ -288,9 +308,16 @@ class ResourceState:
             is_read=is_read,
             category=category,
             sync=sync,
+            energy_pj=price.energy_pj,
+            requests=price.requests,
+            row_hits=price.row_hits,
         )
         self.records.append(rec)
         self.dram_free = end
+        self.dram_energy_pj += price.energy_pj
+        self.dram_standby_pj += price.standby_pj
+        self.dram_requests += price.requests
+        self.dram_row_hits += price.row_hits
         if sync:
             self.now = end
         if is_read:
@@ -307,12 +334,12 @@ class ResourceState:
         return rec
 
     def async_copy(
-        self, node, n_bytes: int, is_load: bool, key, path, category=""
+        self, node, n_bytes: int, is_load: bool, key, path, category, price
     ) -> TimingRecord:
         # A DMA occupies DRAM but does NOT advance the program clock: the
         # waits on its counter are what reconcile it.
         rec = self._dram_event(
-            node, n_bytes, is_load, category, path, sync=False
+            node, n_bytes, is_load, category, path, False, price
         )
         self.counter_posts.setdefault(key, []).append(rec.end)
         if self.trace is not None:
@@ -398,17 +425,20 @@ class ResourceState:
 
     def dram_copy(self, node, reads, write, path) -> TimingRecord:
         """A DRAM->DRAM materialization (``pad`` / ``expand`` / ``cat``): read
-        every input, then write the output.  Each ``(bytes, category)`` side is
-        sized from its own tensor, so a copy that reads a weight and writes an
-        activation lands in both buckets.
+        every input, then write the output.  Each ``(bytes, category, price)``
+        side is sized from its own tensor, so a copy that reads a weight and
+        writes an activation lands in both buckets; ``price`` is its DRAMSim3
+        price under ``--dram_sim``, else ``None``.
 
         It carries no counter, so nothing can wait on it and it cannot be
         overlapped -- it is synchronous and stalls the program clock.
         """
-        for n_bytes, category in reads:
-            self._dram_event(node, n_bytes, True, category, path, sync=True)
-        n_bytes, category = write
-        return self._dram_event(node, n_bytes, False, category, path, sync=True)
+        for n_bytes, category, price in reads:
+            self._dram_event(node, n_bytes, True, category, path, True, price)
+        n_bytes, category, price = write
+        return self._dram_event(
+            node, n_bytes, False, category, path, True, price
+        )
 
     def async_wait(self, node, key, threshold, path) -> TimingRecord:
         """The program clock blocks until counter ``key`` reaches
@@ -487,13 +517,18 @@ class ResourceState:
 
     def counters(self) -> Tuple[int, ...]:
         """The additive totals a skipped period multiplies: DRAM bytes by
-        direction and category."""
+        direction and category, then the DRAMSim3 energy, requests, row
+        hits and standby energy."""
         return (
             self.read_bytes,
             self.write_bytes,
             self.cat_bytes["weight"],
             self.cat_bytes["activation"],
             self.cat_bytes["kv"],
+            self.dram_energy_pj,
+            self.dram_requests,
+            self.dram_row_hits,
+            self.dram_standby_pj,
         )
 
     def add_counters(self, delta: Tuple[int, ...], times: int) -> None:
@@ -502,6 +537,10 @@ class ResourceState:
         self.cat_bytes["weight"] += delta[2] * times
         self.cat_bytes["activation"] += delta[3] * times
         self.cat_bytes["kv"] += delta[4] * times
+        self.dram_energy_pj += delta[5] * times
+        self.dram_requests += delta[6] * times
+        self.dram_row_hits += delta[7] * times
+        self.dram_standby_pj += delta[8] * times
 
     def snapshot(self) -> tuple:
         """Every timestamp the state holds, as nested tuples that compare by
@@ -578,7 +617,15 @@ class ResourceState:
                 self.cur_kernel,
             ),
             counts=(len(self.records), len(self.skips)),
-            bytes=(self.read_bytes, self.write_bytes, dict(self.cat_bytes)),
+            bytes=(
+                self.read_bytes,
+                self.write_bytes,
+                dict(self.cat_bytes),
+                self.dram_energy_pj,
+                self.dram_requests,
+                self.dram_row_hits,
+                self.dram_standby_pj,
+            ),
             loop_stats={k: copy.copy(v) for k, v in self.loop_stats.items()},
         )
 
@@ -610,6 +657,12 @@ class ResourceState:
         del self.skips[cp.counts[1] :]
         self.read_bytes, self.write_bytes = cp.bytes[0], cp.bytes[1]
         self.cat_bytes = dict(cp.bytes[2])
+        (
+            self.dram_energy_pj,
+            self.dram_requests,
+            self.dram_row_hits,
+            self.dram_standby_pj,
+        ) = cp.bytes[3:]
         for k in list(self.loop_stats):
             if k not in cp.loop_stats:
                 del self.loop_stats[k]

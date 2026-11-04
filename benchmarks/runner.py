@@ -36,6 +36,7 @@ one sweep per arm into its own ``--out`` gives the ablation across all axes:
 
 import argparse
 import os
+import re
 from collections import namedtuple
 from dataclasses import astuple
 
@@ -43,6 +44,8 @@ import common
 import latency_dram_chart as ldc
 import plot_model_size_scaling
 import plot_results_mpl
+
+from voyager_compiler.dram import DramSystem
 
 # -- axis definitions (moved from the individual sweep scripts) ---------------
 CONTEXT_LENGTHS = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -75,6 +78,8 @@ FAMILY_MODELS = [
 PE_ARRAYS = [(16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
 SRAM_EFFECTIVE_MB = [0.5, 1, 2, 4, 8, 16]
 BANDWIDTH_SCALES = [0.125, 0.25, 0.5, 1, 2, 4]
+# Under --dram-sim the bandwidth axis is the part's channel count instead.
+DRAM_CHANNELS = [1, 2, 4, 8, 16]
 
 MODES = ("prefill", "decode")
 
@@ -175,6 +180,9 @@ def build_points(args):
                     cfg,
                 )
             )
+    if args.dram_sim is not None:
+        pts += _channel_points(args)
+        return pts
     for scale in BANDWIDTH_SCALES:
         gbs = common.BASELINE_DRAM_BANDWIDTH_GBS * scale
         for mode in MODES:
@@ -195,9 +203,52 @@ def build_points(args):
     return pts
 
 
+def _channel_points(args):
+    """The bandwidth axis under ``--dram-sim``: the part at each of
+    ``DRAM_CHANNELS``, its ``.ini`` written to ``<out>/dram/``, with the tile
+    search told that part's peak bandwidth."""
+    with open(args.dram_sim) as f:
+        text = f.read()
+    if not re.search(r"^channels\s*=", text, re.MULTILINE):
+        raise ValueError(f"{args.dram_sim} does not set channels")
+    out_dir = os.path.join(args.out, "dram")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(args.dram_sim))[0]
+    pts = []
+    for channels in DRAM_CHANNELS:
+        path = os.path.join(out_dir, f"{stem}_{channels}ch.ini")
+        with open(path, "w") as f:
+            f.write(
+                re.sub(
+                    r"^channels\s*=.*$",
+                    f"channels = {channels}",
+                    text,
+                    flags=re.MULTILINE,
+                )
+            )
+        gbs = DramSystem(path).peak_gbps
+        for mode in MODES:
+            cfg = common.config_from_args(
+                args, mode=mode, dram_sim=path, dram_bandwidth_gbs=gbs
+            )
+            pts.append(
+                Point(
+                    "hardware",
+                    BASELINE_PREFIX,
+                    "bw",
+                    "DRAM Channels",
+                    f"{channels}ch",
+                    mode,
+                    cfg,
+                )
+            )
+    return pts
+
+
 def _metrics_dict(m):
-    """A Metrics -> the uniform field dict the metric sheet writes."""
-    return {
+    """A Metrics -> the uniform field dict the metric sheet writes, plus the
+    DRAMSim3 energy and the analytic formula's latency under --dram-sim."""
+    out = {
         "total_latency": m.total_latency,
         "dram_total": m.dram_total_bytes,
         "dram_read": m.dram_read_bytes,
@@ -209,6 +260,10 @@ def _metrics_dict(m):
         "num_layers": m.num_layers,
         "num_params": m.num_params,
     }
+    if m.dram_energy_pj:
+        out["dram_energy_mj"] = m.dram_energy_pj * 1e-9
+        out["analytic_latency"] = m.analytic_latency
+    return out
 
 
 def _metric_sheets(points, metric_by_key):
@@ -312,6 +367,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.dram_sim is not None:
+        # The tile search reads a GB/s figure: give it the part's peak.
+        args.dram_sim = os.path.abspath(args.dram_sim)
+        args.dram_bandwidth_gbs = DramSystem(args.dram_sim).peak_gbps
     selected = set(args.only) if args.only else {"baseline", *SHEET_ORDER}
 
     points = [p for p in build_points(args) if p.sheet in selected]

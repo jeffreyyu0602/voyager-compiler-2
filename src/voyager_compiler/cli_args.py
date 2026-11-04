@@ -433,6 +433,14 @@ def add_compile_args(parser=None):
         help="DRAM access energy (pJ/bit) for the reporting energy columns.",
     )
     parser.add_argument(
+        "--dram_sim",
+        default=None,
+        help="DRAMSim3 .ini (e.g. src/voyager_compiler/dram/configs/"
+        "DDR3_8Gb_x8_1866.ini): the reporting estimator prices each DMA "
+        "with DRAMSim3 instead of the DRAM bandwidth / latency / energy "
+        "figures. Build the simulator first with dram/build.sh.",
+    )
+    parser.add_argument(
         "--frequency",
         type=float,
         default=DEFAULT_FREQUENCY_GHZ,

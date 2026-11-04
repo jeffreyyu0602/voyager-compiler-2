@@ -68,6 +68,9 @@ METRIC_FIELDS = (
     "num_params",
 )
 HEADER = ("group", "point", "mode", *METRIC_FIELDS)
+# Columns a sweep under --dram-sim adds after METRIC_FIELDS (the charts move
+# right to make room).
+EXTRA_FIELDS = ("dram_energy_mj", "analytic_latency")
 POINT_COL = 2  # B: the config point (category axis)
 LATENCY_COL = 4  # D: total_latency (bars)
 DRAM_COL = 5  # E: dram_total (line)
@@ -484,7 +487,12 @@ def _write_metric_sheet(ws, sheet):
     """Lay out one sweep's data (grouped: per group, prefill block then decode
     block, a blank row between groups) and drop a prefill/decode chart pair per
     group to the right."""
-    ws.append(list(HEADER))
+    extras = [
+        f
+        for f in EXTRA_FIELDS
+        if any(f in r for group in sheet.groups for r in group.rows)
+    ]
+    ws.append(list(HEADER) + extras)
     # Explicit cursor: ws.max_row counts the last row *with data*, so it lags a
     # row right after a blank separator and would fold the blank into a range.
     row = 1
@@ -498,7 +506,7 @@ def _write_metric_sheet(ws, sheet):
             for r in mrows:
                 ws.append(
                     [r.get("group", ""), r["point"], mode]
-                    + [r.get(f) for f in METRIC_FIELDS]
+                    + [r.get(f) for f in METRIC_FIELDS + tuple(extras)]
                 )
                 row += 1
             end = row
@@ -513,12 +521,12 @@ def _write_metric_sheet(ws, sheet):
         lat = build_chart(
             ws, f"{head} Latency and DRAM Traffic vs. {axis}", start, end
         )
-        lat.anchor = _anchor(g, is_pre, base_col=14)
+        lat.anchor = _anchor(g, is_pre, base_col=14 + len(extras))
         ws.add_chart(lat)
         brk = build_dram_breakdown(
             ws, f"{head} DRAM Traffic Breakdown vs. {axis}", start, end
         )
-        brk.anchor = _anchor(g, is_pre, base_col=28)
+        brk.anchor = _anchor(g, is_pre, base_col=28 + len(extras))
         ws.add_chart(brk)
 
 

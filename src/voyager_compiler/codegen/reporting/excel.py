@@ -120,7 +120,38 @@ def _summary(wb, result: ScheduleResult, rows: List[KernelRow]):
         ("kernels_calibrated_per_op", len(per_op)),
         ("calibration_coverage", coverage(rows, result.total_latency)),
     ]
+    if result.dram is not None:
+        lines += _dram_summary(result)
     _table(wb, "Summary", ["Metric", "Value"], lines, {0: 24, 1: 16})
+
+
+def _dram_summary(result: ScheduleResult) -> list:
+    """The Summary lines DRAMSim3 adds under ``--dram_sim``: the part, its
+    peak and achieved bandwidth, row-hit rate, and the DRAM energy by part
+    (activate / read / write, refresh, standby) with its mean power."""
+    system = result.dram.system
+    freq = result.cost.frequency
+    moved = result.dram_read_bytes + result.dram_write_bytes
+    busy_ns = result.busy_dram / freq
+    energy = result.dram_run_energy_pj()
+    total = sum(energy.values())
+    makespan_ns = result.total_latency / freq
+    hits = (
+        result.dram_row_hits / result.dram_requests
+        if result.dram_requests
+        else 0.0
+    )
+    return [
+        ("dram_sim_config", system.config_file),
+        ("dram_peak_gbps", system.peak_gbps),
+        ("dram_achieved_gbps", moved / busy_ns if busy_ns else 0.0),
+        ("dram_row_hit_rate", hits),
+        ("dram_access_energy_mj", energy["access"] * 1e-9),
+        ("dram_refresh_energy_mj", energy["refresh"] * 1e-9),
+        ("dram_background_energy_mj", energy["background"] * 1e-9),
+        ("dram_energy_mj", total * 1e-9),
+        ("dram_power_w", total / makespan_ns * 1e-3 if makespan_ns else 0.0),
+    ]
 
 
 def _kernels(wb, rows: List[KernelRow]):
@@ -402,6 +433,9 @@ class OperationRow:
     bytes: int = 0
     ideal: float = 0.0
     power_cycles: float = 0.0  # sum of power * span, for the weighted mean
+    dram_energy_pj: float = 0.0  # DRAMSim3 activate / read / write
+    dram_requests: int = 0
+    dram_row_hits: int = 0
     first: int = 0
     groups: List[str] = field(default_factory=list)
 
@@ -493,6 +527,9 @@ def operation_rows(result, rows, agg, calibration=None) -> List[OperationRow]:
         entry.count += 1
         entry.cycles += row.span
         entry.bytes += n_bytes
+        entry.dram_energy_pj += row.dram_energy_pj
+        entry.dram_requests += row.dram_requests
+        entry.dram_row_hits += row.dram_row_hits
         entry.ideal += (
             st["ideal"] if (st["mma"] or st["vec"]) else n_bytes / bpc
         )
@@ -525,6 +562,9 @@ def totals(table: List[OperationRow], total_latency: int) -> OperationRow:
         out.bytes += row.bytes
         out.ideal += row.ideal
         out.power_cycles += row.power_cycles
+        out.dram_energy_pj += row.dram_energy_pj
+        out.dram_requests += row.dram_requests
+        out.dram_row_hits += row.dram_row_hits
     if total_latency:
         out.ideal = out.ideal / total_latency * out.cycles if out.cycles else 0
     return out
@@ -548,11 +588,19 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
     sheet's cell for the row's build group, so editing a measured watt there
     updates the energy here without recompiling.  Latency, traffic and
     utilization are values -- they come from the scheduler, not arithmetic a
-    spreadsheet could redo.
+    spreadsheet could redo.  Under ``--dram_sim`` the DRAM energy is a value
+    too: the row's DRAMSim3 activate / read / write energy plus refresh and
+    standby at their mean power over the row's latency, followed by the
+    row's DRAM power and row-hit rate.
     """
     table = operation_rows(result, rows, agg, calibration)
     freq = result.cost.frequency
     jpb = result.cost.dram_energy_per_byte
+    standby_pj_per_cycle = 0.0
+    if result.dram is not None and result.total_latency:
+        run = result.dram_run_energy_pj()
+        standby = run["refresh"] + run["background"]
+        standby_pj_per_cycle = standby / result.total_latency
     ws = wb.add_worksheet("Operation Summary")
     bold = wb.add_format({"bold": True, "align": "center", "border": 1})
     cell = wb.add_format({"border": 1})
@@ -575,11 +623,13 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
         "DRAM Energy (mJ)",
         "Energy (mJ)",
     ]
+    if result.dram is not None:
+        headers += ["DRAM Power (W)", "Row-hit rate"]
     for c, h in enumerate(headers):
         ws.write(0, c, h, bold)
     ws.set_column(0, 0, 30)
     ws.set_column(1, 1, 14)
-    ws.set_column(2, 9, 17)
+    ws.set_column(2, len(headers) - 1, 17)
     ws.freeze_panes(1, 0)
 
     # Where each build group's power lives on the Calibration sheet.
@@ -619,16 +669,32 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
             f2,
             row.compute_energy(freq) * 1e3,
         )
+        if result.dram is None:
+            ws.write_formula(
+                r,
+                8,
+                f"=E{one}*1000000*{jpb}*1000",
+                f2,
+                row.dram_energy(jpb) * 1e3,
+            )
+            ws.write_formula(
+                r, 9, f"=H{one}+I{one}", f2, row.energy(freq, jpb) * 1e3
+            )
+            continue
+        dram_pj = row.dram_energy_pj + standby_pj_per_cycle * row.cycles
+        ws.write_number(r, 8, dram_pj * 1e-9, f2)
         ws.write_formula(
             r,
-            8,
-            f"=E{one}*1000000*{jpb}*1000",
+            9,
+            f"=H{one}+I{one}",
             f2,
-            row.dram_energy(jpb) * 1e3,
+            row.compute_energy(freq) * 1e3 + dram_pj * 1e-9,
         )
-        ws.write_formula(
-            r, 9, f"=H{one}+I{one}", f2, row.energy(freq, jpb) * 1e3
-        )
+        # pJ per cycle at ``freq`` GHz is mW times freq.
+        power_w = dram_pj / row.cycles * freq * 1e-3 if row.cycles else 0.0
+        ws.write_number(r, 10, power_w, f3)
+        hits = row.dram_row_hits / row.dram_requests if row.dram_requests else 0
+        ws.write_number(r, 11, hits, f3)
     r = len(table) + 1
     one = r + 1
     tot = totals(table, result.total_latency)

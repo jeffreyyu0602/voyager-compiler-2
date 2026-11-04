@@ -38,7 +38,9 @@ class TimingRecord:
     the ``OpInfo`` a compute event was priced by.  ``sync`` marks a DRAM
     event the program clock waits on -- the whole-tensor materialization of
     a ``pad`` / ``permute`` / ``cat`` / ``expand``, which cannot overlap --
-    as against a tile ``async_copy``, which can.
+    as against a tile ``async_copy``, which can.  Under ``--dram_sim`` a DRAM
+    event also carries DRAMSim3's activate / read / write ``energy_pj`` and
+    its ``requests`` and ``row_hits``.
     """
 
     eid: int
@@ -55,6 +57,9 @@ class TimingRecord:
     category: str = ""
     op_key: str = ""
     sync: bool = False  # DRAM: a materialization that stalls the program clock
+    energy_pj: float = 0.0  # DRAM ops under --dram_sim
+    requests: int = 0  # DRAM ops under --dram_sim
+    row_hits: int = 0  # DRAM ops under --dram_sim
     ready: int = -1
     done: int = -1
     # A fused op's vector pass, derived from the matrix-class pass it rides.
@@ -150,7 +155,9 @@ class LoopSkip:
     periods of ``period`` iterations, each a time-shift by ``shift`` cycles
     of the ``template`` records (the last walked period), starting at
     iteration ``first_step`` and cycle ``start``.  ``bytes`` is one
-    period's DRAM traffic by counter (``read`` / ``write`` / a category).
+    period's DRAM traffic by counter (``read`` / ``write`` / a category);
+    ``energy_pj``, ``requests`` and ``row_hits`` are one period's DRAMSim3
+    totals under ``--dram_sim``.
     """
 
     loop_uid: int
@@ -163,6 +170,9 @@ class LoopSkip:
     shift: int
     start: int
     bytes: Dict[str, int] = field(default_factory=dict)
+    energy_pj: float = 0.0
+    requests: int = 0
+    row_hits: int = 0
 
     @property
     def iterations(self) -> int:
@@ -201,7 +211,10 @@ class ScheduleResult:
     runs between them, so the two together describe the whole schedule.
     ``busy_*`` are exact union lengths of the compute, DRAM and either
     lanes' busy intervals over the whole makespan.  ``kernel_groups``
-    maps each kernel to its ``calibration.KernelSignature``.
+    maps each kernel to its ``calibration.KernelSignature``.  Under
+    ``--dram_sim``, ``dram`` is the ``DramPricer`` that priced the DMAs and
+    ``dram_energy_pj`` / ``dram_standby_pj`` / ``dram_requests`` /
+    ``dram_row_hits`` their totals.
     """
 
     records: List[TimingRecord]
@@ -219,3 +232,19 @@ class ScheduleResult:
     busy_dram: int = 0
     busy_any: int = 0
     kernel_groups: Dict[str, object] = field(default_factory=dict)
+    dram: Optional[object] = None
+    dram_energy_pj: float = 0.0
+    dram_standby_pj: float = 0.0
+    dram_requests: int = 0
+    dram_row_hits: int = 0
+
+    def dram_run_energy_pj(self) -> Dict[str, float]:
+        """Under ``--dram_sim``: the DRAM energy by part -- activate /
+        read / write, refresh and standby -- over the makespan."""
+        out = {"access": self.dram_energy_pj}
+        out.update(
+            self.dram.run_energy_pj(
+                self.total_latency, self.busy_dram, self.dram_standby_pj
+            )
+        )
+        return out

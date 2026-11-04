@@ -265,6 +265,8 @@ class SweepConfig:
     frequency_ghz: float = BASELINE_FREQUENCY_GHZ
     dram_bandwidth_gbs: float = BASELINE_DRAM_BANDWIDTH_GBS
     dram_access_latency_ns: float = BASELINE_DRAM_ACCESS_LATENCY_NS
+    # A DRAMSim3 .ini: the estimator prices every DMA with it.
+    dram_sim: Optional[str] = None
 
     attn_implementation: str = "eager"
     pipelined: bool = True
@@ -301,6 +303,7 @@ class SweepConfig:
             dram_size=64.0,
             dram_bandwidth=self.dram_bandwidth_gbs,
             dram_access_latency=self.dram_access_latency_ns,
+            dram_sim=self.dram_sim,
             frequency=self.frequency_ghz,
         )
 
@@ -722,6 +725,10 @@ class Metrics:
     scratchpad_bytes: int
     num_layers: int
     num_params: int
+    # Under --dram-sim: DRAMSim3's DRAM energy (access + refresh + standby),
+    # and the analytic DRAM formula's latency for the same compiled graph.
+    dram_energy_pj: float = 0.0
+    analytic_latency: int = 0
     # Runtime breakdown (per-module only): a schedule's makespan split into
     # compute-bound / memory-bound / overlapped / stalled cycles.
     compute: int = 0
@@ -753,6 +760,8 @@ def _scale(m: "Metrics", count: int) -> "Metrics":
         dram_weight_bytes=m.dram_weight_bytes * count,
         dram_activation_bytes=m.dram_activation_bytes * count,
         dram_kv_bytes=m.dram_kv_bytes * count,
+        dram_energy_pj=m.dram_energy_pj * count,
+        analytic_latency=m.analytic_latency * count,
         compute=m.compute * count,
         memory=m.memory * count,
         overlap=m.overlap * count,
@@ -833,12 +842,9 @@ def _frontend(cfg: SweepConfig):
         gm, model, example_args, example_kwargs = build_prefill(cfg)
     # Only a cache stored quantized -- KIVI's, or one the attention matmuls
     # read in their MX format -- is split into chunks and a residual.
-    split = (
-        is_decode
-        and (
-            cfg.kv_bits != 16
-            or quantizes_kv_cache(gm, build_quantizer(cfg, split=False))
-        )
+    split = is_decode and (
+        cfg.kv_bits != 16
+        or quantizes_kv_cache(gm, build_quantizer(cfg, split=False))
     )
     if split:
         split_kv_cache(gm, cfg.group, cfg.kv_len)
@@ -948,6 +954,13 @@ def _dump_kernel_rows(cfg: SweepConfig, result) -> None:
         )
 
 
+def _dram_energy_pj(result) -> float:
+    """A schedule's DRAMSim3 DRAM energy, 0 without ``--dram-sim``."""
+    if result.dram is None:
+        return 0.0
+    return sum(result.dram_run_energy_pj().values())
+
+
 def run_design_point(cfg: SweepConfig) -> Metrics:
     """Compile ``cfg`` and return its ideal latency + DRAM traffic, priced by
     ``cfg.calibration`` when one is given."""
@@ -960,7 +973,17 @@ def run_design_point(cfg: SweepConfig) -> Metrics:
     )
     if cfg.calibration_rows_dir is not None:
         _dump_kernel_rows(cfg, r)
+    analytic = 0
+    if cfg.dram_sim is not None:
+        analytic = estimate_schedule(
+            gm,
+            replace(cfg.acc_config, dram_sim=None),
+            full_walk=cfg.full_walk,
+            calibration=_calibration(cfg.calibration),
+        ).total_latency
     return Metrics(
+        dram_energy_pj=_dram_energy_pj(r),
+        analytic_latency=analytic,
         total_latency=r.total_latency,
         dram_read_bytes=r.dram_read_bytes,
         dram_write_bytes=r.dram_write_bytes,
@@ -1004,6 +1027,8 @@ def run_design_point_fast(
             m1.dram_activation_bytes, m2.dram_activation_bytes
         ),
         dram_kv_bytes=extrap(m1.dram_kv_bytes, m2.dram_kv_bytes),
+        dram_energy_pj=extrap(m1.dram_energy_pj, m2.dram_energy_pj),
+        analytic_latency=extrap(m1.analytic_latency, m2.analytic_latency),
         scratchpad_bytes=m2.scratchpad_bytes,
         num_layers=n,
         num_params=extrap(m1.num_params, m2.num_params),
@@ -1263,6 +1288,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         write_excel_report(r, os.path.join(dump_dir, f"{node.name}.xlsx"))
         write_perfetto(r, os.path.join(dump_dir, f"{node.name}.perfetto.json"))
     return Metrics(
+        dram_energy_pj=_dram_energy_pj(r),
         total_latency=r.total_latency,
         dram_read_bytes=r.dram_read_bytes,
         dram_write_bytes=r.dram_write_bytes,

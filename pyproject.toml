@@ -47,7 +47,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 # Package data for voyager_compiler and all subpackages.
-"*" = ["*.txt", "*.json", "*.proto"]
+"*" = ["*.txt", "*.json", "*.proto", "*.ini"]
 
 [tool.black]
 line-length = 80

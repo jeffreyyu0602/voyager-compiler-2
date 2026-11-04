@@ -10,8 +10,10 @@ Physical units: ``dram_bandwidth`` is GB/s, ``dram_access_latency`` ns,
 ``frequency`` GHz, so bytes/cycle is ``dram_bandwidth / frequency`` and
 per-transfer latency in cycles is ``dram_access_latency * frequency``.
 ``dram_energy_per_bit`` is pJ/bit, which ``dram_energy_per_byte`` turns into
-J/B for the reporting energy columns.  The reporting model reads this object
-directly as its cost knobs.
+J/B for the reporting energy columns.  ``dram_sim`` names a DRAMSim3
+``.ini``; when set, the reporting estimator prices every DMA with DRAMSim3
+and ignores the three DRAM figures above (the tile search still reads them).
+The reporting model reads this object directly as its cost knobs.
 """
 
 from dataclasses import dataclass
@@ -73,6 +75,7 @@ class AcceleratorConfig:
     dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
     dram_access_latency: Optional[float] = DEFAULT_DRAM_ACCESS_LATENCY_NS
     dram_energy_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT  # pJ/bit
+    dram_sim: Optional[str] = None  # DRAMSim3 .ini for the reporting model
 
     def __post_init__(self):
         """Fill the unit widths left unset, then reject a reservation the
@@ -218,4 +221,5 @@ class AcceleratorConfig:
             dram_bandwidth=args.dram_bandwidth,
             dram_access_latency=args.dram_access_latency,
             dram_energy_per_bit=args.dram_energy_per_bit,
+            dram_sim=args.dram_sim,
         )

@@ -30,6 +30,9 @@ class KernelRow:
     end: int = 0
     read_bytes: int = 0
     write_bytes: int = 0
+    dram_energy_pj: float = 0.0  # DRAMSim3 activate / read / write
+    dram_requests: int = 0
+    dram_row_hits: int = 0
     trip_count: int = 0
     walked: int = 0
     skipped: int = 0
@@ -126,11 +129,17 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
             row.end = max(row.end, skip.end)
             row.read_bytes += skip.bytes.get("read", 0) * skip.repeats
             row.write_bytes += skip.bytes.get("write", 0) * skip.repeats
+            row.dram_energy_pj += skip.energy_pj * skip.repeats
+            row.dram_requests += skip.requests * skip.repeats
+            row.dram_row_hits += skip.row_hits * skip.repeats
         for r in recs:
             if r.is_read:
                 row.read_bytes += r.bytes
             elif r.bytes:
                 row.write_bytes += r.bytes
+            row.dram_energy_pj += r.energy_pj
+            row.dram_requests += r.requests
+            row.dram_row_hits += r.row_hits
         loops = loops_by_kernel.get(kernel, [])
         if loops:
             main = max(loops, key=lambda s: s.trip_count)

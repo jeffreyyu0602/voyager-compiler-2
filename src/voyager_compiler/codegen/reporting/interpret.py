@@ -292,6 +292,10 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
     overwrites, and one that scatters is sized by the tensor it scatters rather
     than by its output.  A one-element constant goes by value and owns no DRAM
     (``_passed_whole``), so it is not read.
+
+    Each side is ``(bytes, category, root)``: ``root`` is the DRAM buffer it
+    reads or writes (an in-place op's destination), which ``--dram_sim``
+    streams the bytes from, starting at its first byte.
     """
     src = _INPLACE_SRC.get(node.target)
     dest = node.args[0] if node.target in _INPLACE_SRC else None
@@ -315,9 +319,124 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
                 f"-- a Scratchpad source would be an async_copy"
             )
         n_bytes = min(tile_bytes(inp, _shape(inp)), out_bytes)
-        reads.append((n_bytes, _buf_category(inp, bind)))
-    write = (out_bytes, _buf_category(node, bind))
+        reads.append((n_bytes, _buf_category(inp, bind), root))
+    target = _root(dest, bind) if dest is not None else node
+    write = (out_bytes, _buf_category(node, bind), target)
     return reads, write
+
+
+# async_copy's argument names, in schema order (bufferize/ops.py).
+_ASYNC_COPY_ARGS = (
+    "src",
+    "dst",
+    "indices",
+    "sizes",
+    "counter",
+    "dims",
+    "strides",
+    "transposed",
+    "pad",
+    "pad_value",
+    "count",
+)
+
+
+def _priced_side(rs, side, is_write: bool):
+    """A ``_copy_traffic`` side ``(bytes, category, root)`` as the
+    ``(bytes, category, price)`` ``dram_copy`` takes."""
+    n_bytes, category, root = side
+    price = rs.dram.stream(root, n_bytes, is_write) if rs.dram else None
+    return n_bytes, category, price
+
+
+def _row_major(shape) -> List[int]:
+    return [math.prod(shape[d + 1 :]) for d in range(len(shape))]
+
+
+def _dram_view(node, bind: Dict[Node, Node], env):
+    """``(root, offset, strides)``: the DRAM buffer ``node`` views, where the
+    view starts (in the root's elements) and its stride along each of
+    ``node``'s dims, following ``_root``'s path.  A ``subview`` composes as
+    ``voyager.subview`` does; a reshape keeps a contiguous view contiguous,
+    and a non-contiguous one only adds or drops size-1 dims.
+
+    Raises:
+        NotImplementedError: On a reshape of a non-contiguous view.
+    """
+    while isinstance(node, Node) and node in bind:
+        node = bind[node]
+    is_view = node.op == "call_function" and (
+        node.target is _SUBVIEW
+        or is_nop(node)
+        or (
+            node.target is operator.getitem
+            and isinstance(_val(node), torch.Tensor)
+        )
+    )
+    shape = _shape(node)
+    if not is_view:
+        return node, 0, _row_major(shape)
+    root, offset, strides = _dram_view(node.args[0], bind, env)
+    if node.target is operator.getitem:
+        return root, offset, strides
+    if node.target is _SUBVIEW:
+        offsets, _sizes, steps = (
+            [int(_resolve(v, env)) for v in vs] for vs in node.args[1:4]
+        )
+        squeezed = node.args[4] if len(node.args) > 4 else ()
+        offset += sum(o * s for o, s in zip(offsets, strides))
+        kept = [d for d in range(len(steps)) if d not in squeezed]
+        return root, offset, [strides[d] * steps[d] for d in kept]
+    source = _shape(node.args[0])
+    big = [d for d, n in enumerate(source) if n != 1]
+    contiguous = _row_major(source)
+    if all(strides[d] == contiguous[d] for d in big):
+        return root, offset, _row_major(shape)
+    if [source[d] for d in big] != [n for n in shape if n != 1]:
+        raise NotImplementedError(
+            f"--dram_sim: {node.name} reshapes a non-contiguous DRAM view "
+            f"(source {node.args[0]} {source} at strides {strides} "
+            f"-> {shape})"
+        )
+    big_strides = iter(strides[d] for d in big)
+    return root, offset, [next(big_strides) if n != 1 else 0 for n in shape]
+
+
+def _dma_price(node: Node, is_load: bool, fill, env, ctx):
+    """DRAMSim3's price of ``async_copy`` ``node``: the block it moves out
+    of (``is_load``) or into its DRAM operand, offset, clipped by ``pad``
+    and cut to ``count`` as the op itself does."""
+    a = dict(zip(_ASYNC_COPY_ARGS, node.args))
+    a.update(node.kwargs)
+    operand = a["src"] if is_load else a["dst"]
+    root, view_offset, view_strides = _dram_view(operand, ctx.bind, env)
+    shape = _shape(operand)
+    sizes = [int(_resolve(s, env)) for s in a["sizes"]]
+    strides = [int(_resolve(s, env)) for s in (a.get("strides") or sizes)]
+    indices = [int(_resolve(i, env)) for i in a["indices"]]
+    dims = a.get("dims")
+    if dims is None:
+        offsets = [i * s for i, s in zip(indices, strides)]
+    else:
+        offsets = [0] * len(sizes)
+        for index, dim in zip(indices, dims):
+            offsets[dim] = index * strides[dim]
+    pad = a.get("pad")
+    if pad is not None:
+        if not is_load:
+            raise NotImplementedError(f"--dram_sim: padded store {node.name}")
+        lo = [max(0, min(o - p, e)) for o, p, e in zip(offsets, pad, shape)]
+        hi = [
+            max(0, min(o - p + z, e))
+            for o, p, z, e in zip(offsets, pad, sizes, shape)
+        ]
+        offsets, sizes = lo, [h - l for l, h in zip(lo, hi)]
+    elif a.get("count") is not None:
+        count = [int(_resolve(c, env)) for c in a["count"]]
+        sizes = [min(z, c) for z, c in zip(sizes, count)]
+    return ctx.rs.dram.block(
+        root, view_offset, view_strides, offsets, sizes, not is_load, fill
+    )
 
 
 def _counter_key(counter_arg, bind):
@@ -374,9 +493,13 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             if fill is not None:
                 n_bytes = math.ceil(n_bytes * fill)
             key = _counter_key(node.args[4], ctx.bind)
-            rs.async_copy(
-                node, n_bytes, is_load, key, path, _buf_category(buf, ctx.bind)
+            price = (
+                _dma_price(node, is_load, fill, env, ctx)
+                if rs.dram is not None
+                else None
             )
+            category = _buf_category(buf, ctx.bind)
+            rs.async_copy(node, n_bytes, is_load, key, path, category, price)
         elif t is _ASYNC_WAIT:
             key = _counter_key(node.args[0], ctx.bind)
             rs.async_wait(node, key, _resolve(node.args[1], env), path)
@@ -390,7 +513,8 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             rs.compute(node, path)
         elif _is_dram_copy(node):
             reads, write = _copy_traffic(node, ctx.bind)
-            rs.dram_copy(node, reads, write, path)
+            reads = [_priced_side(rs, side, False) for side in reads]
+            rs.dram_copy(node, reads, _priced_side(rs, write, True), path)
         elif _is_scratchpad_op(node, ctx.bind):
             rs.compute(node, path)
         elif _should_eval(node):
@@ -629,9 +753,12 @@ class _Fold:
                 bytes=dict(
                     zip(
                         ("read", "write", "weight", "activation", "kv"),
-                        plan.counters,
+                        plan.counters[:5],
                     )
                 ),
+                energy_pj=plan.counters[5],
+                requests=plan.counters[6],
+                row_hits=plan.counters[7],
             )
         )
         self.stats.skipped += plan.period * repeats
@@ -836,4 +963,9 @@ def estimate_schedule(
         busy_dram=busy_dram,
         busy_any=busy_any,
         kernel_groups=groups,
+        dram=rs.dram,
+        dram_energy_pj=rs.dram_energy_pj,
+        dram_standby_pj=rs.dram_standby_pj,
+        dram_requests=rs.dram_requests,
+        dram_row_hits=rs.dram_row_hits,
     )
