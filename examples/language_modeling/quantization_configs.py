@@ -5,6 +5,7 @@ import torch
 from torchao.quantization.pt2e.quantizer.utils import annotate_output_qspec
 
 from voyager_compiler import QuantizationSpec, QuantizationConfig
+from voyager_compiler.codegen.node_info import ancestors
 
 logger = logging.getLogger(__name__)
 
@@ -183,15 +184,18 @@ KIVI_RESIDUAL_LENGTH = 128
 # Entry width of a KIVI cache.  2 is KIVI's own setting; 4 buys accuracy
 # back at twice the cache traffic, with the group geometry unchanged.
 KIVI_CACHE_BITS = 2
+# Format of a KIVI group's scale and zero point.
+KIVI_CACHE_SCALE = "fp8_e4m3"
 
 
-def kivi_cache_spec(bits, role):
+def kivi_cache_spec(bits, role, scale=KIVI_CACHE_SCALE):
     """The dtype string for one KIVI cache tensor.
 
     Args:
         bits: Entry width of the stored cache.
         role: ``"key"``, grouped along the sequence (``ax=-2``), or
             ``"value"``, grouped along the head dim (``ax=-1``).
+        scale: Format of each group's scale and zero point.
 
     Returns:
         The spec string that quantizes that cache.
@@ -199,7 +203,7 @@ def kivi_cache_spec(bits, role):
     ax = -2 if role == "key" else -1
     return (
         f"uint{bits},bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,"
-        f"ax={ax},scale=fp8_e4m3"
+        f"ax={ax},scale={scale}"
     )
 
 
@@ -253,7 +257,7 @@ def set_kivi_attention_qconfig(quantizer):
     set_residual_attention_qconfig(quantizer)
 
 
-def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
+def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS, scale=KIVI_CACHE_SCALE):
     """Quantize the main KV caches of a split decode graph to KIVI's
     grouped-affine layout.
 
@@ -266,6 +270,8 @@ def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
         gm: Decode graph from ``convert_and_export_with_cache``, after
             ``split_kv_cache``; annotated in place.
         bits: Entry width of the stored cache.
+        scale: Format of each group's scale and zero point
+            (``kivi_cache_spec``).
 
     Returns:
         The number of caches annotated.
@@ -274,8 +280,10 @@ def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
         RuntimeError: A cache is still written directly, i.e. the graph was
             not split.
     """
-    key_qspec = QuantizationSpec.from_str(kivi_cache_spec(bits, "key"))
-    value_qspec = QuantizationSpec.from_str(kivi_cache_spec(bits, "value"))
+    key_qspec = QuantizationSpec.from_str(kivi_cache_spec(bits, "key", scale))
+    value_qspec = QuantizationSpec.from_str(
+        kivi_cache_spec(bits, "value", scale)
+    )
     count = 0
     for node in gm.graph.nodes:
         if node.op != "get_attr":
@@ -309,6 +317,44 @@ def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
         )
         count += 1
     return count
+
+
+def annotate_attention_mask(gm):
+    """Quantize the prefill's causal mask to int1 when it is a constant: the
+    ``where`` over the boolean mask that the attention scores' ``add``
+    reads, which ``convert_pt2e`` then folds into an int1 constant.  A mask
+    built at run time (the static-cache export's, from ``cache_position``)
+    stays unquantized, so no quantize of it runs in the graph.
+
+    Raises:
+        RuntimeError: No causal-mask ``where`` feeds an ``add`` and the
+            attention is not sdpa (which runs with no mask tensor to
+            quantize).
+    """
+    qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
+    wheres = [
+        n
+        for n in gm.graph.nodes
+        if n.target is torch.ops.aten.where.ScalarOther
+        and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
+    ]
+    if not wheres:
+        sdpa = any(
+            n.target is torch.ops.aten.scaled_dot_product_attention.default
+            for n in gm.graph.nodes
+        )
+        if not sdpa:
+            raise RuntimeError("no causal-mask where node feeds an add")
+        logger.info("no attention mask under sdpa")
+    masks = [
+        n
+        for n in wheres
+        if not any(a.op == "placeholder" for a in ancestors(n))
+    ]
+    if len(masks) < len(wheres):
+        logger.info("causal mask built at run time: left unquantized")
+    for mask in masks:
+        annotate_output_qspec(mask, qspec)
 
 
 def set_qconfig(quantizer, qconfigs):

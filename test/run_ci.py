@@ -119,6 +119,8 @@ SCHEME_ARGS = {
         "--residual fp8_e4m3 --quantize_fc --tensor_layout nhwc "
         "--gemm_layout xc,ck->xk --scratchpad_size 2097152 "
         "--scratchpad_banks 16 --conv2d_im2col"
+        # The Sphinx accelerator double-buffers its accumulation buffer.
+        " --double_buffered_accum_buffer"
     ),
     "BF16": "--bf16 --tensor_layout nhwc --gemm_layout xc,ck->xk",
     # Training schemes: the gradients (--error) are quantized too.  FP8 is
@@ -169,18 +171,17 @@ _LLM = (
     "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask "
     + _FP16
 )
+_LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
+_LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
 # MXNF4's vector unit reads a causal flash attention's mask table as int1.
 _BOOL_MASK = " --bool_mask"
-_LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
-# A prompt of 960 tokens leaves a 64-token tail past its 128-position chunks.
-_LLM_TAIL = _LLM.replace("--context_length 1024", "--context_length 960")
-_RESIDUAL = " --residual_length 128"
-_LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
-_DB = "--double_buffered_l2"
-_LLM_DB = _LLM + " " + _DB
-_LLM_SPMM_DB = _LLM_SPMM + " " + _DB
+# A KIVI cache: 2-bit chunks plus a 128-position full-precision residual.
+_KIVI = " --kv_cache kivi --residual_length 128"
+# The one graph of a causal LM each clm command compiles.
+_PREFILL = " --stage prefill"
+_DECODE = " --stage decode"
 _LLM_TRAIN = (
-    "--training --context_length 1024 --num_hidden_layers 1 "
+    "--stage training --context_length 1024 --num_hidden_layers 1 "
     "--accumulate_fp32 " + _FP16
 )
 
@@ -216,108 +217,43 @@ COMMANDS = [
     Command("mobilenet_v2", "MXINT8", "16,16"),
     # -- MXNF4 (llama) --
     Command(
-        "llama_prefill", "MXNF4", "64,64", "llama_prefill", _LLM + _BOOL_MASK
+        "clm", "MXNF4", "64,64", "llama_prefill", _LLM + _PREFILL + _BOOL_MASK
     ),
     Command(
-        "llama_prefill",
+        "clm",
         "MXNF4",
         "64,64",
         "llama_prefill_mp",
-        _LLM_MP + _BOOL_MASK,
+        _LLM_MP + _PREFILL + _BOOL_MASK,
     ),
     Command(
-        "llama_prefill",
+        "clm",
         "MXNF4",
         "64,64",
         "llama_prefill_spmm",
-        _LLM_SPMM + _BOOL_MASK,
+        _LLM_SPMM + _PREFILL + _BOOL_MASK,
     ),
     Command(
-        "llama_decode", "MXNF4", "64,64", "llama_decode", _LLM + _BOOL_MASK
+        "clm", "MXNF4", "64,64", "llama_decode", _LLM + _DECODE + _BOOL_MASK
     ),
     Command(
-        "llama_decode_kivi",
+        "clm",
         "MXNF4",
         "64,64",
         "llama_decode_kivi",
-        _LLM + _RESIDUAL + _BOOL_MASK,
-    ),
-    # -- the prefill that fills the decode's KV cache, compiled with it: a
-    # 128-position residual with a tail of 0 and of 64 tokens, the latter
-    # under flash attention too, and the split each cache's blocks ask for --
-    Command(
-        "llama_cache",
-        "MXNF4",
-        "64,64",
-        "llama_cache",
-        _LLM + _RESIDUAL + _BOOL_MASK,
-    ),
-    Command(
-        "llama_cache",
-        "MXNF4",
-        "64,64",
-        "llama_cache_tail",
-        _LLM_TAIL + _RESIDUAL + _BOOL_MASK,
-    ),
-    Command(
-        "llama_cache",
-        "MXNF4",
-        "64,64",
-        "llama_cache_sdpa",
-        _LLM_TAIL + _RESIDUAL + " --attn_implementation sdpa" + _BOOL_MASK,
-    ),
-    # The Voyager test set's llama_prefill + llama_decode pair.
-    Command(
-        "llama_cache",
-        "MXNF4",
-        "64,64",
-        "llama_cache_blocks",
-        _LLM + _BOOL_MASK,
-    ),
-    # The Voyager test set's llama_prefill_mp + llama_decode_kivi pair: one
-    # qconfig, the decode's cache KIVI.
-    Command(
-        "llama_cache_kivi",
-        "MXNF4",
-        "64,64",
-        "llama_pair_mp",
-        _LLM_MP + _RESIDUAL + _BOOL_MASK,
+        _LLM + _DECODE + _KIVI + _BOOL_MASK,
     ),
     # -- BF16 (an unquantized KV cache stays whole) --
-    Command("llama_decode", "BF16", "64,64", "llama_decode", _LLM),
+    Command("clm", "BF16", "64,64", "llama_decode", _LLM + _DECODE),
     # -- MXNF4 (vision / bert) --
     Command("resnet18", "MXNF4", "64,64"),
     Command("resnet50", "MXNF4", "64,64"),
     Command("vit", "MXNF4", "64,64", extra=_FP16),
     Command("bert", "MXNF4", "64,64"),
-    # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
-    # pipeline apart) --
-    Command("resnet18", "MXNF4", "64,64", "resnet18_db", _DB),
-    Command(
-        "llama_prefill",
-        "MXNF4",
-        "64,64",
-        "llama_prefill_db",
-        _LLM_DB + _BOOL_MASK,
-    ),
-    Command(
-        "llama_decode",
-        "MXNF4",
-        "64,64",
-        "llama_decode_db",
-        _LLM_DB + _BOOL_MASK,
-    ),
-    Command(
-        "llama_prefill",
-        "MXNF4",
-        "64,64",
-        "llama_prefill_spmm_db",
-        _LLM_SPMM_DB + _BOOL_MASK,
-    ),
     # -- training: one AdamW step, compiled into gradient/ and update/ --
-    Command("llama_prefill", "BF16", "64,64", "llama_train", _LLM_TRAIN),
-    Command("llama_prefill", "FP8", "64,64", "llama_train", _LLM_TRAIN),
-    Command("llama_prefill", "MXFP4", "64,64", "llama_train", _LLM_TRAIN),
+    Command("clm", "BF16", "64,64", "llama_train", _LLM_TRAIN),
+    Command("clm", "FP8", "64,64", "llama_train", _LLM_TRAIN),
+    Command("clm", "MXFP4", "64,64", "llama_train", _LLM_TRAIN),
 ]
 
 # Timestamp folder format; lexicographic sort == chronological sort.
@@ -326,8 +262,7 @@ TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
 RUN_DIR = "<run_dir>"
 # What the commands read, relative to the repo root: the package, the
 # driver and its loaders (under test/ at older commits), and the qconfig
-# table scripts/models/llama.py imports from the
-# language-modeling example.
+# table scripts/models/clm.py imports from the language-modeling example.
 SOURCES = (
     "src",
     "scripts",
@@ -798,7 +733,9 @@ def compile_one(version, label, dest, threads):
     argv[:2] = [sys.executable, str(codegen)]
     argv[argv.index("--model_output_dir") + 1] = str(dest)
     prints_report = "total_latency=" in codegen.read_text()
-    if prints_report and "--training" not in argv:
+    # A training step (--training, or clm's --stage training) takes none.
+    stage = argv[argv.index("--stage") + 1] if "--stage" in argv else None
+    if prints_report and "--training" not in argv and stage != "training":
         argv.append("--report")
 
     dest.mkdir(parents=True, exist_ok=True)

@@ -18,7 +18,7 @@ linears. The Voyager backend is untouched and imports nothing from here.
 
 | Stage | GPU | Note |
 |---|---|---|
-| Model loading, export and quantization (`llama.load_model`, `llama.quantize_model` from `scripts/models/llama.py`) | shared as is | run under `with torch.device(gpu):`, so the inputs it builds land on the GPU |
+| Model loading, export and quantization (`clm.load_model`, `clm.quantize_model` from `scripts/models/clm.py`) | shared as is | run under `with torch.device(gpu):`, so the inputs it builds land on the GPU |
 | Quantization specs, quantizer, `prepare_pt2e`, `convert_pt2e` | shared as is | |
 | `run_shared_passes`, `transform()`, `compile()` | not used | cuBLAS tiles each GEMM; PyTorch's allocator places memory |
 | FP8 GEMMs (`fp8.py`, `lower()`) | custom | |

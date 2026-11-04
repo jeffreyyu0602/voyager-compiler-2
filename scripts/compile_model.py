@@ -7,8 +7,8 @@ from torch.testing import assert_close
 from torch.utils._pytree import tree_flatten
 from torchvision import models
 from dataset import glue, imagenet
-from models import bert, llama, mobilebert, torchvision_models, vit
-from models.llama import QUANTIZATION_CONFIGS
+from models import bert, clm, mobilebert, torchvision_models, vit
+from models.clm import QUANTIZATION_CONFIGS
 from models.compile_steps import compile_training_step
 
 from voyager_compiler import (
@@ -162,12 +162,32 @@ def main():
         help="Context length for the LLM decoding.",
     )
     parser.add_argument(
-        "--spec_length",
+        "--stage",
+        default=None,
+        choices=clm.STAGES,
+        help=(
+            "The one graph of a causal LM (the clm model) to compile: the "
+            "prefill, the decode step, or a training step."
+        ),
+    )
+    parser.add_argument(
+        "--kv_cache",
+        default=None,
+        choices=["kivi"],
+        help=(
+            "Store a decode stage's KV cache in KIVI's 2-bit format "
+            "(requires --residual_length); by default it is stored as the "
+            "qconfig quantizes it."
+        ),
+    )
+    parser.add_argument(
+        "--decode_tokens",
         type=int,
         default=1,
         help=(
-            "Tokens a llama_verify step writes at once: the draft tokens a "
-            "speculative-decoding verification step checks."
+            "Positions a decode step writes at once; above one, a "
+            "speculative-decoding verification step over that many draft "
+            "tokens."
         ),
     )
     parser.add_argument(
@@ -251,12 +271,22 @@ def main():
     add_quantization_args(parser)
     add_compile_args(parser)
     args = parser.parse_args()
-    if args.training and args.model not in ("bert", "llama_prefill"):
-        parser.error("--training compiles bert or llama_prefill")
-    if args.training and args.report:
-        parser.error("--report takes one graph; --training compiles two")
-    if args.training and args.attn_implementation == "sdpa":
-        parser.error("--training has no fused attention backward: use eager")
+    if args.model == "clm":
+        if args.stage is None:
+            parser.error("clm compiles the --stage it is given")
+        if args.stage != "decode" and (
+            args.kv_cache is not None or args.decode_tokens != 1
+        ):
+            parser.error("--kv_cache and --decode_tokens set a decode stage")
+    elif args.stage is not None or args.kv_cache is not None:
+        parser.error("--stage and --kv_cache take the clm model")
+    if args.training and args.model != "bert":
+        parser.error("--training compiles bert; clm takes --stage training")
+    training = args.training or args.stage == "training"
+    if training and args.report:
+        parser.error("--report takes one graph; a training step compiles two")
+    if training and args.attn_implementation == "sdpa":
+        parser.error("training has no fused attention backward: use eager")
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -369,29 +399,19 @@ def main():
             if args.evaluate:
                 bert.evaluate_gm(gm, preprocessed_dataset)
 
-    elif args.model in (
-        "llama_prefill",
-        "llama_decode",
-        "llama_decode_kivi",
-        "llama_verify",
-        *llama.CACHE_STAGES,
-    ):
-        model, tokenizer = llama.load_model(args)
+    elif args.model == "clm":
+        model, tokenizer = clm.load_model(args)
 
-        if args.training:
-            lm = llama.quantize_model(model, tokenizer, quantizer, args)
+        if args.stage == "training":
+            lm = clm.quantize_model(model, tokenizer, quantizer, args)
             gm, old_output, new_output = compile_training_step(
                 lm,
-                llama.training_inputs(tokenizer, args),
+                clm.training_inputs(tokenizer, args),
                 FUSION_PATTERNS,
                 args,
             )
-        elif args.model in llama.CACHE_STAGES:
-            gm, old_output, new_output = llama.compile_cache_programs(
-                model, tokenizer, quantizer, FUSION_PATTERNS, args
-            )
         else:
-            gm, old_output, new_output = llama.quantize_and_dump_model(
+            gm, old_output, new_output = clm.quantize_and_dump_model(
                 model=model,
                 tokenizer=tokenizer,
                 quantizer=quantizer,

@@ -84,8 +84,8 @@ It writes:
 | `resnet18.svg` | The compute graph |
 | `tensor_files/` | Every tensor's values (only with `--dump_tensors`) |
 
-`--debug` re-runs the transformed graph (for the Llama steps and `--training`,
-the compiled one) and compares its output with the quantized model's
+`--debug` re-runs the transformed graph (for `clm` and `--training`, the
+compiled one) and compares its output with the quantized model's
 (`Results match (max deviation …)`). A mismatch prints a warning. Without the
 flag the check is skipped.
 
@@ -98,17 +98,18 @@ The driver's first argument picks the model:
 | any `torchvision.models` name (`resnet18`, `resnet50`, `mobilenet_v2`, …) | ImageNet CNNs |
 | `bert`, `mobilebert` | BERT-base and MobileBERT on GLUE (`--task_name`, default `sst2`) |
 | `vit` | ViT-B/16 (`google/vit-base-patch16-224`) |
-| `llama_prefill`, `llama_decode` | Llama-3.1-8B prefill and decode steps |
-| `llama_decode_kivi` | Llama decode with a KIVI 2-bit KV cache |
-| `llama_verify` | Llama speculative-decoding verification: one decode step over `--spec_length` draft tokens |
+| `clm` | A causal LM (default Llama-3.1-8B): the one stage `--stage` names, `prefill`, `decode` or `training` |
 
 `--model_name_or_path` loads a different checkpoint. `--num_hidden_layers N`
-compiles only the first `N` layers of BERT, MobileBERT or Llama.
-`--context_length` sets the Llama prompt length. A prefill step processes that
-many tokens, and a decode step starts with that many already in the KV cache.
+compiles only the first `N` layers of BERT, MobileBERT or a causal LM.
+`--context_length` sets the causal LM's prompt length. A prefill step processes
+that many tokens, and a decode step starts with that many already in the KV
+cache. A decode stage takes `--kv_cache kivi` for a KIVI 2-bit KV cache
+(with `--residual_length`), and `--decode_tokens N` for a speculative-decoding
+verification step over `N` draft tokens.
 
-`--training` (with `bert` or `llama_prefill`) compiles one full training step
-instead: a gradient program and an AdamW update program, written to
+`--stage training` (`clm`) and `--training` (`bert`) compile one full training
+step instead: a gradient program and an AdamW update program, written to
 `gradient/` and `update/` under the output directory. Quantized training also
 needs `--error` (the gradient spec).
 
@@ -133,7 +134,7 @@ PE array's column count times the activation width in bytes: one byte for the
 with MXNF4 on a 64×64 array:
 
 ```bash
-python scripts/compile_model.py llama_prefill \
+python scripts/compile_model.py clm --stage prefill \
     --activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 \
     --weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 \
     --bf16 --tensor_layout nhwc --gemm_layout 'xc,ck->xk' --pe_array_size 64,64 \

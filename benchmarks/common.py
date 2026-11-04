@@ -763,7 +763,7 @@ MASK_QSPEC = "int1,qs=per_tensor_symmetric,qmax=1"
 
 
 def _annotate_attention_mask(gm) -> int:
-    """Annotate prefill's causal mask int1, as ``scripts/models/llama.py``
+    """Annotate prefill's causal mask int1, as ``scripts/models/clm.py``
     does: the HF export builds the mask in-graph as a ``where`` that the
     attention scores' ``add`` reads, and ``convert_pt2e`` then leaves an int1
     constant plus its dequantize.  Returns how many masks were annotated;

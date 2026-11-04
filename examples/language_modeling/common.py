@@ -423,8 +423,8 @@ def quantize_generator(
     """Quantize ``model`` into a ``QuantizedLM`` with prefill and decode
     graphs, prepared and calibrating.
 
-    The graphs are quantized the way ``compile_model.py``'s ``llama_prefill``
-    / ``llama_decode_kivi`` paths quantize them, except that the softmax and
+    The graphs are quantized the way ``compile_model.py``'s ``clm`` prefill
+    and KIVI decode stages quantize them, except that the softmax and
     RMS norm stay unquantized.  The training graphs the class captures take
     the prefill's quantizer.
 

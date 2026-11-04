@@ -6,9 +6,9 @@ the prefill, then decode steps -- three ways, back to back on one KV cache:
 
 - **U**, the prepared (fake-quant) graphs;
 - **V**, the converted graphs (``convert``), or the frozen ones;
-- **W**, the compiled programs, built as the ``llama_cache`` stage builds
-  them: the decode once, then the prefill at each prompt length, storing
-  the prompt in the decode's cache format at the decode's DRAM addresses.
+- **W**, the compiled programs: the decode once, then the prefill at each
+  prompt length, storing the prompt in the decode's cache format at the
+  decode's DRAM addresses.
   Each program's Voyager ``model.txt`` is written under ``tmp_path``
   (``pytest --basetemp`` keeps them).
 
@@ -19,11 +19,11 @@ one with ``-k``.
 """
 
 import copy
+import math
 import os
 import shlex
 import sys
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -36,23 +36,19 @@ from transformers import (
     LlamaForCausalLM,
 )
 
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts"
-    ),
-)
+_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+sys.path.insert(0, os.path.join(_REPO, "scripts"))
+sys.path.append(os.path.join(_REPO, "examples", "language_modeling"))
 from compile_model import FUSION_PATTERNS  # noqa: E402
-from models import llama  # noqa: E402
 from models.compile_steps import (  # noqa: E402
     get_compile_args,
     get_transform_args,
     single_cpu_thread,
 )
 
-# ``models.llama`` puts examples/language_modeling on the path.
 from common import quantize_generator  # noqa: E402
 from quantization_configs import (  # noqa: E402
+    annotate_attention_mask,
     annotate_kivi_cache,
     set_kivi_attention_qconfig,
     set_residual_attention_qconfig,
@@ -81,6 +77,8 @@ pytestmark = pytest.mark.slow
 VOCAB = 256
 HIDDEN = 256
 CONTEXT = 1024
+# Generation slots the KV cache holds beyond the context.
+DECODE_MAX_GEN = 128
 # The vector lanes, which a residual is a multiple of.
 LANES = 64
 COMPILE_FLAGS = (
@@ -256,7 +254,8 @@ def quantizer(scheme: str, phase: str):
 
 
 def build(case: Case, phases=ALL_PHASES, model=None):
-    """Build ``case`` as ``llama.quantize_model`` does.
+    """Build ``case``'s ``QuantizedLM``, quantized as Voyager's causal-LM
+    stages are.
 
     Under a residual length, a decode cache the attention reads quantized
     is split before quantization (``split_kv_cache``) and the prefill's
@@ -293,7 +292,7 @@ def build(case: Case, phases=ALL_PHASES, model=None):
         if case.merge_linears and phase != "training":
             merge_sibling_linears(gm)
         if case.quantize_mask and phase == "prefill":
-            llama._annotate_attention_mask(gm)
+            annotate_attention_mask(gm)
         if phase == "prefill" and split["done"]:
             split_kv_cache(gm, case.residual, 0)
         if phase != "decode":
@@ -315,17 +314,15 @@ def build(case: Case, phases=ALL_PHASES, model=None):
     extra = {}
     if case.backward_override is not None:
         extra["backward_override"] = case.backward_override
-    cache_args = SimpleNamespace(
-        residual_length=case.residual, context_length=CONTEXT
-    )
+    # The context plus the generation slots, in whole lane blocks and
+    # residual chunks.
+    block = math.lcm(LANES, case.residual or 1)
     lm = QuantizedLM(
         model,
         quantizers,
         Example((), {"input_ids": ids, "labels": ids}),
         context_length=CONTEXT,
-        cache_len=llama.max_cache_len(
-            cache_args, SimpleNamespace(vector_lanes=LANES)
-        ),
+        cache_len=-(-(CONTEXT + DECODE_MAX_GEN) // block) * block,
         phases=phases,
         logits_to_keep=case.logits_to_keep,
         rewrite=rewrite,
@@ -444,7 +441,7 @@ def compile_settings(case: Case, out_dir):
         shlex.split(flags)
     )
     vars(args).update(
-        model="llama_cache", model_output_dir=str(out_dir), dump_tensors=False
+        model="tiny_llama", model_output_dir=str(out_dir), dump_tensors=False
     )
     compile_args = get_compile_args(args)
     compile_args.pop("output_dir")
@@ -453,10 +450,9 @@ def compile_settings(case: Case, out_dir):
 
 
 def compile_programs(lm, case: Case, out_dir, lengths, decode_tokens=1):
-    """Compile the decode, then a prefill per prompt length, as the
-    ``llama_cache`` stage does: each prefill holds the decode's cache
-    buffers, stores the prompt in their format and places them at the
-    decode's DRAM addresses.
+    """Compile the decode, then a prefill per prompt length: each prefill
+    holds the decode's cache buffers, stores the prompt in their format and
+    places them at the decode's DRAM addresses.
 
     Returns:
         ``(decode, {length: prefill}, cache buffers)``, compiled and

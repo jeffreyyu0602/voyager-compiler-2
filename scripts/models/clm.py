@@ -1,19 +1,16 @@
-"""Llama prefill / decode / training quantization and lowering for
-``compile_model.py``.
+"""Causal-LM quantization and lowering for ``compile_model.py``'s ``clm``.
 
-One ``QuantizedLM`` holds every graph: the prefill and decode graphs over a
-static KV cache, both keeping only the last position's logits
-(``logits_to_keep=1``) so the vocabulary projection lowers as a
-matrix-vector product, and the training graphs.  ``llama_prefill`` /
-``llama_decode`` / ``llama_decode_kivi`` compile one of the inference graphs
-and ``--training`` the training step; a speculative-decoding verification
-step (``llama_verify``) is a decode graph of ``--spec_length`` tokens, and
-``llama_cache`` / ``llama_cache_kivi`` compile the decode graph with the
-prefill that fills its KV cache.
+Any Hugging Face causal LM loads into one ``QuantizedLM`` whose graphs are
+the stages ``--stage`` names: the prefill and decode graphs over a static KV
+cache, both keeping only the last position's logits (``logits_to_keep=1``)
+so the vocabulary projection lowers as a matrix-vector product, and the
+training graphs.  ``prefill`` and ``decode`` compile that inference graph,
+``training`` one training step.  A decode of ``--decode_tokens`` tokens is
+a speculative-decoding verification step, and ``--kv_cache kivi`` stores its
+cache in KIVI's 2-bit format.
 """
 
 import copy
-import logging
 import math
 import os
 import re
@@ -40,13 +37,11 @@ from voyager_compiler import (
     ShapeProp,
     compile,
     merge_sibling_linears,
-    planned_buffer_layout,
     quantizes_kv_cache,
     split_kv_cache,
     transform,
 )
 from voyager_compiler.codegen import match_and_fuse_rms_norm
-from voyager_compiler.codegen.node_info import ancestors
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 from .compile_steps import (
@@ -67,12 +62,11 @@ from quantization_configs import (  # noqa: E402
     KIVI_BLOCK_SIZE,
     KIVI_RESIDUAL_LENGTH,
     QUANTIZATION_CONFIGS,
+    annotate_attention_mask,
     set_kivi_attention_qconfig,
     set_qconfig,
     set_residual_attention_qconfig,
 )
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 
@@ -98,10 +92,8 @@ _KIVI_VALUE_SPEC = (
 _KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
 _KV_BUFFER = re.compile(r"^(key|value)_cache_\d+(_residual)?$")
 
-# The stages compiled from the decode graph, and those compiling the decode
-# graph together with the prefill that fills its KV cache.
-_DECODE_STAGES = ("llama_decode", "llama_decode_kivi", "llama_verify")
-CACHE_STAGES = ("llama_cache", "llama_cache_kivi")
+# The stages ``--stage`` picks, each compiling one graph of the model.
+STAGES = ("prefill", "decode", "training")
 
 
 def load_model(args):
@@ -230,49 +222,11 @@ def annotate_kivi_cache(gm):
         )
 
 
-def _annotate_attention_mask(gm):
-    """Quantize the prefill's causal mask to int1 when it is a constant: the
-    ``where`` over the boolean mask that the attention scores' ``add``
-    reads, which ``convert_pt2e`` then folds into an int1 constant.  A mask
-    built at run time (the static-cache export's, from ``cache_position``)
-    stays unquantized, so no quantize of it runs in the graph.
-
-    Raises:
-        RuntimeError: No causal-mask ``where`` feeds an ``add`` and the
-            attention is not sdpa (which runs with no mask tensor to
-            quantize).
-    """
-    qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
-    wheres = [
-        n
-        for n in gm.graph.nodes
-        if n.target is torch.ops.aten.where.ScalarOther
-        and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
-    ]
-    if not wheres:
-        sdpa = any(
-            n.target is torch.ops.aten.scaled_dot_product_attention.default
-            for n in gm.graph.nodes
-        )
-        if not sdpa:
-            raise RuntimeError("no causal-mask where node feeds an add")
-        logger.info("no attention mask under sdpa")
-    masks = [
-        n
-        for n in wheres
-        if not any(a.op == "placeholder" for a in ancestors(n))
-    ]
-    if len(masks) < len(wheres):
-        logger.info("causal mask built at run time: left unquantized")
-    for mask in masks:
-        annotate_output_qspec(mask, qspec)
-
-
 def quantize_model(model, tokenizer, quantizer, args):
     """Quantize ``model`` as one ``QuantizedLM``, prepared with its
-    observers on, building the phases the run needs: the training graphs
-    under ``--training``, the prefill for ``llama_prefill``, and both
-    inference graphs for a decode stage, whose cache the prefill fills.
+    observers on, building the phases ``--stage`` needs: the training graphs
+    for ``training``, the prefill for ``prefill``, and both inference graphs
+    for ``decode``, whose cache the prefill fills.
 
     Every phase quantizes as ``quantizer`` says, the rotary embedding's
     matmul excepted.  The prefill and decode quantizers add ``--qconfig``'s
@@ -281,8 +235,8 @@ def quantize_model(model, tokenizer, quantizer, args):
     (``split_kv_cache``), its attention's residual halves unquantized, and
     the prefill splits its writes alike; without the flag the caches stay
     whole, and ``transform`` splits a cache whose blocks run along the
-    positions.  Under a KIVI stage the main caches are quantized to 2 bits,
-    which needs ``--residual_length``.
+    positions.  Under ``--kv_cache kivi`` the main caches are quantized to 2
+    bits, which needs ``--residual_length``.
     Each graph's RMSNorms are fused before quantization; under
     ``--quantize_attention_mask`` the prefill's causal mask, when a
     constant, is int1; under
@@ -301,7 +255,7 @@ def quantize_model(model, tokenizer, quantizer, args):
 
     Raises:
         ValueError: A verification step would cross a residual chunk
-            boundary, or a KIVI stage has no ``--residual_length`` or one
+            boundary, or a KIVI cache has no ``--residual_length`` or one
             that is not a multiple of the 2-bit group.
     """
     quantizer.set_module_name_object_type_order(
@@ -311,8 +265,8 @@ def quantize_model(model, tokenizer, quantizer, args):
         phase: copy.deepcopy(quantizer)
         for phase in ("prefill", "decode", "training")
     }
-    kivi = args.model in ("llama_decode_kivi", "llama_cache_kivi")
-    tokens = args.spec_length if args.model == "llama_verify" else 1
+    kivi = args.kv_cache == "kivi"
+    tokens = args.decode_tokens
     if args.qconfig is not None:
         for phase in ("prefill", "decode"):
             set_qconfig(quantizers[phase], QUANTIZATION_CONFIGS[args.qconfig])
@@ -338,7 +292,7 @@ def quantize_model(model, tokenizer, quantizer, args):
         if args.merge_linears and phase != "training":
             merge_sibling_linears(gm)
         if phase == "prefill" and args.quantize_attention_mask:
-            _annotate_attention_mask(gm)
+            annotate_attention_mask(gm)
         if phase == "prefill":
             # The decode graph was rewritten first: the prefill writes a
             # cache split there as the decode does.
@@ -376,9 +330,9 @@ def quantize_model(model, tokenizer, quantizer, args):
         elif split["done"]:
             set_residual_attention_qconfig(quantizers["decode"])
 
-    if args.training:
+    if args.stage == "training":
         phases = ("training",)
-    elif args.model == "llama_prefill":
+    elif args.stage == "prefill":
         phases = ("prefill",)
     else:
         phases = ("prefill", "decode")
@@ -397,8 +351,8 @@ def quantize_model(model, tokenizer, quantizer, args):
 
 
 def quantize_graphs(model, tokenizer, quantizer, args):
-    """Quantize, calibrate and convert the inference graphs the stage
-    ``args.model`` names.
+    """Quantize, calibrate and convert the inference graphs ``--stage``
+    needs.
 
     Calibration prefills the ``--context_length`` prompt and, with a decode
     graph, decodes the tokens after it, twice (delayed scaling), so the
@@ -411,7 +365,7 @@ def quantize_graphs(model, tokenizer, quantizer, args):
     """
     lm = quantize_model(model, tokenizer, quantizer, args)
     length = args.context_length
-    tokens = args.spec_length if args.model == "llama_verify" else 1
+    tokens = args.decode_tokens
     prompt = _prompt_ids(tokenizer, length + tokens)
     kwargs = {
         "prefill": {
@@ -436,72 +390,11 @@ def quantize_graphs(model, tokenizer, quantizer, args):
 
 
 def quantize_stage(model, tokenizer, quantizer, args):
-    """The converted graph of the one-graph inference stage ``args.model``
-    names (``llama_prefill`` / ``llama_decode`` / ``llama_decode_kivi`` /
-    ``llama_verify``) and the inputs it is compiled for
+    """The converted graph of the inference stage ``--stage`` names
+    (``prefill`` or ``decode``) and the inputs it is compiled for
     (``quantize_graphs``)."""
     lm, kwargs = quantize_graphs(model, tokenizer, quantizer, args)
-    name = "decode" if args.model in _DECODE_STAGES else "prefill"
-    return lm.graphs[name], kwargs[name]
-
-
-def compile_cache_programs(model, tokenizer, quantizer, fusion_patterns, args):
-    """Compile the decode graph and the prefill that fills its KV cache as
-    one pair (``llama_cache`` / ``llama_cache_kivi``).
-
-    The decode graph is transformed first; the prefill then stores the
-    prompt's whole chunks in the decode graph's cache format
-    (``transform``'s ``cache_formats``) and, compiled after it, places every
-    buffer the two share at the decode graph's address
-    (``planned_buffer_layout``).  Each program goes into its own directory
-    under ``--model_output_dir``.
-
-    Returns:
-        ``(programs, reference, lowered)``, each keyed ``"prefill"`` and
-        ``"decode"``: the compiled programs, the logits the converted graphs
-        give run prefill then decode on the shared cache, and the same from
-        the compiled graphs under ``--debug``, else ``None``.
-    """
-    lm, kwargs = quantize_graphs(model, tokenizer, quantizer, args)
-    programs = {name: lm.graphs[name] for name in ("prefill", "decode")}
-
-    def run():
-        return {
-            name: ShapeProp(program).propagate(
-                *tree_flatten(((), kwargs[name]))[0]
-            )
-            for name, program in programs.items()
-        }
-
-    reference = run()
-    transform_args = get_transform_args(args, fusion_patterns)
-    transform(programs["decode"], (), kwargs["decode"], **transform_args)
-    transform(
-        programs["prefill"],
-        (),
-        kwargs["prefill"],
-        cache_formats=programs["decode"].meta["cache_formats"],
-        **transform_args,
-    )
-    compile_args = get_compile_args(args)
-    out_dir = compile_args.pop("output_dir")
-    layout = None
-    for name in ("decode", "prefill"):
-        compile(
-            programs[name],
-            (),
-            kwargs[name],
-            output_dir=os.path.join(out_dir, name),
-            dram_layout=layout,
-            **compile_args,
-        )
-        layout = planned_buffer_layout(
-            programs[name], programs["prefill"], transform_args["config"]
-        )
-    if not args.debug:
-        return programs, reference, None
-    with single_cpu_thread():
-        return programs, reference, run()
+    return lm.graphs[args.stage], kwargs[args.stage]
 
 
 def kv_cache_state(gm):
@@ -525,7 +418,7 @@ def restore_kv_cache(gm, state):
 
 
 def quantize_and_dump_model(model, tokenizer, quantizer, fusion_patterns, args):
-    """Quantize the inference stage ``args.model`` names (``quantize_stage``),
+    """Quantize the inference stage ``--stage`` names (``quantize_stage``),
     then transform and compile it.  Returns ``(gm, old_output,
     new_output)``; ``new_output`` is ``None`` unless ``--debug`` re-runs the
     lowered graph."""

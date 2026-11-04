@@ -42,7 +42,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../scripts")
 )
 from compile_model import FUSION_PATTERNS  # noqa: E402
-from models import llama  # noqa: E402
+from models import clm  # noqa: E402
 from models.compile_steps import (  # noqa: E402
     get_compile_args,
     get_transform_args,
@@ -91,7 +91,9 @@ def voyager_args(args, config):
     add_quantization_args(parser)
     add_compile_args(parser)
     voyager = parser.parse_args([])
-    voyager.model = f"llama_{args.phase}"
+    voyager.model = "clm"
+    voyager.stage = args.phase
+    voyager.kv_cache = None
     voyager.model_name_or_path = args.model
     voyager.context_length = args.context
     voyager.num_hidden_layers = args.layers
@@ -101,7 +103,7 @@ def voyager_args(args, config):
     voyager.qconfig = None
     voyager.quantize_attention_mask = False
     voyager.residual_length = None
-    voyager.spec_length = 1
+    voyager.decode_tokens = 1
     voyager.debug = False
     voyager.model_output_dir = args.out
     voyager.dump_tensors = False
@@ -147,7 +149,7 @@ def main():
     config = TARGETS[args.target]
     voyager = voyager_args(args, config)
 
-    model, tokenizer = llama.load_model(voyager)
+    model, tokenizer = clm.load_model(voyager)
     spec = DTYPES[args.dtype]
     quantizer = get_default_quantizer(
         input_activation=spec,
@@ -156,7 +158,7 @@ def main():
     )
     # Attention's matmuls stay BF16.
     quantizer.set_object_type(torch.ops.aten.matmul.default, None)
-    gm, example_kwargs = llama.quantize_stage(
+    gm, example_kwargs = clm.quantize_stage(
         model, tokenizer, quantizer, voyager
     )
     example_args = ()
