@@ -6,13 +6,46 @@ latency, the numerics, and measured speed. Newest commit first. Only commits
 that changed something are listed. How entries are made: README.md,
 "Development workflow".
 
-## 8d0ffa7 → (2026-11-03)
+## 8d0ffa7 → (2026-11-03 to 2026-11-05)
 
-From the CI run of 2026-11-03 (`test/run_ci.py`, baseline e5c49a0; run
-folder `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/weight-layout/ci/2026-11-03_03-27-38`).
-The commits from fd6feef to 8d0ffa7 are not logged yet.
+Each entry names the CI run it comes from. 98dac81 (the calibration sheet's
+suggested run lengths) changed no config.
 
-### fix: store the KIVI cache in place (2026-11-03)
+### 1c45f7b refactor: scalarize one-element constant operands of elementwise ops (2026-11-05)
+
+- From the CI run of 2026-11-05 (`test/run_ci.py`, baseline 98dac81; run
+  folder `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/scalarize/ci/2026-11-04_20-02-24`):
+  10 configs match, 16 change. Predicted latency, DRAM traffic, addresses
+  and peak memory are unchanged in every config, and no verdict changes.
+- **model.txt:** a one-element constant operand becomes an immediate: the
+  attention-scale `mul` in bert and vit (12 kernels each, 0.125), the 5
+  mobilebert_encoder configs (0.1767578125) and the llama prefill and decode
+  configs (0.08837890625); RoPE's two `mul` by 1.0 in the llama configs; and
+  the constant zero fills of `where_1` to `where_5` in the 3 llama_train
+  gradient programs. resnet18, resnet50 and mobilenet_v2 do not change.
+
+### b2e14d3 refactor: compile every causal LM through one clm model (2026-11-04)
+
+- From the MXNF4 CI run of 2026-11-04 (baseline 8123056; run folder
+  `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/clm-refactor/ci2/2026-11-04_01-50-39`).
+  The other configs match in the full run of 2026-11-03 (run folder
+  `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/clm-refactor/ci/2026-11-03_22-31-13`).
+- **CI commands:** the llama configs compile through `clm --stage prefill`
+  or `--stage decode`, which on the same flags leaves their output
+  unchanged. The 9 MXNF4 configs now pass `--double_buffered_accum_buffer`,
+  as the Sphinx accelerator is built. The 5 paired configs and the 4 `_db`
+  configs are removed.
+- **model.txt, the 9 MXNF4 configs:** the double-buffered accumulation buffer
+  re-tiles GEMMs (36 of 164 kernels in bert).
+- **Predicted latency:** llama_prefill and _mp −2.7% (DRAM reads −33%),
+  llama_prefill_spmm −2.2%, resnet18 −2.2%, resnet50 −2.8%, vit −1.3%, bert
+  −1.5% (DRAM reads −5.6%), the decodes +64 cycles.
+- **Numerics, bert:** ok → numeric_drift (logits off by up to 0.16). Its FFN
+  down projection (K = 3072) now splits K into 3 rounds whose bf16 partial
+  sums round in the scratchpad; the 1–2 ULP differences grow through the
+  4-bit requantization of later layers. Every other verdict is unchanged.
+
+### 8123056 fix: store the KIVI cache in place (2026-11-03)
 
 - Not in the CI run above; traced on the `llama_cache_kivi` pair only.
 - **model.txt, llama_cache_kivi:** a KIVI chunk's cache store writes into a
@@ -23,8 +56,10 @@ The commits from fd6feef to 8d0ffa7 are not logged yet.
 - Numerics: the 8 cache, scale and zero-point buffers, both residuals and
   the logits are bit-identical.
 
-### feat: store each weight once, in the model's layout (2026-11-03)
+### a331ef1 feat: store each weight once, in the model's layout (2026-11-03)
 
+- From the CI run of 2026-11-03 (`test/run_ci.py`, baseline e5c49a0; run
+  folder `/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/weight-layout/ci/2026-11-03_03-27-38`).
 - **model.txt, 19 of 34 configs** (the 10 llama_prefill and llama_cache
   configs, bert, resnet18, resnet18_db, resnet50, vit and the 5
   mobilebert_encoder configs): a GEMM weight is stored in the model's
@@ -35,6 +70,224 @@ The commits from fd6feef to 8d0ffa7 are not logged yet.
   all 19. Numerics: all 34 configs keep their verdicts.
 - The new `llama_cache_kivi` command (the Voyager `llama_prefill_mp` +
   `llama_decode_kivi` pair) is not in this run's comparison.
+
+## fd6feef → 8d0ffa7 (2026-11-01 to 2026-11-03, 22 commits)
+
+Traced on 2026-11-04 by bisection, not by one `test/run_ci.py` run. Every build
+runs its commit's own `run_ci.py` command through `run_ci.py`'s build and cache
+code, and every comparison is `run_ci.py`'s. The two ends, fd6feef and 8d0ffa7,
+were built as the CI builds them, with `--debug`. Each config whose `model.txt`
+or predicted cost differs between them was bisected with single-config compiles
+at the commits in between, each probe placed where it settles the most configs.
+The probes ran without `--debug`, which a check showed leaves `model.txt` and
+the predicted cost byte-identical. Numeric verdicts were checked at the
+endpoints and bisected, with `--debug`, only for the 9 configs whose printed
+outputs differ there. Two equal builds are taken to mean no change between them.
+Folder:
+`/sim/jeffreyy/soc-voyager-migration/sims/vcs/claude-scratch/changelog-backfill`
+(`entries-codegen/<commit>/<config>.txt` and `.diff` hold each change).
+
+0c38c3a (this change log), da1a604 (READMEs only; not built), 36738b9 (lowered
+LM on a GPU), ae71782 (replay switch), cf98a92 (benchmarks only), 0b39826
+(per-op calibration, which only `--calib_in` turns on, and no CI command passes
+it), 95490e3 (memory-planning refactor), 9c9cbc2 (help text) and 044d499 (rate
+renames) changed no config. No verdict changed; the printed outputs of 9 configs
+did (592a186, 214fe61, e5c49a0, 31fb84a).
+
+Predicted latency, fd6feef → 8d0ffa7 (training configs print none):
+
+| Config | total_latency (cycles) | DRAM reads |
+|---|---|---|
+| resnet18 E4M3, P8_1 16x16 | 7,692,155 → 8,072,432 (+4.94%) | +0.24% |
+| resnet18 E4M3 32x64 | 1,178,262 → 1,173,897 (−0.37%) | +7.06% |
+| resnet18 E4M3 4x8 | 60,119,432 → 61,335,862 (+2.02%) | = |
+| resnet18 INT8 | 7,711,816 → 8,545,082 (+10.81%) | +1.66% |
+| resnet18 MXINT8 | 7,768,559 → 8,113,747 (+4.44%) | −0.12% |
+| resnet50 E4M3 32x64 | 2,770,786 → 2,764,485 (−0.23%) | +0.95% |
+| mobilebert E4M3, P8_1 16x16 | 514,020 → 528,422 (+2.80%) | = |
+| mobilebert E4M3 4x8 | 3,627,605 → 3,648,607 (+0.58%) | = |
+| mobilebert INT8 | 520,648 → 534,775 (+2.71%) | = |
+| mobilebert MXINT8 | 538,908 → 537,663 (−0.23%) | +2.19% |
+| mobilenet_v2 MXINT8 | 2,388,383 → 2,252,179 (−5.70%) | = |
+| resnet18 MXNF4, _db | 870,519 → 993,024 (+14.07%) | −0.25% |
+| resnet50 MXNF4 | 2,155,869 → 2,433,468 (+12.88%) | = |
+| vit MXNF4 | 8,748,787 → 10,525,207 (+20.30%) | = |
+| bert MXNF4 | 4,253,881 → 5,040,835 (+18.50%) | = |
+| llama_prefill, _db | 76,085,683 → 79,464,159 (+4.44%) | +34.57% |
+| llama_prefill_mp | 76,267,435 → 79,494,391 (+4.23%) | +34.29% |
+| llama_prefill_spmm, _spmm_db | 81,366,840 → 84,665,204 (+4.05%) | +8.07% |
+| llama_cache, _blocks (prefill) | 75,972,302 → 79,416,830 (+4.53%) | +34.66% |
+| llama_cache_tail (prefill) | 71,602,963 → 74,717,406 (+4.35%) | +16.16% |
+| llama_cache_sdpa (prefill) | 70,449,581 → 72,672,070 (+3.15%) | +12.24% |
+| llama_decode, _db (MXNF4) | 11,944,340 → 11,956,132 (+0.10%) | = |
+| llama_decode_kivi | 11,980,246 → 12,016,060 (+0.30%) | = |
+| llama_decode/BF16 | 24,302,647 → 24,087,687 (−0.88%) | −0.47% |
+
+DRAM writes moved by less than 0.6% in every config.
+
+### 8d0ffa7 feat: place each unit's passes on its own timeline in the estimator (2026-11-03)
+
+- **Predicted latency, every config with a cost:** each unit's passes are
+  scheduled on their own timeline and post their counter at done, so the 1-slot
+  boundary and the last tail are priced. The changes are small: from −1.01%
+  (llama_cache_sdpa's prefill) to +0.96% (resnet50/MXNF4); llama prefill and its
+  cache configs ±0.01%, decode +0.35%, bert +0.78%.
+- **model.txt:** a matrix tile is now priced at steady with the fill, skew and
+  drain added once, which re-tiles a few GEMMs. The llama prefill configs,
+  llama_prefill_spmm and llama_train/MXFP4 re-tile RoPE's frequency `matmul`
+  (128 → 256 per tile); llama_decode/BF16 its `where` and `matmul`. Also 4 convs
+  in resnet18/MXNF4 and _db, 4 in resnet50/E4M3 and 3 in resnet50/MXNF4.
+  llama_train/BF16 and FP8 do not change.
+
+### e5c49a0 fix: price vector work at the scratchpad bank port, not the DRAM rate (2026-11-02)
+
+- **Predicted latency:** vector ops, pooling fetches, softmax passes and a
+  GEMM's tail pass are priced at one scratchpad word per cycle instead of the
+  DRAM rate. That is the largest change in the range: vit +17.26%, bert +14.60%,
+  resnet18/MXNF4 +14.77%, resnet50/MXNF4 +12.07%, resnet18 INT8 +10.98%, the
+  other 16x16 resnet18 configs +4.5 to +5.0% (4x8 +2.03%), the llama prefill
+  configs +4.4 to +5.2%, mobilebert +0.3 to +3.1%, decode +0.10% (kivi +0.30%).
+  mobilenet_v2 drops 7.05% and llama_decode/BF16 0.89%.
+- **model.txt:** the tiler's `vector_cycles` divides by the same rate, so vector
+  kernels re-tile: RoPE's `cos`, `sin`, `mul` and `neg` kernels in the llama
+  prefill configs, 11 quantize kernels in resnet18/MXNF4, 24 kernels in
+  resnet50/MXNF4, 26 in bert, 11 in llama_decode/BF16 (with 0.47% fewer DRAM
+  reads). No DRAM traffic changes otherwise.
+- **llama_train:** vector kernels re-tile in BF16 (9 gradient kernels: the
+  RMSNorm means and three sums) and MXFP4 (25 gradient kernels, RoPE's and the
+  norms', and 10 AdamW kernels). FP8 does not change.
+- **Printed outputs, llama_decode/BF16:** its re-tiled GEMMs reduce in a
+  different order, so the failed check prints other numbers.
+
+### 21821aa feat: double-buffer the SpMM gather and price its scratch slots (2026-11-02)
+
+- **llama_prefill_spmm and _spmm_db:** the SpMM nest gathers into a staging slot
+  per pipeline step, so a gather overlaps the SpMM reading the slot before it.
+  11 kernels change (the projections and the outlier quantize); predicted
+  latency 88,306,176 → 81,104,712 (−8.16%). No other config changes.
+
+### cee0f13 fix: drop the estimator's hardcoded done delay and ratio calibration (2026-11-02)
+
+- **Predicted latency only, every config with a cost:** a matrix pass is done at
+  the end of its cycles again, instead of its analytic skew and drain later.
+  llama_prefill_spmm −0.46%, bert −0.53%, mobilebert +0.1 to +0.3%,
+  resnet50/E4M3 +0.39%, the rest within ±0.2%. No `model.txt` changes. (The
+  ratio fallback it removes applies only under `--calib_in`.)
+
+### e486d5e feat: lag the SpMM nest's stores and drop the CSR-emitting GEMM (2026-11-02)
+
+- **llama_prefill_spmm and _spmm_db:** a sparse GEMM's stores trail its compute
+  by the kernel's lag again, so consecutive SpMM tiles overlap (cc0d72b had made
+  each tile store on its own step). 11 kernels change and 45 addresses move;
+  predicted latency 115,047,782 → 88,712,497 (−22.89%). Removing the unused
+  CSR-emitting GEMM changes nothing.
+
+### 592a186 fix: price the split-K slot count and the tile-boundary stall (2026-11-02)
+
+- **model.txt:** a split reduction with a tail now offers 2 and 1 scratch slots
+  and the search keeps the cheaper, and a one-slot tile boundary is priced.
+  GEMMs re-tile in 14 configs: in the llama prefill and cache configs
+  `down_proj` and the P.V product `matmul_mx_default_1` (DRAM reads +28.2%; in
+  _tail only P.V, reads unchanged; not in _sdpa), 10 convs in resnet18/E4M3
+  32x64 (reads +7.06%), 6 in resnet18 INT8, 6 in resnet50/E4M3, 4 in resnet18
+  MXINT8, 3 in resnet18 E4M3 and P8_1 16x16, 9 in mobilebert MXINT8, 12 in vit.
+- **Predicted latency:** down in every config with a cost: resnet18/MXNF4
+  −4.44%, resnet18 32x64 −2.64%, resnet50 −1.7%, vit −1.45%, bert −1.44%,
+  llama_prefill_spmm −1.24%, the llama prefill configs −0.54%, the other
+  resnet18 and mobilebert configs −0.2 to −1.0%, decode ≈0.
+- **llama_train/BF16:** 10 gradient GEMMs re-tile (seven projections and three
+  `matmul`s); FP8 and MXFP4 do not change.
+- **Printed outputs, llama_prefill, _db, _mp, llama_cache and _blocks:** the
+  re-tiled `down_proj` and P.V reduce in a different order. llama_prefill's
+  mismatched logits go from 22.7% to 22.9%.
+
+### bba4993 feat: the sync pass derives every wait, SpMM and copies included (2026-11-01)
+
+- **model.txt, every config:** builders emit only loads, compute and stores, and
+  the sync pass derives every wait, the copy streams' included, from RAW, WAR
+  and WAW on the planned buffers. Every kernel's IR changes (`sym_ite`
+  thresholds replace the builders' waits) and addresses move. FA3 keeps its
+  running max in three slots and needs no clone or fill. In the 3 llama_train
+  configs every kernel of the gradient and update programs changes too.
+- **Predicted latency:** unchanged in every config but llama_cache_sdpa
+  (−0.29%), whose FA3 attention loses its clone and fill.
+
+### e96f01c fix: run the emitter's cpu ops as host ops (2026-11-01)
+
+- **model.txt, the llama prefill and cache configs, llama_prefill_spmm and
+  llama_decode_kivi:** the integer adds on the cache position (`add`, `add_1`,
+  `le_2`) leave the vector commits and get CPU waits, and their run-time operand
+  is loaded on chip. 4 kernels change (8 in _spmm, 2 in kivi). Predicted latency
+  +101 to +202 cycles (kivi unchanged).
+- **llama_train, all 3 configs:** the same rule loads the single-element
+  operands a graph input feeds on chip, so the 35 AdamW kernels that scale by
+  the step count change in every update program, and in FP8 also the 81
+  delayed-scaling kernels (`amax`, `where`) of the gradient program.
+
+### 1b8fd5b fix: quantize the attention mask only when it is a constant (2026-11-01)
+
+- **model.txt, the llama prefill and cache configs (not _sdpa, which has no mask
+  `where`) and llama_prefill_spmm:** the mask that the static-cache export
+  builds from `cache_position` is no longer quantized on the device: the
+  `quantize_default` kernel is gone, and `where`, RoPE's `matmul` and QKᵀ
+  (`matmul_mx_default`) change. The attention reads the bf16 mask, so DRAM reads
+  rise 4.96% (4.01% in _tail, 2.86% in _spmm), while predicted latency drops
+  0.05% (0.03% in _spmm).
+
+### becaee2 fix: give a split-K scratch a second slot and price a pass's done (2026-11-01)
+
+- **Predicted latency, every config with a cost:** the scheduler posts a pass's
+  done its completion later, so waits on the post see when the result is
+  written: resnet18/MXNF4 +4.62%, bert +2.00%, resnet50/MXNF4 +1.91%, resnet18
+  32x64 +1.84%, vit +1.69%, llama_prefill_spmm +1.18%, resnet50/E4M3 +1.06%, the
+  16x16 resnet18 configs +0.7 to +1.0% (4x8 +0.18%), mobilebert +0.3%, llama
+  prefill and decode +0.01%.
+- **model.txt:** a split-K kernel with a tail rotates two partial-sum slots when
+  they fit, in `down_proj` of the llama prefill and cache configs and
+  `matmul_mx_default_1` of mobilebert MXINT8 (−0.15%), and in the gradient
+  programs of llama_train: 29 kernels in BF16 (the projections and the MLP), 4
+  in FP8, 2 in MXFP4.
+
+### cc0d72b feat: synchronize dispatches with hardware counters in a sync pass (2026-11-01)
+
+- **model.txt, every config:** a sync pass after memory planning wraps every
+  dispatch in a commit with counter waits and one post. Every kernel changes:
+  `voyager::async_wait`, `alloc`, `zeros` and `sym_ite` thresholds are added,
+  `voyager::fill` goes, and each CNN, mobilebert and vit program gains a
+  `(start)` region.
+- **Predicted latency:** unchanged in the E4M3, P8_1, INT8 and MXINT8 resnet18,
+  resnet50 and mobilebert configs and in llama_decode/BF16. The report prices
+  the commit waits: llama_decode −0.35% (kivi −0.34%), llama prefill −0.02%,
+  resnet18/MXNF4 −0.12%; bert +2.60%, vit +2.21%, mobilenet_v2 +1.21%.
+- **llama_prefill_spmm and _spmm_db, +41.50%** (81,398,064 → 115,177,208; DRAM
+  reads +5.06%): the sparse GEMM nest stores each tile on its own step in place
+  of the async nest, so consecutive SpMM tiles stop overlapping. e486d5e and
+  21821aa win it back.
+- **llama_train:** every kernel of the gradient and update programs changes in
+  all 3 configs.
+
+### 31fb84a fix: MX shared exponent takes log2 in float32 (2026-11-01)
+
+- **Printed outputs, llama_train/MXFP4:** a block maximum just below a power of
+  two no longer rounds up to it, so its pot=1 MX scales come out one lower where
+  that happened. No `model.txt` or cost changes; the MXINT8 configs pass their
+  check before and after.
+
+### 214fe61 fix: price the scratchpad bus per bank and the MX scale pass (2026-11-01)
+
+- **Predicted latency:** the GEMM model charges each bank its share of the roles
+  it holds, and a vector quantize_mx blocking along a non-last axis costs two
+  passes. resnet18/MXNF4 −0.41%, resnet50/MXNF4 −0.17%, mobilebert MXINT8
+  +0.11%, llama prefill −0.04%, llama_prefill_spmm +0.04%, llama_cache_tail and
+  _sdpa −0.39%.
+- **model.txt:** `o_proj` and `down_proj` re-tile in the llama prefill and cache
+  configs (bank strides change; in llama_cache_tail and _sdpa with DRAM reads
+  +11.7% and +12.2%), and 2 convs in resnet50/E4M3, whose peak scratchpad grows
+  from 1,772,544 to 2,056,320 B.
+- **llama_train:** MXFP4's gradient program re-tiles `linear_mx_default_7` and
+  `quantize_mx_default_32`; BF16's re-tiles `sub_2`; FP8 does not change.
+- **Printed outputs, llama_cache_tail and _sdpa:** their re-tiled projections
+  reduce in a different order.
 
 ## 0a94c31 → fd6feef (2026-11-01, 6 commits)
 
