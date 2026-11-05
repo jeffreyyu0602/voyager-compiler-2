@@ -1,4 +1,4 @@
-"""Lower single-element arithmetic to control-processor scalars.
+"""Lower single-element tensors to control-processor scalars.
 
 A decode graph does its index bookkeeping -- the cache position, the slot a
 token lands in, the chunk it belongs to -- as arithmetic on one-element
@@ -10,7 +10,10 @@ rewrites such a chain into what the accelerator's control processor does
 natively: one read of each source tensor (``_local_scalar_dense``),
 Python-scalar arithmetic on the result (emitted as ``cpu`` ops), and, where
 a consumer needs a tensor again, a host-written one (``full`` for a single
-element, ``arange`` for an index vector shifted by a scalar).
+element, ``arange`` for an index vector shifted by a scalar).  A
+single-element constant that an elementwise op combines with full tensors
+(an attention mask's ``torch.where(mask, torch.tensor(0.0), min)``) becomes
+an immediate of the op's scalar overload.
 """
 
 import logging
@@ -20,15 +23,19 @@ import operator
 import torch
 from torch.fx import GraphModule, Node
 
+from voyager_compiler.codegen.node_info import quant_param_arg_nodes
+from voyager_compiler.codegen.transform.bufferize.utils import _passed_whole
 from voyager_compiler.shape_prop import (
     constant_value,
     fetch_attr,
     propagate_shape,
+    set_node_value,
+    written_buffers,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["scalarize_index_arithmetic"]
+__all__ = ["scalarize_single_elements"]
 
 aten = torch.ops.aten
 
@@ -62,6 +69,7 @@ def clamp_min(a, b):
     """The larger of ``a`` and ``b``, as ``aten.clamp_min`` takes it: a NaN
     ``a`` stays NaN."""
     return a if math.isnan(a) or a >= b else b
+
 
 # Elementwise ops that mean the same on Python scalars.  ``floor_divide``
 # and ``remainder`` follow Python's floor semantics, as ``//`` and ``%`` do.
@@ -100,6 +108,29 @@ _SCALAR_OPS = {
     aten.clamp_min.default: clamp_min,
 }
 
+# The scalar overload of each elementwise op that combines a single-element
+# constant with full tensors: op -> {the operand positions passed as
+# Python scalars -> the overload taking them so}.
+_SCALAR_OVERLOADS = {
+    aten.where.self: {
+        (1,): aten.where.ScalarSelf,
+        (2,): aten.where.ScalarOther,
+        (1, 2): aten.where.Scalar,
+    },
+    aten.where.ScalarSelf: {(2,): aten.where.Scalar},
+    aten.where.ScalarOther: {(1,): aten.where.Scalar},
+    aten.add.Tensor: {(1,): aten.add.Scalar},
+    aten.sub.Tensor: {(1,): aten.sub.Scalar},
+    aten.mul.Tensor: {(1,): aten.mul.Scalar},
+    aten.div.Tensor: {(1,): aten.div.Scalar},
+    aten.eq.Tensor: {(1,): aten.eq.Scalar},
+    aten.ne.Tensor: {(1,): aten.ne.Scalar},
+    aten.lt.Tensor: {(1,): aten.lt.Scalar},
+    aten.le.Tensor: {(1,): aten.le.Scalar},
+    aten.gt.Tensor: {(1,): aten.gt.Scalar},
+    aten.ge.Tensor: {(1,): aten.ge.Scalar},
+}
+
 _INTEGER_DTYPES = (torch.int64, torch.int32, torch.bool)
 
 
@@ -129,8 +160,8 @@ def _index_vector(model: GraphModule, node):
     return int(value[0]), int(steps[0]), value.numel()
 
 
-def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
-    """Rewrite arithmetic on one-element tensors into scalar ops.
+def scalarize_single_elements(model: GraphModule) -> GraphModule:
+    """Rewrite one-element tensor operands of elementwise ops into scalars.
 
     Walking in program order, an elementwise op in ``_SCALAR_OPS`` whose
     tensor operands are all single-element tensors becomes the
@@ -142,6 +173,16 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
     arange(R)``) becomes an ``arange`` starting at the scalar, so the vector
     is written by the host rather than computed.
 
+    An op in ``_SCALAR_OVERLOADS`` whose other operands are full tensors
+    takes each single-element constant (a ``get_attr``, lifted constants
+    included) as its Python value through the op's scalar overload, e.g.
+    ``where.self`` -> ``where.ScalarSelf``.  The rewrite is made only where
+    the overload keeps the op's result dtype and shape (``where.Scalar`` is
+    float32 whatever its operands).  A computed single-element tensor next to
+    full tensors stays a tensor, as do the operands a quantized op takes whole
+    (codebooks, qmaps, scalar scales) and the buffers the graph writes in
+    place.
+
     Args:
         model: The graph module to rewrite in place, shape-propagated.
 
@@ -151,6 +192,19 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
     graph = model.graph
     scalar_of = {}  # tensor node -> the scalar node standing in for it
     reads = {}  # tensor node -> its _local_scalar_dense read
+
+    # The operands a quantized op takes whole stay tensors.
+    codebooks = set()
+    for node in graph.nodes:
+        codebooks |= quant_param_arg_nodes(node)
+    passed_whole = set()
+    for node in graph.nodes:
+        if getattr(node.target, "namespace", None) != "quantized_ops":
+            continue
+        for operand in node.all_input_nodes:
+            if _passed_whole(operand, codebooks):
+                passed_whole.add(operand)
+    written = written_buffers(graph)
 
     def scalar(operand, before):
         """``operand`` as a scalar: a literal, a scalar node, or a read."""
@@ -168,6 +222,45 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
             propagate_shape(reads[operand], model)
         return reads[operand]
 
+    def inline_constants(node) -> bool:
+        """Pass ``node``'s single-element constant operands as Python values
+        of its scalar overload, in place; whether it did."""
+        overloads = _SCALAR_OVERLOADS[node.target]
+        candidates = set()
+        for key in overloads:
+            candidates.update(key)
+        positions = []
+        for index, operand in enumerate(node.args):
+            if (
+                index in candidates
+                and isinstance(operand, Node)
+                and operand.op == "get_attr"
+                and _single_element(operand)
+                and operand not in passed_whole
+                and operand.target not in written
+            ):
+                positions.append(index)
+        overload = overloads.get(tuple(positions))
+        if overload is None:
+            return False
+
+        args = list(node.args)
+        for index in positions:
+            args[index] = constant_value(model, args[index]).item()
+        target, original_args, original = node.target, node.args, node.value
+        node.target = overload
+        node.args = tuple(args)
+        propagate_shape(node, model)
+        if (
+            node.value.dtype == original.dtype
+            and node.value.shape == original.shape
+        ):
+            return True
+        node.target = target
+        node.args = original_args
+        set_node_value(node, original)
+        return False
+
     def materialize(node, value, before):
         """A tensor holding scalar ``value``, in ``node``'s shape and dtype,
         written by the host."""
@@ -182,8 +275,13 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
         return tensor
 
     count = 0
+    inlined = 0
     for node in list(graph.nodes):
-        if node.op != "call_function" or node.target not in _SCALAR_OPS:
+        if node.op != "call_function":
+            continue
+        if node.target not in _SCALAR_OPS:
+            if node.target in _SCALAR_OVERLOADS and inline_constants(node):
+                inlined += 1
             continue
         tensors = [a for a in node.all_input_nodes]
         if not tensors:
@@ -203,6 +301,8 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
             _single_element(node)
             and all(_single_element(a) or a in scalar_of for a in tensors)
         ):
+            if node.target in _SCALAR_OVERLOADS and inline_constants(node):
+                inlined += 1
             continue
 
         if vector is not None:
@@ -260,5 +360,8 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
     graph.lint()
     graph.eliminate_dead_code()
     model.recompile()
-    logger.info(f"[transform] scalarized {count} index ops")
+    logger.info(
+        f"[transform] scalarized {count} index ops, inlined constants into "
+        f"{inlined}"
+    )
     return model

@@ -46,7 +46,7 @@ from voyager_compiler.codegen.transform.rewrites import (
     specialize_symbolic_sizes,
 )
 from voyager_compiler.codegen.transform.scalarize import (
-    scalarize_index_arithmetic,
+    scalarize_single_elements,
 )
 from voyager_compiler.codegen.transform.tiling.grid_search import (
     gemv_op_tiling,
@@ -81,7 +81,7 @@ __all__ = [
     "rename_nodes_with_param_names",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
-    "scalarize_index_arithmetic",
+    "scalarize_single_elements",
     "sink_cache_folds",
     "specialize_symbolic_sizes",
     "split_kv_cache",

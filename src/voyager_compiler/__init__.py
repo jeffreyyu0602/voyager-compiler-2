@@ -49,7 +49,7 @@ from voyager_compiler.codegen import (
     rename_nodes_with_param_names,
     replace_conv2d_with_im2col,
     replace_interpolate,
-    scalarize_index_arithmetic,
+    scalarize_single_elements,
     specialize_symbolic_sizes,
     split_kv_cache,
     split_token_blocked_caches,
@@ -195,7 +195,7 @@ __all__ = [
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
-    "scalarize_index_arithmetic",
+    "scalarize_single_elements",
     "set_batch_norm_training",
     "set_training",
     "shared_dram_layout",
@@ -342,9 +342,10 @@ def transform(
             whole chunks in the decode's quantized format, into the
             decode's own buffers (``store_prompt_chunks``).  None for any
             other graph.
-        host_scalars: Turn index arithmetic on one-element tensors into
-            control-processor scalars (``scalarize_index_arithmetic``), as
-            the Voyager program runs it.  False keeps it in device tensors,
+        host_scalars: Turn index arithmetic on one-element tensors, and the
+            one-element constant operands of elementwise ops, into
+            control-processor scalars (``scalarize_single_elements``), as
+            the Voyager program runs it.  False keeps them in device tensors,
             so a GPU step reads nothing back to the host and can replay as
             a CUDA graph.
         weight_layout: How the linear weights are stored: ``"kc"`` [out, in]
@@ -392,7 +393,7 @@ def transform(
     remove_prunable_ops(model)
     normalize_attention_operands(model)
     if host_scalars:
-        scalarize_index_arithmetic(model)
+        scalarize_single_elements(model)
     fuse_quantize_dequantize_with_producer(model)
     if cache_formats is not None:
         store_prompt_chunks(model, cache_formats)

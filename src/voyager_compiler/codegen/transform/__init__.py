@@ -35,7 +35,7 @@ from voyager_compiler.codegen.transform.rewrites import (
     replace_interpolate,
 )
 from voyager_compiler.codegen.transform.scalarize import (
-    scalarize_index_arithmetic,
+    scalarize_single_elements,
 )
 
 __all__ = [
@@ -61,7 +61,7 @@ __all__ = [
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
-    "scalarize_index_arithmetic",
+    "scalarize_single_elements",
     "sink_cache_folds",
     "split_kv_cache",
 ]

@@ -1653,7 +1653,7 @@ def _fold_quantize_into_split_cache(
         old.replace_all_uses_with(buffers[i])
 
     # The chunk index and the completing-step predicate as control-
-    # processor scalars.  ``scalarize_index_arithmetic`` has usually
+    # processor scalars.  ``scalarize_single_elements`` has usually
     # already made the offsets an ``arange`` from ``c * R`` and the
     # predicate a host-written ``full``; otherwise they are read out.
     with graph.inserting_before(write):
