@@ -108,7 +108,6 @@ def _produces_tensor(node: Node) -> bool:
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
 _ATEN_CLONE = torch.ops.aten.clone.default
 _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
-_VOYAGER_ONES = torch.ops.voyager.ones.default
 _SUBVIEW = torch.ops.voyager.subview.default
 
 # The space a ``voyager.alloc`` at each level lives in; an alloc at any other
@@ -1105,7 +1104,6 @@ _DEDUP_SKIP = frozenset(
     {
         _VOYAGER_ALLOC,
         _VOYAGER_ZEROS,
-        _VOYAGER_ONES,
         _VOYAGER_INSERT,
         _VOYAGER_ASYNC,
         torch.ops.voyager.async_wait.default,
@@ -1165,10 +1163,7 @@ def _dedup_regions(gm: GraphModule) -> None:
             _VOYAGER_ASYNC,
         ):
             evict(_buffer_root(node.args[1]))
-        elif node.op == "call_function" and node.target in (
-            _VOYAGER_ZEROS,
-            _VOYAGER_ONES,
-        ):
+        elif node.op == "call_function" and node.target is _VOYAGER_ZEROS:
             evict(_buffer_root(node.args[0]))
         elif node.op == "call_module" or (
             node.op == "call_function"

@@ -11,8 +11,8 @@ Primitives
 ``voyager.alloc(size, dtype)``       the one op that declares storage: a DRAM
                                      buffer, an on-chip tile, or (0-d int64
                                      at the register level) a counter.
-``voyager.zeros(t)`` / ``ones(t)``   fill an existing tensor in place; on a
-                                     counter, ``zeros`` is its reset.
+``voyager.zeros(t)``                 zero-fill an existing tensor in place;
+                                     on a counter, it is the reset.
 ``voyager.subview(src, o, s, st)``   strided window onto a buffer (a slot).
 ``voyager.insert(src, dst)``         destination-passing compute-result write.
 ``voyager.async_copy(..., c)``       async tile DMA; adds 1 to counter ``c``
@@ -249,12 +249,12 @@ def race_check():
 
 
 # ---------------------------------------------------------------------------
-# voyager.zeros / voyager.ones — fill an existing tensor in place.  Neither
-# allocates: the tensor is an ``alloc`` (or a view of one).  ``zeros`` on an
+# voyager.zeros — zero-fill an existing tensor in place.  It does not
+# allocate: the tensor is an ``alloc`` (or a view of one).  ``zeros`` on an
 # on-chip tile is a zero fill (a reduction accumulator's init); on a counter
 # (a 0-d int64 ``alloc`` at ``MemoryLevel.REGISTER``) it is the reset to 0.
-# They are ``voyager`` ops (not ``aten.zero_`` / ``fill_``) so the bufferizer
-# can tell a buffer fill from a genuine compute op.
+# It is a ``voyager`` op (not ``aten.zero_``) so the bufferizer can tell a
+# buffer fill from a genuine compute op.
 # ---------------------------------------------------------------------------
 voyager_lib.define("zeros(Tensor(a!) self) -> ()")
 
@@ -268,19 +268,6 @@ def zeros(self: torch.Tensor) -> None:
 
 @torch.library.register_fake("voyager::zeros")
 def _zeros_fake(self: torch.Tensor) -> None:
-    return None
-
-
-voyager_lib.define("ones(Tensor(a!) self) -> ()")
-
-
-@impl(voyager_lib, "ones", "CompositeExplicitAutograd")
-def ones(self: torch.Tensor) -> None:
-    self.fill_(1)
-
-
-@torch.library.register_fake("voyager::ones")
-def _ones_fake(self: torch.Tensor) -> None:
     return None
 
 

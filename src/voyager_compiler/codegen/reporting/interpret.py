@@ -74,7 +74,6 @@ from voyager_compiler.shape_prop import run_op
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
-_ONES = torch.ops.voyager.ones.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
@@ -111,7 +110,7 @@ def _should_eval(node: Node) -> bool:
     tensor and not a pure buffer op)."""
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZEROS, _ONES, _SUBVIEW)
+        and node.target not in (_ALLOC, _ZEROS, _SUBVIEW)
         and not _is_tensor(node)
     )
 

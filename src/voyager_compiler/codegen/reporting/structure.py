@@ -38,7 +38,6 @@ _SUBVIEW = torch.ops.voyager.subview.default
 _DELINEARIZE = torch.ops.voyager.delinearize_index.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
-_ONES = torch.ops.voyager.ones.default
 
 _CHUNK = 1 << 20
 _SLOT_BITS = 16  # an int-valued sink
@@ -106,7 +105,7 @@ def _placeholders(gm: GraphModule) -> List[Node]:
 def _is_scalar_node(node: Node) -> bool:
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZEROS, _ONES, _SUBVIEW)
+        and node.target not in (_ALLOC, _ZEROS, _SUBVIEW)
         and not isinstance(_val(node), torch.Tensor)
     )
 
