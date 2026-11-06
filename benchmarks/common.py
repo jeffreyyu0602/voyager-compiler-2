@@ -89,6 +89,7 @@ from voyager_compiler import (
     prepare_pt2e,
     quantizes_kv_cache,
     split_kv_cache,
+    synchronize,
     transform,
 )
 from voyager_compiler.codegen.aten_classifier import is_compute_op
@@ -906,6 +907,8 @@ def _compile(cfg: SweepConfig):
         builders=backend.builders,
     )
     plan = plan_memory(gm, cfg.acc_config)
+    if backend.synchronizes:
+        synchronize(gm)
     if cfg.dump_dir is not None:
         path = os.path.join(cfg.dump_dir, _cfg_stem(cfg) + ".bufferized.txt")
         with open(path, "w") as f:
@@ -1244,6 +1247,8 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         builders=backend.builders,
     )
     plan = plan_memory(sub, acc_config)
+    if backend.synchronizes:
+        synchronize(sub)
     r = estimate_schedule(sub, acc_config, full_walk=cfg.full_walk)
     compute, memory, overlap, stall = _time_split(r)
     if dump_dir is not None:
