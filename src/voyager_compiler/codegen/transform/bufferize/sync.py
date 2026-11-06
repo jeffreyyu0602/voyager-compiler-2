@@ -6,9 +6,9 @@ loop(s) with their prologue and epilogue, every op inline and every copy
 bare -- and leaves the graph the program the hardware runs: each compute op
 wrapped in a ``commit`` whose waits, grouped by unit, the pass derived, and
 whose last pass adds 1 to that unit's counter; each copy adding 1 to its
-stream's counter; a CPU ``async_wait`` before every copy, scalar read or
-host op that depends on a dispatch or a copy; every counter waited at its
-total when the layer ends.
+stream's counter; a CPU ``async_wait`` before every copy, scalar read, host
+op or zero fill that depends on a dispatch or a copy; every counter waited
+at its total when the layer ends.
 
 A producer is a dispatch, posting on the counter of its last pass's unit,
 or a copy, posting on its stream's: the loads into one on-chip buffer, or
@@ -71,6 +71,7 @@ _ASYNC_COPY = voyager.async_copy.default
 _ASYNC_WAIT = voyager.async_wait.default
 _INSERT = voyager.insert.default
 _ALLOC = voyager.alloc.default
+_ZEROS = voyager.zeros.default
 _SUBVIEW = voyager.subview.default
 _SCALAR_READ = torch.ops.aten._local_scalar_dense.default
 _SPMM = torch.ops.quantized_ops.spmm_csr.default
@@ -1092,7 +1093,7 @@ class _Layer:
                 self._walk_copy(self.copies[node], state)
             elif node.target is _SCALAR_READ:
                 self._walk_cpu(node, region, state)
-            elif _is_host_op(node):
+            elif _is_host_op(node) or node.target is _ZEROS:
                 self._walk_cpu(node, region, state)
 
     def _graph(self, region) -> Graph:
@@ -1133,12 +1134,16 @@ class _Layer:
         self.touched.add(copy.region.gm if copy.region else self.gm)
 
     def _walk_cpu(self, node, region, state) -> None:
-        """A CPU op -- a scalar read, or a host op (``_is_host_op``) -- waits
-        on the CPU for the producers of the on-chip values it reads and
-        overwrites.  It posts nothing: the CPU issues what follows only once
-        it is done."""
+        """A CPU op -- a scalar read, a host op (``_is_host_op``) or a zero
+        fill -- waits on the CPU for the producers of the on-chip values it
+        reads and overwrites.  It posts nothing: the CPU issues what follows
+        only once it is done."""
         if node.target is _SCALAR_READ:
             reads, written = [node.args[0]], []
+        elif node.target is _ZEROS:
+            # Fills its operand in place; a counter reset is not on chip, so
+            # it waits for nothing.
+            reads, written = [], [node.args[0]]
         else:
             reads = node.all_input_nodes
             written = [node] + [
