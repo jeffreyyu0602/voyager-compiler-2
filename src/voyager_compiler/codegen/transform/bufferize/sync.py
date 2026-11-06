@@ -214,6 +214,7 @@ def synchronize(model: GraphModule) -> int:
                 if branch is not None and branch not in graphs:
                     graphs.append(branch)
     layers = 0
+    regions, synced = set(), []
     for gm in graphs:
         for name, nodes in _layers(gm):
             # A layer with no loop, dispatch or copy of its own -- a host
@@ -226,8 +227,17 @@ def synchronize(model: GraphModule) -> int:
                 for n in nodes
             ):
                 continue
-            _Layer(gm, nodes, name, names, order).synchronize()
+            layer = _Layer(gm, nodes, name, names, order)
+            layer.synchronize()
+            regions |= layer.touched
+            if gm not in synced:
+                synced.append(gm)
             layers += 1
+    # Every graph the layers edited is recompiled once, after them all: a
+    # recompile regenerates the module's whole subtree, so one per layer
+    # would cost the model's size once per layer.
+    for gm in [*regions, *synced]:
+        gm.recompile()
     bare = [
         n.name
         for sub in model.modules()
@@ -851,11 +861,6 @@ class _Layer:
                 )
             anchor.meta.update(self.tags)
 
-    def _recompile(self) -> None:
-        for gm in self.touched:
-            gm.recompile()
-        self.gm.recompile()
-
     def _unique(self, seq) -> list:
         unique = []
         for item in seq:
@@ -1075,7 +1080,6 @@ class _Layer:
         state = {}
         self._walk(self.nodes, None, state)
         self._close({a: state.get((_POSTS, a), 0) for a in self.counters})
-        self._recompile()
 
     def _walk(self, nodes, region, state) -> None:
         for node in list(nodes):
