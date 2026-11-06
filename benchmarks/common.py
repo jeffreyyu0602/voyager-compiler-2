@@ -895,13 +895,15 @@ def _compile(cfg: SweepConfig):
     program, nests and fused passes annotated with their memory spaces --
     to ``<dump_dir>/<stem>.bufferized.txt`` beside the compute graph."""
     gm, model, tiler = _frontend(cfg)
+    backend = cfg.acc_config.backend()
     bufferize_graph(
         gm,
         pipelined=cfg.pipelined,
         tiler=tiler,
-        async_pipeline=cfg.acc_config.async_pipeline,
         single_buffer_tail=cfg.single_buffer_tail,
+        store_lag=backend.store_lag,
         bool_mask=cfg.bool_mask,
+        builders=backend.builders,
     )
     plan = plan_memory(gm, cfg.acc_config)
     if cfg.dump_dir is not None:
@@ -1231,13 +1233,15 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
     path can compute because it still holds the ``ScheduleResult``.  With
     ``dump_dir`` set, also write an xlsx + perfetto pair for the block."""
     sub = _extract_standalone(gm, node)
+    backend = acc_config.backend()
     bufferize_graph(
         sub,
         pipelined=cfg.pipelined,
         tiler=tiler,
-        async_pipeline=acc_config.async_pipeline,
         single_buffer_tail=cfg.single_buffer_tail,
+        store_lag=backend.store_lag,
         bool_mask=cfg.bool_mask,
+        builders=backend.builders,
     )
     plan = plan_memory(sub, acc_config)
     r = estimate_schedule(sub, acc_config, full_walk=cfg.full_walk)
