@@ -315,7 +315,10 @@ def main():
             if args.evaluate:
                 torchvision_models.evaluate(model, imagenet_dataset)
         else:
-            imagenet_dataset = imagenet.retrieve_dataset(10, "resnet")
+            # Calibration reads one image per step.
+            imagenet_dataset = imagenet.retrieve_dataset(
+                max(10, args.calibration_steps), "resnet"
+            )
 
         gm, old_output, new_output, preprocess_fn = (
             torchvision_models.quantize_and_dump_model(
@@ -426,7 +429,10 @@ def main():
             if args.evaluate:
                 vit.evaluate(model, imagenet_dataset)
         else:
-            imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
+            # Calibration reads one image per step.
+            imagenet_dataset = imagenet.retrieve_dataset(
+                max(10, args.calibration_steps), "vit"
+            )
 
         gm, old_output, new_output, preprocess_fn = vit.quantize_and_dump_model(
             model=model,
