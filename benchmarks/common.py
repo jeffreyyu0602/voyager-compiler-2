@@ -63,6 +63,7 @@ from typing import (
 from unittest.mock import patch
 
 import torch
+import torch.fx.experimental.proxy_tensor as proxy_tensor
 from datasets import load_dataset
 from torch._export.utils import _disable_aten_to_metadata_assertions
 from transformers import (
@@ -1024,6 +1025,12 @@ def safe_run(
         traceback.print_exc()
         print(f"  [skip] {label}: {type(e).__name__}: {e}", flush=True)
         return None
+    finally:
+        # Two torch globals keep a point's graphs, and with them its weights,
+        # alive after it returns: dynamo's cache of the eager while_loop and
+        # cond calls, and make_fx's map of its last trace's nodes.
+        torch._dynamo.reset()
+        proxy_tensor._FAKE_TENSOR_ID_TO_PROXY_MAP_FOR_EXPORT.clear()
 
 
 def _run_point_worker(task):
